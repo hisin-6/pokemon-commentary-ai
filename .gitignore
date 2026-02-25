@@ -1,0 +1,32 @@
+# 仮想環境
+venv/
+
+# Pythonキャッシュ
+__pycache__/
+*.pyc
+*.pyo
+
+# EasyOCRモデルキャッシュ
+.EasyOCR/
+
+# デバッグ用スクショ（screen_capture.pyが自動生成）
+debug_turn_*.png
+
+# テスト・学習用画像（大きいのでGit管理しない）
+data/test_images/ocr/*.png
+data/test_images/ocr/*.jpg
+data/test_images/diff_detection/*.png
+data/test_images/diff_detection/*.jpg
+data/yolo_dataset/images/**/*.png
+data/yolo_dataset/images/**/*.jpg
+
+# ただしREADMEは含める
+!data/**/README.md
+
+# 環境変数・秘密情報
+.env
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
