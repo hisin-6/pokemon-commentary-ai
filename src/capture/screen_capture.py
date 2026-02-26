@@ -135,7 +135,7 @@ def run_file_mode(image_path: str, reader: easyocr.Reader) -> None:
 
 # ─── ライブキャプチャモード ─────────────────────────────────────────────────
 
-def run_live_mode(reader: easyocr.Reader, interval: float = 1.0) -> None:
+def run_live_mode(reader: easyocr.Reader, interval: float = 1.0, monitor_index: int = 1) -> None:
     """
     mssでリアルタイム画面キャプチャしOCRを実行する。
     Windows Pythonで実行する必要がある。
@@ -153,9 +153,18 @@ def run_live_mode(reader: easyocr.Reader, interval: float = 1.0) -> None:
     log.info(f"ライブキャプチャ開始（間隔: {interval}秒、Ctrl+Cで終了）")
 
     with mss.mss() as sct:
-        # モニター1（プライマリ）全体をキャプチャ
-        monitor = sct.monitors[1]
-        log.info(f"キャプチャ対象モニター: {monitor['width']}x{monitor['height']}")
+        # 利用可能なモニター一覧を表示（0=全体, 1=プライマリ, 2=セカンダリ...）
+        log.info(f"利用可能なモニター数: {len(sct.monitors) - 1}")
+        for i, m in enumerate(sct.monitors):
+            label = "全体" if i == 0 else f"モニター{i}"
+            log.info(f"  [{i}] {label}: {m['width']}x{m['height']} (left={m['left']}, top={m['top']})")
+
+        if monitor_index >= len(sct.monitors):
+            log.error(f"モニター {monitor_index} は存在しません（利用可能: 0〜{len(sct.monitors)-1}）")
+            sys.exit(1)
+
+        monitor = sct.monitors[monitor_index]
+        log.info(f"キャプチャ対象: モニター{monitor_index} ({monitor['width']}x{monitor['height']})")
 
         while True:
             start = time.perf_counter()
@@ -177,7 +186,9 @@ def run_live_mode(reader: easyocr.Reader, interval: float = 1.0) -> None:
                 print_ocr_results(results)
 
                 # スクリーンショットを保存（デバッグ用）
-                save_path = Path(f"debug_turn_{turn:03d}.png")
+                debug_dir = Path("debug")
+                debug_dir.mkdir(exist_ok=True)
+                save_path = debug_dir / f"turn_{turn:03d}.png"
                 cv2.imwrite(str(save_path), frame)
                 log.info(f"スクリーンショット保存: {save_path}")
 
@@ -197,6 +208,7 @@ def main() -> None:
     group.add_argument("--live", action="store_true", help="ライブキャプチャモード（Windows推奨）")
 
     parser.add_argument("--interval", type=float, default=1.0, help="キャプチャ間隔（秒、デフォルト: 1.0）")
+    parser.add_argument("--monitor", type=int, default=1, help="キャプチャ対象モニター番号（1=プライマリ, 2=セカンダリ、デフォルト: 1）")
     parser.add_argument("--cpu", action="store_true", help="CPUモードで実行（GPU無効）")
 
     args = parser.parse_args()
@@ -207,7 +219,7 @@ def main() -> None:
     if args.image:
         run_file_mode(args.image, reader)
     else:
-        run_live_mode(reader, interval=args.interval)
+        run_live_mode(reader, interval=args.interval, monitor_index=args.monitor)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ __pycache__/
 .EasyOCR/
 
 # デバッグ用スクショ（screen_capture.pyが自動生成）
-debug_turn_*.png
+debug/
 
 # テスト・学習用画像（大きいのでGit管理しない）
 data/test_images/ocr/*.png
