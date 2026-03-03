@@ -71,11 +71,11 @@
 │  ┌────────▼────────────────────────────┐                           │
 │  │  音声・映像出力レイヤー                │                           │
 │  │                                      │                           │
-│  │  ┌──────────┐  ┌────────────────┐  │                           │
-│  │  │ VOICEVOX │  │ VTube Studio   │  │ VRAM: 4〜5GB              │
-│  │  │ 音声生成  │  │ 3Dモデル描画   │  │（3Dモデル描画）            │
-│  │  │ (CPU)    │  │ VMC Protocol   │  │                           │
-│  │  └──────────┘  └────────────────┘  │                           │
+│  │  ┌──────────┐  ┌──────────────────────┐  │                      │
+│  │  │ VOICEVOX │  │ バーチャルモーション    │  │ VRAM: 4〜5GB         │
+│  │  │ 音声生成  │  │ キャプチャー          │  │（3Dモデル描画）       │
+│  │  │ (CPU)    │  │ VB-Audio連携         │  │                      │
+│  │  └──────────┘  └──────────────────────┘  │                      │
 │  └────────┬────────────────────────────┘                           │
 │           │                                                          │
 │  ┌────────▼────────┐                                                │
@@ -108,7 +108,7 @@
 
 | コンポーネント | ツール | VRAM消費 | 備考 |
 |-------------|-------|---------|------|
-| 3Dモデル描画 | VTube Studio | 4〜5 GB | 最大消費コンポーネント |
+| 3Dモデル描画 | バーチャルモーションキャプチャー | 4〜5 GB | 最大消費コンポーネント |
 | 実況文生成LLM | Phi-3 mini 4bit / Ollama | 2〜3 GB | 量子化でVRAM削減 |
 | **常駐合計** | | **6〜8 GB** | |
 
@@ -131,7 +131,7 @@
 ### VRAM逼迫時の対応策
 
 1. Phi-3 miniのコンテキスト長を短縮（VRAM削減）
-2. VTube Studioの描画解像度・品質設定を下げる
+2. バーチャルモーションキャプチャーの描画解像度・品質設定を下げる
 3. EasyOCRのバッチサイズを1に固定する
 4. それでも足りない場合は実況文生成をBedrock Claude Haikuに移行（ADR-003再検討条件）
 
@@ -195,9 +195,9 @@
     → WAVファイル生成
 
 [9] 音声再生 + 口パク同期（同時実行）
-    ├── WAVファイルを再生
-    └── VMC Protocol（UDP）でVTube Studioに音量データ送信
-        → 3Dモデルが口パク
+    ├── WAVファイルを CABLE Input（VB-Audio Virtual Cable）に再生
+    └── バーチャルモーションキャプチャーが CABLE Output を音声入力として認識
+        → 音量に応じて自動で3Dモデルが口パク
 
 [10] S3に保存
      ├── 実況テキストログ（JSON）
@@ -439,15 +439,15 @@ src/commentary/
 ```
 src/output/
 ├── voicevox_client.py   # VOICEVOX APIクライアント
-├── audio_player.py      # WAV再生
-└── vmc_sender.py        # VMC Protocol UDP送信（口パク同期）
+└── audio_player.py      # WAV再生（出力先: CABLE Input）
 ```
 
-**VMC Protocol設定**
+**音声デバイス設定**
 
 ```python
-VMC_HOST = "127.0.0.1"
-VMC_PORT = 39539         # VTube Studioデフォルトポート
+# audio_player.py で CABLE Input デバイスに出力することで
+# バーチャルモーションキャプチャーが自動でリップシンクを行う
+AUDIO_OUTPUT_DEVICE = "CABLE Input (VB-Audio Virtual Cable)"
 ```
 
 ---
@@ -472,5 +472,5 @@ VMC_PORT = 39539         # VTube Studioデフォルトポート
 - [ADR-003](../adr/ADR-003-local-llm-phi3.md) - 実況文生成にPhi-3 mini
 - [ADR-004](../adr/ADR-004-voicevox.md) - 音声合成にVOICEVOX
 - [ADR-005](../adr/ADR-005-aws-structure.md) - AWSのBedrock・EC2・S3構成
-- [ADR-006](../adr/ADR-006-3d-model-rendering.md) - 3DモデルにVRoid+VTube Studio
+- [ADR-006](../adr/ADR-006-3d-model-rendering.md) - 3DモデルにVRoid+バーチャルモーションキャプチャー
 - [ADR-007](../adr/ADR-007-event-driven-architecture.md) - イベント駆動アーキテクチャ

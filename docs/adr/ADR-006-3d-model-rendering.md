@@ -1,10 +1,10 @@
-# ADR-006: 3Dモデル描画にVRoid Studio + VTube Studioを使用する
+# ADR-006: 3Dモデル描画にVRoid Studio + バーチャルモーションキャプチャーを使用する
 
 ## ステータス
-承認済み
+改訂済み（2026-03-03）※初版はVTube Studioを選定していたが、動作検証の結果バーチャルモーションキャプチャーに変更
 
 ## 日付
-2026-02-25
+2026-02-25（初版）/ 2026-03-03（改訂）
 
 ## 文脈
 
@@ -13,7 +13,6 @@
 要件：
 - VRAMを4〜5GB以内に収めること
 - VOICEVOXの音声出力と口パクをリアルタイム同期できること
-- Pythonから制御可能またはプロトコルで連携できること
 - 無料または低コストで利用できること
 
 ## 決定
@@ -22,76 +21,84 @@
 
 | 役割 | ツール |
 |------|--------|
-| 3Dモデル作成 | VRoid Studio（無料） |
-| 3Dモデル表示・リップシンク | VTube Studio |
-| 音声・モーション連携プロトコル | VMC Protocol（Virtual Motion Capture Protocol） |
+| 3Dモデル作成 | VRoid Studio（無料）※VRM 0.x でエクスポートすること |
+| 3Dモデル表示・リップシンク | バーチャルモーションキャプチャー（無料） |
+| 音声→リップシンク連携 | VB-Audio Virtual Cable（仮想オーディオデバイス） |
 
 ## アーキテクチャ
 
 ```
 Pythonアプリ
-　↓ VOICEVOXで音声生成（WAVファイル）
-音声再生
-　↓ VMC Protocol（UDP）
-VTube Studio
-　↓
-3Dモデル（VRMファイル）が口パク・表情変化
+　↓ VOICEVOX で音声生成・再生（出力先: CABLE Input）
+VB-Audio Virtual Cable
+　↓ CABLE Output をバーチャルモーションキャプチャーが音声入力として認識
+バーチャルモーションキャプチャー
+　↓ 音量に応じて自動でリップシンク
+3Dモデル（VRMファイル）が口パク
 ```
 
 ## 理由
 
+### バーチャルモーションキャプチャー
+- VMC Protocol の本家アプリ（プロトコル発祥元）
+- VRM 0.x モデルの表示・リップシンクを確認済み（Sprint 3 実機検証）
+- 内蔵オーディオリップシンク機能あり（マイク/音声入力デバイスを指定可能）
+- 無料で利用可能
+
+### VB-Audio Virtual Cable
+- VOICEVOX の音声出力をバーチャルモーションキャプチャーに渡すための仮想オーディオデバイス
+- 無料・インストールのみで利用可能
+- Python 側の追加実装不要（OS レベルの音声ルーティングで完結）
+
 ### VRoid Studio
-- 無料で高品質なVRMモデルが作れる
-- VRM形式は各種ツールで広くサポートされている
-- 日本語圏での事例が豊富でドキュメントが充実している
-
-### VTube Studio
-- VRMモデルの表示・リップシンクに特化したアプリ
-- VMC Protocolに対応しており外部から制御可能
-- Steam版が無料で利用できる（ウォーターマークあり、有料解除可）
-
-### VMC Protocol
-- UDP通信でモーション・表情データを送受信できる標準プロトコル
-- PythonライブラリでVMC Protocolメッセージを送信可能
-- VTube Studio・バーチャルモーションキャプチャー等が受信に対応
+- 無料で高品質な VRM モデルが作れる
+- VRM 形式は各種ツールで広くサポートされている
+- **注意**: 現行版（v1.0+）は VRM 1.0 のみ出力。バーチャルモーションキャプチャーは VRM 0.x のみ対応のため、**VRM 0.0 形式でエクスポートすること**（旧バージョンの VRoid Studio を使用するか、VRM コンバーターで変換）
 
 ## VRAM消費
 
 | コンポーネント | 消費VRAM |
 |--------------|---------|
-| VTube Studio（3Dモデル描画） | 約4〜5 GB |
-
-VTube Studioはシステムのディスプレイ（GPU）リソースを使用するため、他のMLワークロード（PyTorch/YOLO）と同じGPUを共有する点に注意。
+| バーチャルモーションキャプチャー（3Dモデル描画） | 約4〜5 GB |
 
 ## 却下した選択肢
 
 | 選択肢 | 却下理由 |
 |--------|---------|
-| Unity（カスタム実装） | 開発工数が大きい・Sprint 3では過剰 |
-| Unreal Engine | 同上・VRAM消費がより大きい |
-| nizima LIVE | 2Dモデル向け・3Dモデルの品質が限られる |
-| バーチャルモーションキャプチャー | 動作確認中・VTube Studioの方が情報が多い |
+| VTube Studio | VRM 1.0 非対応（検証済み）・Steam 版は無料だがウォーターマークあり |
+| VSeeFace | VRM 0.x のみ対応（検証済み）・VRM 1.0 エラーを確認 |
+| 3tene FREE/PRO | VMC Protocol 対応が公式未明記・VRM 1.0 非対応 |
+| Unity（カスタム実装） | 開発工数が大きい・Sprint 3 では過剰 |
+| Unreal Engine | 同上・VRAM 消費がより大きい |
+| nizima LIVE | 2D モデル向け・3D モデルの品質が限られる |
 
 ## 連携実装方針
 
-```python
-# VMC Protocol送信サンプルイメージ
-import socket
-import struct
+リップシンクは VB-Audio Virtual Cable 経由の音声自動連動で実現するため、Python から VMC Protocol を送信する `vmc_sender.py` は**不要**。
 
-def send_lipsync(volume: float):
-    # VMCPでVTube Studioにリップシンク値を送信
-    ...
 ```
-
-Pythonライブラリ `python-osc` を使ってOSC/UDP経由でVMC Protocolメッセージを送信する。
+# 音声出力先を CABLE Input に設定するだけで口パクが自動連動する
+# Python 側で必要な実装:
+# - voicevox_client.py: VOICEVOX API で音声生成
+# - audio_player.py: CABLE Input デバイスに音声を再生
+```
 
 ## 注意事項
 
-- VTube StudioはWindowsアプリとして動作するため、WSL2からの制御はUDP経由で行う
-- 音声再生のタイミングとVMC Protocol送信のタイミングを合わせる同期処理が必要
-- VRAMが逼迫した場合はVTube Studioの解像度・品質設定を下げて対応する
+- バーチャルモーションキャプチャーは Windows アプリとして動作する
+- VRM 0.x フォーマットが必須（VRM 1.0 は非対応）
+- VB-Audio Virtual Cable のインストールが前提（無料）
+- VOICEVOX の音声出力デバイスを「CABLE Input」に設定すること
+- バーチャルモーションキャプチャーのリップシンクデバイスを「CABLE Output」に設定すること
+
+## 未解決の課題（TODO）
+
+- VRoid Studio 現行版（VRM 1.0 のみ出力）で作成した正式モデルを VRM 0.x に変換・または旧版で再作成する方法を確立する
+- **音声出力の二重化**: CABLE Input に流すと視聴者に音が聞こえない問題。以下のいずれかで解決する:
+  - 方法A: VB-Audio Voicemeeter で CABLE Input とスピーカーに同時出力
+  - 方法B: `vmc_sender.py` を実装し、音声は通常スピーカー出力しつつ VMC Protocol でリップシンクデータを別途送信（ADR-006 初版の方針）
+  - Sprint 4 以降で音声出力要件が確定したタイミングで判断する
 
 ## 結果
 
-無料ツールの組み合わせでVTuberアバターのリップシンク動作を実現できる。Sprint 3で実装し、VOICEVOXとの音声同期まで完成させる。
+VB-Audio Virtual Cable を介した音声連動リップシンクにより、Python 側の追加実装なしで口パクを実現できる。Sprint 3 でバーチャルモーションキャプチャー + サンプルモデルでの動作確認済み。

@@ -31,7 +31,7 @@ Ollama + Phi-3 mini 4bit量子化（ローカル）→ 実況文生成
 　↓
 VOICEVOX（ローカル）→ 音声読み上げ
 　↓
-3Dモデル（VRoid + VTube Studio）→ 口パク・表示（VMC Protocol連携）
+3Dモデル（VRoid + バーチャルモーションキャプチャー）→ 口パク・表示（VB-Audio Virtual Cable 経由リップシンク）
 　↓
 AWS S3 → 実況ログ・スクリーンショット保存
 ```
@@ -49,7 +49,7 @@ AWS S3 → 実況ログ・スクリーンショット保存
 | ADR-003 | 実況文生成はPhi-3 mini 4bit量子化（ローカル・Ollama） | VRAM 2〜3GBで3Dモデルと共存可能 |
 | ADR-004 | 音声合成はVOICEVOX | 無料・高品質・CPU動作・GPU不要 |
 | ADR-005 | AWSはBedrock＋EC2＋S3を使用 | 既存環境を活用・APIキーをEC2で管理 |
-| ADR-006 | 3DモデルはVRoid Studio + VTube Studio + VMC Protocol | 無料・VRM対応・Python連携可能 |
+| ADR-006 | 3DモデルはVRoid Studio + バーチャルモーションキャプチャー + VB-Audio Virtual Cable | 無料・VRM 0.x 対応・音声自動リップシンク確認済（Sprint 3） |
 | ADR-007 | イベント駆動アーキテクチャ（差分検知でトリガー制御） | API呼び出し削減・3秒以内の遅延目標 |
 
 ### VRAM配分（合計10GB以内）
@@ -94,7 +94,14 @@ AWS S3 → 実況ログ・スクリーンショット保存
 **タスク**:
 1. VOICEVOXをセットアップし実況テキストを音声再生する
 2. 3DモデルをVRoid等でセットアップし表示する
-3. 音声と口パクを同期させる（VMC Protocol等を検討）
+3. 音声と口パクを同期させる
+
+**完了状況**（Sprint 3 完了）:
+- VOICEVOX インストール済み（Windows・ localhost:50021）
+- バーチャルモーションキャプチャーで VRM 0.x モデル表示確認済み
+- VB-Audio Virtual Cable 経由で VOICEVOX 音声連動リップシンク確認済み
+- 残り: `voicevox_client.py` / `audio_player.py` 実装（Python 自動化）
+- TODO: VRM 1.0 モデルを VRM 0.x に変換・正式モデルに差し替え
 
 ---
 
