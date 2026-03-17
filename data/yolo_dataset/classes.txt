@@ -1,0 +1,10 @@
+poison
+bad_poison
+burn
+paralysis
+freeze
+sleep
+confusion
+ball_alive
+ball_faint
+ball_status

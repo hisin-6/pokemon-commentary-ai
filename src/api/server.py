@@ -53,25 +53,45 @@ def _now_iso() -> str:
 def _build_vision_prompt(context: dict, history: list[str]) -> str:
     """Bedrock に送るプロンプトを組み立てる"""
     lines = [
-        "ポケモン対戦の画面を分析して、現在の状況を日本語で2〜3文で説明してください。",
-        "専門用語はそのまま使い、重要な局面・テラスタル・交代判断などを読み取ってください。",
+        "あなたはポケモン対戦の実況者です。",
+        "画面を見て、以下の形式で日本語で出力してください。",
         "",
-        "【OCR・YOLO取得情報】",
-        f"自分のポケモン: {context.get('pokemon_player', '不明')} (HP: {context.get('hp_player', '?')}%)",
-        f"相手のポケモン: {context.get('pokemon_opponent', '不明')} (HP: {context.get('hp_opponent', '?')}%)",
-        f"直前の技: {context.get('last_move', '不明')}",
+        "【状況】",
+        "（画面から読み取れる対戦状況を1〜2文で説明。ポケモン名・技名・HP等を正確に）",
+        "",
+        "【実況】",
+        "（テンポよく興奮感のある実況を1〜2文。ポケモン名・技名はそのまま使う。HPが低い時は緊張感を出す。鉤括弧は使わない）",
+        "",
+        "【参考情報（OCR・YOLO取得）】",
+        f"画面テキスト: {context.get('ocr_text', '不明')}",
         f"自分の状態異常: {context.get('status_player', 'なし')}",
         f"相手の状態異常: {context.get('status_opponent', 'なし')}",
         f"残りボール (自分/相手): {context.get('balls_remaining_player', '?')} / {context.get('balls_remaining_opponent', '?')}",
         f"イベント種別: {context.get('event_type', '不明')}",
-        f"ターン数: {context.get('turn_count', '?')}",
     ]
     if history:
-        lines.append("")
-        lines.append("【直前の実況】")
-        for h in history[-5:]:
-            lines.append(f"- {h}")
+        lines.append(f"直前の実況: {history[-1]}")
     return "\n".join(lines)
+
+
+def _parse_commentary(text: str) -> tuple[str, str]:
+    """
+    Haiku の出力から【状況】と【実況】を抽出する。
+    Returns: (analysis, commentary)
+    """
+    analysis = text
+    commentary = text  # フォールバック: 全文を実況に使う
+
+    if "【実況】" in text:
+        parts = text.split("【実況】")
+        commentary = parts[1].strip().split("【")[0].strip()
+
+    if "【状況】" in text:
+        parts = text.split("【状況】")
+        analysis_raw = parts[1].split("【")[0].strip()
+        analysis = analysis_raw if analysis_raw else text
+
+    return analysis, commentary
 
 
 # ─── エンドポイント ──────────────────────────────────────────────────────────
@@ -164,14 +184,18 @@ def vision():
     latency_ms = int((time.monotonic() - start_ms) * 1000)
 
     result = json.loads(response["body"].read())
-    analysis = result["content"][0]["text"].strip()
+    raw_text = result["content"][0]["text"].strip()
     usage = result.get("usage", {})
 
+    analysis, commentary = _parse_commentary(raw_text)
+
     logger.info("Vision分析完了 latency=%dms tokens_in=%s tokens_out=%s", latency_ms, usage.get("input_tokens"), usage.get("output_tokens"))
+    logger.info("実況文: %s", commentary)
 
     return jsonify({
         "success": True,
         "analysis": analysis,
+        "commentary": commentary,
         "usage": {
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),

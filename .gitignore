@@ -19,6 +19,7 @@ data/test_images/diff_detection/*.png
 data/test_images/diff_detection/*.jpg
 data/yolo_dataset/images/**/*.png
 data/yolo_dataset/images/**/*.jpg
+data/yolo_dataset/labels/**/*.txt
 
 # ただしREADMEは含める
 !data/**/README.md
@@ -26,6 +27,12 @@ data/yolo_dataset/images/**/*.jpg
 # 環境変数・秘密情報
 .env
 *.key
+
+# YOLOv8 学習出力（モデルウェイト・ログ等）
+runs/
+
+# PyTorch モデルウェイト（自動DLされるもの・学習済みモデル）
+*.pt
 
 # OS
 .DS_Store

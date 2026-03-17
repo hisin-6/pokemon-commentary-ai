@@ -1,0 +1,20 @@
+# YOLOv8 データセット設定
+# ポケモン対戦 状態異常アイコン・ボール数検出
+
+path: data/yolo_dataset   # データセットルート（プロジェクトルートからの相対パス）
+train: images/train
+val:   images/val
+
+# クラス定義（CUSTOM_CLASS_NAMES と同じ順番で定義すること）
+nc: 10
+names:
+  0: poison       # どく
+  1: bad_poison   # どくどく
+  2: burn         # やけど
+  3: paralysis    # まひ
+  4: freeze       # こおり
+  5: sleep        # ねむり
+  6: confusion    # こんらん
+  7: ball_alive   # 生存ポケモンのボール（通常）
+  8: ball_faint   # 瀕死ポケモンのボール
+  9: ball_status  # 状態異常ポケモンのボール（黄色っぽい）

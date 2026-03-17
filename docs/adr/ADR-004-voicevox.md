@@ -40,6 +40,29 @@ VOICEVOX API（localhost:50021）
 音声再生 ＋ 3Dモデル口パク同期（VMC Protocol等）
 ```
 
+## 起動・確認方法
+
+### 起動
+Windows のスタートメニューから **VOICEVOX** を起動する。
+タスクトレイに常駐し、API サーバーが自動で立ち上がる。
+
+### 起動確認
+```powershell
+# コマンドで確認
+curl http://localhost:50021/version
+# バージョン番号（例: "0.14.7"）が返ってくれば起動中
+
+# ブラウザで確認（Swagger UI が表示されれば OK）
+# http://localhost:50021/docs
+```
+
+```python
+# Python で確認
+import requests
+r = requests.get("http://localhost:50021/version")
+print(r.text)
+```
+
 ## 結果
 
 GPU・コストを消費せず高品質な日本語音声を実現できる。Sprint 3でセットアップし3Dモデルとの口パク同期まで実装する。
