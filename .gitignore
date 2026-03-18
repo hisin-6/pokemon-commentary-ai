@@ -12,6 +12,9 @@ __pycache__/
 # デバッグ用スクショ（screen_capture.pyが自動生成）
 debug/
 
+# パイプラインログ（pipeline.pyが自動生成）
+logs/
+
 # テスト・学習用画像（大きいのでGit管理しない）
 data/test_images/ocr/*.png
 data/test_images/ocr/*.jpg
