@@ -143,7 +143,7 @@
 
 ```
 [1] 画面キャプチャ
-    mss.grab() → numpy配列（BGR）
+    cv2.VideoCapture（OBS仮想カメラ・カメラ番号3）
     間隔: 1秒
 
 [2] 差分検出
@@ -151,55 +151,62 @@
     → 差分スコアが閾値を超えた場合のみ [3] へ進む
     → 超えなければ [1] に戻る
 
-[3] イベント種別の判定（並列実行）
-    ├── EasyOCR: ポケモン名・HP数値・技名を取得
-    └── YOLOv8: 状態異常アイコン・ボール数を検出
+[3] OCR + YOLO（並列）
+    ├── EasyOCR: OCR テキスト + bbox 取得
+    └── YOLOv8: 状態異常アイコン・ボール数を検出（毎フレーム）
 
-[4] 状況テキストの構築
+[4] BattlePhaseClassifier によるフェーズ分類・イベント検知
+    OCR テキストからフェーズを判定:
+      command_select / switch_select / animation / faint / battle_end / selection_screen / unknown
+    フェーズ遷移でイベントを発火:
+      battle_start / move_used / switch / faint / battle_end
+    デバウンス 10秒で多重発火を防止
+
+[5] バトル外判定（イベント発生時）
+    _NON_BATTLE_KEYWORDS に該当 → スキップ
+    OCR 件数 < 2（battle_end 除く）→ スキップ
+
+[6] game_state 構築
+    OCR bbox の y 座標でポケモン名を自分/相手に分類:
+      y < 500px  → 相手エリア（name_candidates_opponent）
+      500〜700px → 自分エリア（name_candidates_player）
+      y > 700px  → コマンドメニュー（除外）
     {
-      "pokemon_player": "ガブリアス",
-      "hp_player": 85,
-      "pokemon_opponent": "サーフゴー",
-      "hp_opponent": 42,
-      "last_move": "じしん",
-      "status": "normal",
-      "balls_remaining": [6, 4],
-      "event_type": "move_used"
+      "hp_values": ["121/171", "175/175"],
+      "name_candidates_player": ["ウーラオス", ...],
+      "name_candidates_opponent": ["テラパゴス", ...],
+      "ocr_text": "...",
+      "status": "..."
     }
 
-[5] Bedrock呼び出し判定
-    event_type が [turn_end / switch / faint] → [6A] へ
-    それ以外                                 → [6B] へ
+[7] BattleStateTracker 更新（_battle_active = True の間のみ）
+    battle_start → トラッカーリセット → _battle_active = True
+    各イベントで name/HP/状態異常/気絶フラグを蓄積
+    to_context() で Bedrock へ渡す戦況サマリーを生成:
+      {turn, player_pokemon, opponent_pokemon, event_log}
 
-[6A] Bedrock Vision分析（大きな状況変化時のみ）
-     POST https://{ec2-host}/api/vision
-     スクリーンショット（Base64） + 状況テキスト
-     → Bedrockから状況説明テキストを取得
-     → [7] へ
+[8] Bedrock Vision 呼び出し判定
+    _battle_active = False の場合（選出画面等）→ スキップ
+    event_type が [battle_start / move_used / switch / faint / battle_end] の場合:
+      POST {ec2_url}/api/vision
+      画像 + game_state + BattleStateTracker コンテキスト
+      → 実況文（commentary）と状況分析（analysis）を取得
 
-[6B] ローカル情報のみで実況
-     状況テキスト [4] をそのまま使用
-     → [7] へ
+    battle_end 処理後 → _battle_active = False にリセット
 
-[7] Phi-3 mini で実況文生成（Ollama）
-    プロンプト構成:
-    - システムプロンプト（実況者キャラクター設定）
-    - Bedrock分析結果（あれば）
-    - OCR/YOLO状況テキスト
-    - 直前3件の実況履歴
-    → 実況テキスト生成
+[9] 実況文決定
+    Bedrock 成功 → commentary を使用
+    Bedrock 失敗 → Phi-3 mini（フォールバック）で生成
 
-[8] VOICEVOX で音声生成
-    POST http://localhost:50021/audio_query
-    POST http://localhost:50021/synthesis
-    → WAVファイル生成
+[10] VOICEVOX で音声生成
+     POST http://localhost:50021/audio_query + /synthesis
+     → WAVファイル生成
 
-[9] 音声再生 + 口パク同期（同時実行）
-    ├── WAVファイルを CABLE Input（VB-Audio Virtual Cable）に再生
-    └── バーチャルモーションキャプチャーが CABLE Output を音声入力として認識
-        → 音量に応じて自動で3Dモデルが口パク
+[11] 音声再生
+     CABLE Input（VB-Audio Virtual Cable）に出力
+     → バーチャルモーションキャプチャーが自動で口パク
 
-[10] S3に保存
+[12] S3に保存（/api/log エンドポイント経由）
      ├── 実況テキストログ（JSON）
      └── イベント時スクリーンショット（PNG）
 ```
@@ -209,14 +216,14 @@
 ```
 t=0.0s  イベント検知（差分検出）
 t=0.1s  OCR / YOLO処理完了
-t=0.2s  状況テキスト構築完了
-t=0.2s  Bedrock呼び出し開始（該当イベントの場合）
-t=1.2s  Bedrock Vision分析完了（最大1秒）
-t=1.3s  Phi-3 mini 実況文生成開始
-t=2.3s  実況文生成完了（最大1秒）
-t=2.4s  VOICEVOX音声生成開始
-t=2.9s  音声生成完了・再生開始　← 目標3秒以内 ✓
+t=0.2s  game_state 構築・BattleStateTracker 更新
+t=0.2s  Bedrock 呼び出し開始（battle_active かつ対象イベントの場合）
+t=2.7〜3.5s  Bedrock Vision分析完了（実測 2.5〜3.5秒）
+t=3.5〜9.5s  VOICEVOX音声生成完了（実測 5〜7秒）
+t=9.5〜28s   音声再生完了（実測 10〜20秒）
 ```
+
+> 注: 音声生成・再生が支配的。Bedrock のレイテンシは許容範囲内。
 
 ---
 
@@ -275,45 +282,50 @@ Content-Type: application/json
 
 ```json
 {
-  "image_base64": "<Base64エンコードされたPNG画像>",
+  "image_base64": "<Base64エンコードされたPNG画像（800x450にリサイズ済み）>",
   "context": {
-    "pokemon_player": "ガブリアス",
-    "hp_player": 85,
-    "pokemon_opponent": "サーフゴー",
-    "hp_opponent": 42,
-    "last_move": "じしん",
-    "status_player": "normal",
-    "status_opponent": "normal",
-    "balls_remaining_player": 6,
-    "balls_remaining_opponent": 4,
-    "event_type": "turn_end",
-    "turn_count": 5
+    "event_type": "move_used",
+    "ocr_text": "ウーラオス / 123/175 / ...",
+    "hp_values": "123/175 / 176/176",
+    "name_candidates_player": "ウーラオス / テラパゴス",
+    "name_candidates_opponent": "ガオガエン / ゴリランダ",
+    "status_player": "なし",
+    "status_opponent": "なし",
+    "balls_remaining_player": "?",
+    "balls_remaining_opponent": "?"
   },
   "history": [
-    "ガブリアスのじしんがサーフゴーに命中！",
-    "サーフゴーはHPの半分以上を削られた！"
-  ]
+    "ウーラオスが猛攻を仕掛けます！"
+  ],
+  "battle_state": {
+    "turn": 3,
+    "player_pokemon": "ウーラオス HP:123/175 / テラパゴス HP:219/219",
+    "opponent_pokemon": "ガオガエン(気絶・場に出ていない) / ゴリランダ HP:176/176",
+    "event_log": "T1:battle_start[...] | T2:move_used[...]"
+  }
 }
 ```
 
 | フィールド | 型 | 必須 | 説明 |
 |-----------|---|------|------|
-| `image_base64` | string | ○ | PNG画像のBase64文字列 |
+| `image_base64` | string | ○ | PNG画像のBase64文字列（上限5MB） |
 | `context` | object | ○ | OCR/YOLOで取得した状況情報 |
-| `context.event_type` | string | ○ | `turn_end` / `switch` / `faint` のいずれか |
-| `history` | array[string] | - | 直前の実況テキスト（最大5件） |
+| `context.event_type` | string | ○ | `battle_start` / `move_used` / `switch` / `faint` / `battle_end` のいずれか |
+| `history` | array[string] | - | 直前の実況テキスト（最大3件） |
+| `battle_state` | object | - | BattleStateTracker が生成した複数ターン分の戦況サマリー |
 
 **レスポンス（成功）**
 
 ```json
 {
   "success": true,
-  "analysis": "ガブリアスのじしんでサーフゴーのHPが残り42。サーフゴーは次のターンに交代か反撃か迫られている状況。テラスタルの使用タイミングも重要な局面。",
+  "analysis": "【状況】ウーラオスがゴリランダに攻撃中。",
+  "commentary": "ウーラオスの猛攻がゴリランダを追い詰めます！",
   "usage": {
     "input_tokens": 1240,
     "output_tokens": 85
   },
-  "latency_ms": 820
+  "latency_ms": 2710
 }
 ```
 
@@ -391,47 +403,50 @@ s3://{BUCKET}/screenshots/{session_id}/turn_{turn:03d}.png
 
 ```
 src/capture/
-├── screen_capture.py    # mssによる画面キャプチャ
-├── diff_detector.py     # OpenCV差分検出・イベント判定
-├── ocr_reader.py        # EasyOCRによるテキスト取得
-└── yolo_detector.py     # YOLOv8による物体検出
+├── screen_capture.py    # OBS仮想カメラキャプチャ（cv2.VideoCapture）・EasyOCR
+└── yolo_detector.py     # YOLOv8による状態異常・ボール検出
+
+src/pipeline.py          # 以下のクラスを含む（Sprint 5 統合）
+├── BattlePhaseClassifier    # OCR テキストからフェーズ分類・イベント検知
+├── BattleStateTracker       # 複数ターンにわたる戦況蓄積
+└── PokemonSlot（dataclass） # 1匹分の状態（名前・HP・状態異常・気絶）
 ```
 
-**差分検出の閾値（暫定）**
+**BattlePhaseClassifier の主要定数**
 
 ```python
-DIFF_THRESHOLD = 30      # ピクセル差分の平均値
-DIFF_MIN_AREA = 1000     # 変化領域の最小面積（px²）
+_PLAYER_Y_THRESHOLD = 500   # y < 500px = 相手エリア、以上 = 自分エリア
+_COMMAND_Y_MIN      = 700   # y > 700px = コマンドメニュー（名前候補から除外）
+_HP_ZERO_RE = re.compile(r'\b0/([5-9]\d|\d{3})\b')  # 分母 50 以上のみ faint 判定
 ```
 
 ### 6-2. 実況生成モジュール
 
 ```
 src/commentary/
-├── situation_builder.py  # OCR/YOLO結果→状況テキスト変換
-├── bedrock_client.py     # EC2 Flask APIクライアント
-├── phi3_client.py        # Ollama Phi-3 mini呼び出し
-└── history_manager.py    # 実況履歴管理（直前N件保持）
+└── phi3_client.py        # Ollama Phi-3 mini呼び出し（フォールバック用）
+
+src/pipeline.py
+└── _call_bedrock_vision()  # EC2 /api/vision 呼び出し（メイン実況生成）
 ```
 
-**Phi-3 miniへのプロンプト構造**
+**Bedrock へのリクエスト構造（`server.py` の `_build_vision_prompt`）**
 
 ```
-[システムプロンプト]
-あなたはポケモン対戦の実況者です。テンポよく、専門用語を使って
-ポケモン対戦を実況してください。1〜2文で簡潔に。
+[ロール設定] ポケモンSVダブルバトル実況者
 
-[状況情報]
-{situation_text}
+[ダブルバトル基本知識] 技名・ダメージ表記・状態異常色の説明
 
-[Bedrock分析]
-{bedrock_analysis}  ← ある場合のみ
+[出力ルール]
+  - 今回のイベント種別 + 実況指示（例: battle_start → 両者のポケモン紹介）
+  - 【状況】1文 + 【実況】1〜2文で出力
+  - 画面左上HPバー＝相手、右下HPバー＝自分
 
-[直前の実況]
-{history[-3:]}
+[蓄積された戦況] BattleStateTracker.to_context()
+  - ターン数・自分/相手ポケモン名・HP・状態異常・気絶情報・イベント履歴
 
-[指示]
-次の実況文を生成してください。
+[現在フレームのOCR情報]
+  - 画面テキスト・HP値・自分/相手ポケモン名候補・状態異常
 ```
 
 ### 6-3. 音声・映像同期モジュール

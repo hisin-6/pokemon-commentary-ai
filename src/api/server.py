@@ -19,7 +19,8 @@ import time
 from datetime import datetime, timezone
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.config import Config
+from botocore.exceptions import ClientError, ReadTimeoutError
 from flask import Flask, jsonify, request
 
 # ─── 設定 ────────────────────────────────────────────────────────────────────
@@ -32,7 +33,7 @@ IMAGE_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 S3_REGION = os.environ.get("S3_REGION", "ap-southeast-2")
 
-VALID_EVENT_TYPES = {"turn_end", "switch", "faint"}
+VALID_EVENT_TYPES = {"battle_start", "move_used", "switch", "faint", "battle_end"}
 
 # ─── Flask・AWS クライアント初期化 ────────────────────────────────────────────
 
@@ -40,7 +41,15 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+bedrock = boto3.client(
+    "bedrock-runtime",
+    region_name=BEDROCK_REGION,
+    config=Config(
+        connect_timeout=5,
+        read_timeout=BEDROCK_TIMEOUT_SEC,
+        retries={"max_attempts": 0},
+    ),
+)
 s3 = boto3.client("s3", region_name=S3_REGION)
 
 # ─── ヘルパー ────────────────────────────────────────────────────────────────
@@ -50,27 +59,65 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _build_vision_prompt(context: dict, history: list[str]) -> str:
+def _build_vision_prompt(context: dict, history: list[str], battle_state: dict) -> str:
     """Bedrock に送るプロンプトを組み立てる"""
+
+    # イベント別の実況指示
+    event_type = context.get("event_type", "")
+    event_hint = {
+        "battle_start": "バトル開始！両者のポケモンを紹介して試合への期待感を高める実況をする",
+        "move_used":    "今ターンで使われた技とその効果を実況する",
+        "switch":       "ポケモンの交代について実況する",
+        "faint":        "ポケモンが倒れた瞬間を実況する（HP=0のポケモンを特定すること）",
+        "battle_end":   "試合終了を締めくくる実況をする",
+    }.get(event_type, "状況を実況する")
+
     lines = [
-        "あなたはポケモン対戦の実況者です。",
-        "画面を見て、以下の形式で日本語で出力してください。",
+        "あなたはポケモンSVダブルバトルの熱狂的な実況者です。",
         "",
-        "【状況】",
-        "（画面から読み取れる対戦状況を1〜2文で説明。ポケモン名・技名・HP等を正確に）",
+        "【ダブルバトルの基本知識】",
+        "- 各プレイヤーが2匹ずつ場に出す（合計4匹が同時に戦う）",
+        "- 技名（テラクラスター・アストラルビット・フレアドライブ等）はポケモン名ではなく技の名前",
+        "- みがわり・めいそう・テラスタル・アンコール・かなしばりは戦略的な行動",
+        "- バツグン・いまひとつ・こうかなしはダメージテキストであり技名でもポケモン名でもない",
+        "- トレーナー名（英数字の名前）はポケモン名ではない",
         "",
-        "【実況】",
-        "（テンポよく興奮感のある実況を1〜2文。ポケモン名・技名はそのまま使う。HPが低い時は緊張感を出す。鉤括弧は使わない）",
+        "【出力ルール】",
+        f"- 今回のイベント: {event_type} → {event_hint}",
+        "- 【実況】に実況文を1〜2文で書く",
+        "- 必ず下記の情報にあるポケモン名・技名・HP のみを使う（創作禁止）",
+        "- 画像を直接見て、HPバーの位置から自分と相手のポケモンを判断すること",
+        "  （画面左上のHPバー＝相手のポケモン、画面右下のHPバー＝自分のポケモン）",
+        "- 画像に状態異常アイコンが見えたら必ず言及すること",
+        "  （まひ=黄色、やけど=橙、どく=紫、ねむり=黒、こおり=水色）",
+        "- HPが残り30%未満の時は緊張感を出す",
+        "- 鉤括弧（「」）は使わない",
         "",
-        "【参考情報（OCR・YOLO取得）】",
+        "【蓄積された戦況（複数ターン分の確定情報）】",
+        f"ターン数: {battle_state.get('turn', '不明')}",
+        f"自分のポケモン: {battle_state.get('player_pokemon', '情報収集中')}",
+        f"相手のポケモン: {battle_state.get('opponent_pokemon', '情報収集中')}",
+        f"直近のイベント履歴: {battle_state.get('event_log', 'なし')}",
+        "※ (気絶) とマークされたポケモンはすでに倒れており場にいない。絶対に言及しないこと。",
+        "",
+        "【現在フレームのOCR情報（ヒント・画像と矛盾する場合は画像優先）】",
         f"画面テキスト: {context.get('ocr_text', '不明')}",
+        f"HP値: {context.get('hp_values', '不明')}",
+        f"自分側のポケモン名候補: {context.get('name_candidates_player', '不明')}",
+        f"相手側のポケモン名候補: {context.get('name_candidates_opponent', '不明')}",
         f"自分の状態異常: {context.get('status_player', 'なし')}",
         f"相手の状態異常: {context.get('status_opponent', 'なし')}",
-        f"残りボール (自分/相手): {context.get('balls_remaining_player', '?')} / {context.get('balls_remaining_opponent', '?')}",
-        f"イベント種別: {context.get('event_type', '不明')}",
     ]
     if history:
-        lines.append(f"直前の実況: {history[-1]}")
+        lines.append(f"直前の実況（繰り返さないこと）: {history[-1]}")
+    lines += [
+        "",
+        "【状況】",
+        "（1文で状況説明）",
+        "",
+        "【実況】",
+        "（1〜2文の実況文）",
+    ]
     return "\n".join(lines)
 
 
@@ -140,7 +187,8 @@ def vision():
         return jsonify({"success": False, "error": "image_too_large", "message": "画像サイズが上限（5MB）を超えています"}), 400
 
     # Bedrock 呼び出し
-    prompt_text = _build_vision_prompt(context, history)
+    battle_state: dict = data.get("battle_state", {})
+    prompt_text = _build_vision_prompt(context, history, battle_state)
     request_body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 256,
@@ -170,11 +218,14 @@ def vision():
             contentType="application/json",
             accept="application/json",
         )
+    except ReadTimeoutError as e:
+        logger.warning("Bedrock 読み取りタイムアウト: %s", e)
+        return jsonify({"success": False, "error": "bedrock_timeout", "message": "Bedrock タイムアウト"}), 504
     except ClientError as e:
         code = e.response["Error"]["Code"]
-        if "Timeout" in code or "ThrottlingException" == code:
-            logger.warning("Bedrock タイムアウト / スロットリング: %s", e)
-            return jsonify({"success": False, "error": "bedrock_timeout", "message": f"Bedrock APIエラー: {code}"}), 504
+        if code == "ThrottlingException":
+            logger.warning("Bedrock スロットリング: %s", e)
+            return jsonify({"success": False, "error": "bedrock_timeout", "message": f"Bedrock スロットリング: {code}"}), 504
         logger.error("Bedrock ClientError: %s", e)
         return jsonify({"success": False, "error": "bedrock_error", "message": str(e)}), 502
     except Exception as e:
