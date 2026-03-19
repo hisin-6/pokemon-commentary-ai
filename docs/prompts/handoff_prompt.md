@@ -8,7 +8,7 @@
 
 ---
 
-## システム構成（Sprint 5 時点）
+## システム構成（Sprint 6 時点）
 
 ```
 OBS仮想カメラ（カメラ番号3・1920x1080）
@@ -26,9 +26,12 @@ BattlePhaseClassifier（フェーズ遷移ベースのイベント検知）
 　↓ イベント検知時
 YOLOv8（状態異常・ボール検出）
 game_state 構築（OCR y 座標で自分/相手 ポケモン名を分離）
+PokeClassifier（rapidfuzz で OCR テキストをポケモン名/技名/特性名/アイテム名に分類）
+  → 確定ポケモン名から get_pokemon_info() でタイプ・特性・代表技を取得（RAG）
 BattleStateTracker（戦況を複数ターンにわたって蓄積）
 　↓ _battle_active = True の間のみ Bedrock を呼び出す
 AWS Bedrock Claude Haiku（EC2 API経由・Vision分析 + 実況文生成）
+  → プロンプトに【ポケモン図鑑情報】セクションを追加（PokeDB RAG）
 　↓ Bedrock 失敗時フォールバック
 Phi-3 mini 4bit / Ollama（ローカル実況文生成）
 　↓
@@ -44,6 +47,12 @@ AWS S3 → 実況ログ・スクリーンショット保存
 > - `BattleStateTracker` で自分/相手それぞれ最大4匹の戦況を蓄積し Bedrock に渡す。
 > - `_battle_active` フラグで選出画面など試合外での Bedrock 呼び出しを抑制。
 
+> **重要変更（Sprint 6）**:
+> - `PokeClassifier`（`src/pokedb/classifier.py`）追加: rapidfuzz で OCR テキストをポケモン名/技名/特性名/アイテム名に fuzzy 分類。
+> - `scripts/build_pokedb.py` で PokeAPI から Gen1〜9 全ポケモンデータを SQLite に保存（`data/pokedb.sqlite`）。
+> - `_extract_structured_info` に PokeClassifier を組み込み、技名・UI文字のノイズをフィルタリング。
+> - Bedrock プロンプトに【ポケモン図鑑情報】セクション追加（タイプ・特性・代表技6つ）。
+
 ---
 
 ## アーキテクチャ決定記録（ADR）サマリー
@@ -57,6 +66,7 @@ AWS S3 → 実況ログ・スクリーンショット保存
 | ADR-005 | AWSはBedrock＋EC2＋S3 |
 | ADR-006 | 3DモデルはVRoid + バーチャルモーションキャプチャー + VB-Audio |
 | ADR-007 | イベント駆動アーキテクチャ（BattlePhaseClassifier + BattleStateTracker） |
+| ADR-008 | PokeDB設計（SQLite + rapidfuzz、PostgreSQL移行条件） |
 
 詳細: `docs/adr/`
 
@@ -81,8 +91,8 @@ AWS S3 → 実況ログ・スクリーンショット保存
 | Sprint 2 | Bedrock連携 + EC2 API + S3 | ✅ 完了 |
 | Sprint 3 | VOICEVOX + バーチャルモーションキャプチャー | ✅ 完了 |
 | Sprint 4 | YOLOv8学習・導入 | ✅ 完了 |
-| Sprint 5 | パイプライン統合 | 🔄 動作確認中 |
-| Sprint 6 | 実況品質向上（RAG + OCR改善） | 📋 計画中 |
+| Sprint 5 | パイプライン統合 | ✅ 完了 |
+| Sprint 6 | 実況品質向上（PokeDB RAG + OCR分類改善） | ✅ 完了 |
 | Sprint 7 | 検出精度向上（ボール検出 + 音声二重化） | 📋 計画中 |
 | Sprint 8 | Fine-tuning（Phi-3 LoRA） | 📋 計画中 |
 | Sprint 9 | キャラクター強化（音声・3Dモデル改善） | 📋 アイデア段階 |
@@ -91,15 +101,24 @@ AWS S3 → 実況ログ・スクリーンショット保存
 
 ## ロードマップ詳細
 
-### Sprint 5 完了タスク（最優先）
-- [ ] `src/api/server.py` を EC2 に WinSCP で転送 → gunicorn 再起動
-- [ ] 統合テスト: 選出画面誤実況・battle_start/end 検知・BattleStateTracker 精度を確認
+### Sprint 5 完了タスク ✅
+- [x] `src/api/server.py` を EC2 に WinSCP で転送 → gunicorn 再起動
 
-### Sprint 6: 実況品質向上（RAG + OCR改善）
-- [ ] PokeAPI から全ポケモンDBを JSON に作成するスクリプト
-- [ ] `pipeline.py` に DB 参照を組み込み（OCR検出名 → タイプ・特性・代表技を取得）
-- [ ] `server.py` プロンプトに `pokemon_info` セクション追加
-- [ ] OCR ノイズフィルター改善（アイテム名・UIテキストの混入対策）
+### Sprint 6 完了タスク ✅
+
+**DB構成**: SQLite（`data/pokedb.sqlite`）+ rapidfuzz / 対象: 第9世代のみ
+※ 将来 Web可視化・複雑分析が必要になった場合は PostgreSQL 移行を検討（ADR-008）
+
+- [x] `scripts/build_pokedb.py`: PokeAPI から Gen1〜9 全データ取得 → SQLite 保存
+  - 収録: 1025ポケモン / 919技 / 306特性 / 1953アイテム（日英）
+- [x] `src/pokedb/classifier.py`: OCR テキスト分類モジュール
+  - rapidfuzz WRatio で曖昧マッチング（閾値: 90=確定 / 75〜89=候補 / 75未満=除外）
+  - 分類結果: pokemon / move / ability / item / unknown
+  - `get_pokemon_info()` でタイプ・特性・代表技を取得（RAG用）
+- [x] `src/pipeline.py`: `_extract_structured_info` に PokeClassifier 組み込み
+  - OCR テキストを fuzzy 分類してポケモン名のみを name_candidates に採用
+- [x] `src/api/server.py`: RAG セクション追加（デプロイ済み）
+  - 確定ポケモン名 → タイプ・特性・代表技6つをプロンプトの【ポケモン図鑑情報】に追加
 
 ### Sprint 7: 検出精度向上
 - [ ] ボール検出改善（YOLO Recall=0 の根本原因調査 → 再学習 or 代替手法検討）
@@ -128,7 +147,7 @@ AWS S3 → 実況ログ・スクリーンショット保存
 
 ```powershell
 # パイプライン起動（Bedrock あり）
-venv\Scripts\python.exe src/pipeline.py --camera 3 --model runs/detect/train4/weights/best.pt --ec2-url http://13.211.11.202:5000
+venv\Scripts\python.exe src/pipeline.py --camera 3 --model runs/detect/train4/weights/best.pt --ec2-url http://<EC2-IP>:5000
 
 # パイプライン起動（Bedrock なし・Phi-3のみ）
 venv\Scripts\python.exe src/pipeline.py --camera 3 --model runs/detect/train4/weights/best.pt
@@ -151,14 +170,14 @@ venv\Scripts\python.exe src/pipeline.py --camera 3 --model runs/detect/train4/we
   cd /home/app_admin/pokemon-api
   venv/bin/gunicorn -w 2 -b 127.0.0.1:8000 server:app --daemon
   ```
-- ヘルスチェック: `curl -UseBasicParsing http://13.211.11.202:5000/health`
+- ヘルスチェック: `curl -UseBasicParsing http://<EC2-IP>:5000/health`
 
 ---
 
-## 次回作業（Sprint 5 完了 → Sprint 6 開始）
+## 次回作業（Sprint 6 完了 → Sprint 7 開始）
 
-1. EC2 に `server.py` デプロイ → 統合テスト
-2. テスト結果を確認して Sprint 6（RAG実装）へ
+1. パイプライン再起動して Sprint 6 統合テスト（PokeDB RAG が実況に反映されているか確認）
+2. Sprint 7（ボール検出改善 + 音声出力二重化）へ
 
 ---
 
