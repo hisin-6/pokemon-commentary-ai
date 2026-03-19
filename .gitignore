@@ -15,6 +15,15 @@ debug/
 # パイプラインログ（pipeline.pyが自動生成）
 logs/
 
+# PokeAPI キャッシュ（336MB、scripts/build_pokedb.pyが生成）
+data/pokeapi_cache/
+
+# PokeDB（build_pokedb.pyで再生成可能なバイナリ）
+data/pokedb.sqlite
+
+# VS Code ワークスペース設定
+.vscode/
+
 # テスト・学習用画像（大きいのでGit管理しない）
 data/test_images/ocr/*.png
 data/test_images/ocr/*.jpg
