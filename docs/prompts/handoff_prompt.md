@@ -8,7 +8,7 @@
 
 ---
 
-## システム構成（Sprint 6 時点）
+## システム構成（Sprint 7 時点）
 
 ```
 OBS仮想カメラ（カメラ番号3・1920x1080）
@@ -53,6 +53,15 @@ AWS S3 → 実況ログ・スクリーンショット保存
 > - `_extract_structured_info` に PokeClassifier を組み込み、技名・UI文字のノイズをフィルタリング。
 > - Bedrock プロンプトに【ポケモン図鑑情報】セクション追加（タイプ・特性・代表技6つ）。
 
+> **重要変更（Sprint 6 追加改善）**:
+> - `BattleStateTracker` 刷新: `PokemonSlot` → `FieldPokemon`（on_field/moves_used/last_seen_turn 追加）。場の2匹と控えを分離管理。
+> - HP 値を y 座標で自分/相手に分類して正確に紐付け（`hp_values_player` / `hp_values_opponent`）。
+> - `to_context()` を「自分の場/控え/相手の場/控え」分離フォーマットに変更し `server.py` プロンプトも対応。
+> - バグ修正: ゴリランダー誤気絶（HP=0 即気絶を削除・faintイベント時のみ気絶判定）/ 「相手の〇〇」技ログ混入（`_INVALID_POKEMON_PREFIXES` 追加）/ 中国語ポケモン名の相手エリア候補登録。
+> - 韓国語ポケモン名対応: `init_reader_ko()`（ko+en の別 Reader）/ `PokeClassifier._is_pure_hangul()` / `name_ko` カラム（PokeDB）追加。
+> - ターン過剰カウント修正: OCR 件数不足・バトル外フレームをスキップ / `BattlePhaseClassifier.reset_after_processing()` 追加。
+> - 自動テスト 162 件導入（`tests/` ディレクトリ・pytest 約 2 秒）。
+
 ---
 
 ## アーキテクチャ決定記録（ADR）サマリー
@@ -92,8 +101,8 @@ AWS S3 → 実況ログ・スクリーンショット保存
 | Sprint 3 | VOICEVOX + バーチャルモーションキャプチャー | ✅ 完了 |
 | Sprint 4 | YOLOv8学習・導入 | ✅ 完了 |
 | Sprint 5 | パイプライン統合 | ✅ 完了 |
-| Sprint 6 | 実況品質向上（PokeDB RAG + OCR分類改善） | ✅ 完了 |
-| Sprint 7 | 検出精度向上（ボール検出 + 音声二重化） | 📋 計画中 |
+| Sprint 6 | 実況品質向上（PokeDB RAG + OCR分類改善 + BattleStateTracker刷新） | ✅ 完了 |
+| Sprint 7 | 検出精度向上（ボール検出 + 戦況・ターン検知改善 + 音声二重化） | 🔧 進行中 |
 | Sprint 8 | Fine-tuning（Phi-3 LoRA） | 📋 計画中 |
 | Sprint 9 | キャラクター強化（音声・3Dモデル改善） | 📋 アイデア段階 |
 
@@ -110,20 +119,31 @@ AWS S3 → 実況ログ・スクリーンショット保存
 ※ 将来 Web可視化・複雑分析が必要になった場合は PostgreSQL 移行を検討（ADR-008）
 
 - [x] `scripts/build_pokedb.py`: PokeAPI から Gen1〜9 全データ取得 → SQLite 保存
-  - 収録: 1025ポケモン / 919技 / 306特性 / 1953アイテム（日英）
+  - 収録: 1025ポケモン / 919技 / 306特性 / 1953アイテム（日英・韓国語名 `name_ko` 追加済み）
 - [x] `src/pokedb/classifier.py`: OCR テキスト分類モジュール
   - rapidfuzz WRatio で曖昧マッチング（閾値: 90=確定 / 75〜89=候補 / 75未満=除外）
   - 分類結果: pokemon / move / ability / item / unknown
   - `get_pokemon_info()` でタイプ・特性・代表技を取得（RAG用）
+  - 韓国語名マッチング: `_is_pure_hangul()` / `_best_match_ko()` 追加
 - [x] `src/pipeline.py`: `_extract_structured_info` に PokeClassifier 組み込み
   - OCR テキストを fuzzy 分類してポケモン名のみを name_candidates に採用
-- [x] `src/api/server.py`: RAG セクション追加（デプロイ済み）
+  - 韓国語OCR: イベント時のみ `reader_ko` を追加実行してハングル結果をマージ
+  - ターン品質チェック: OCR 件数不足・バトル外フレームをスキップ
+- [x] `src/api/server.py`: RAG セクション追加
   - 確定ポケモン名 → タイプ・特性・代表技6つをプロンプトの【ポケモン図鑑情報】に追加
+  - プロンプトを「自分の場/控え/相手の場/控え」分離フォーマットに対応
+- [x] `BattleStateTracker` 刷新（`src/pipeline.py`）
+  - `FieldPokemon`（on_field / moves_used / last_seen_turn）で場と控えを分離管理
+  - HP 値を y 座標で自分/相手に分類・faintイベント時のみ気絶判定（誤気絶バグ修正）
+- [x] 自動テスト 162 件導入（`tests/`・pytest 約 2 秒）
 
-### Sprint 7: 検出精度向上
+### Sprint 7: 検出精度向上 🔧
 - [ ] ボール検出改善（YOLO Recall=0 の根本原因調査 → 再学習 or 代替手法検討）
   - 現状: OBS映像からの検出が Recall=0（学習データと映像の差異が原因の可能性）
   - 候補手法: YOLO再学習 / OpenCV テンプレートマッチング / HSV色検出
+- [ ] 戦況・ターン検知の改善
+  - BattleStateTracker / BattlePhaseClassifier の検知精度向上
+  - 詳細はボール検出改善完了後に確定
 - [ ] 音声出力二重化（Voicemeeter で CABLE Input + スピーカー同時出力）
 
 ### Sprint 8: Fine-tuning 準備・実行
@@ -174,10 +194,11 @@ venv\Scripts\python.exe src/pipeline.py --camera 3 --model runs/detect/train4/we
 
 ---
 
-## 次回作業（Sprint 6 完了 → Sprint 7 開始）
+## 次回作業（Sprint 7 進行中）
 
-1. パイプライン再起動して Sprint 6 統合テスト（PokeDB RAG が実況に反映されているか確認）
-2. Sprint 7（ボール検出改善 + 音声出力二重化）へ
+1. ボール検出改善（HSV色検出 or テンプレートマッチングで Recall=0 を解消）
+2. 戦況・ターン検知の改善（詳細はボール検出完了後に確定）
+3. 音声出力二重化（Voicemeeter で CABLE Input + スピーカー同時出力）
 
 ---
 

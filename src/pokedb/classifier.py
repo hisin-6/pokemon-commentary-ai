@@ -85,18 +85,23 @@ class PokeClassifier:
 
         # カテゴリ別に (canonical_ja, canonical_en) のリストをメモリに展開
         # rapidfuzz は日本語名リストに対して検索する
-        self._pokemon:  list[tuple[str, str]] = []
-        self._moves:    list[tuple[str, str]] = []
-        self._abilities:list[tuple[str, str]] = []
-        self._items:    list[tuple[str, str]] = []
+        self._pokemon:    list[tuple[str, str]] = []
+        self._moves:      list[tuple[str, str]] = []
+        self._abilities:  list[tuple[str, str]] = []
+        self._items:      list[tuple[str, str]] = []
+
+        # 韓国語名 → 日本語名 の対応リスト（ハングルOCR用）
+        # (name_ko, name_ja) のタプルリスト
+        self._pokemon_ko: list[tuple[str, str]] = []
 
         # pokemon_id → row のキャッシュ（RAG 用）
         self._pokemon_rows: dict[str, dict] = {}
 
         self._load()
         log.info(
-            "PokeClassifier 初期化完了: pokemon=%d, moves=%d, abilities=%d, items=%d",
-            len(self._pokemon), len(self._moves), len(self._abilities), len(self._items),
+            "PokeClassifier 初期化完了: pokemon=%d (ko=%d), moves=%d, abilities=%d, items=%d",
+            len(self._pokemon), len(self._pokemon_ko),
+            len(self._moves), len(self._abilities), len(self._items),
         )
 
     # ── ロード ───────────────────────────────────────────────────────────────
@@ -105,9 +110,24 @@ class PokeClassifier:
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
         try:
-            for row in conn.execute("SELECT id, name_ja, name_en, type1, type2, ability1, ability2, ability_hidden FROM pokemon"):
+            try:
+                rows = conn.execute(
+                    "SELECT id, name_ja, name_en, name_ko, type1, type2, ability1, ability2, ability_hidden FROM pokemon"
+                ).fetchall()
+                has_ko = True
+            except sqlite3.OperationalError:
+                # 古い DB（name_ko カラムなし）→ 韓国語対応スキップ
+                log.warning("name_ko カラムが見つかりません。scripts/build_pokedb.py を再実行してください。")
+                rows = conn.execute(
+                    "SELECT id, name_ja, name_en, type1, type2, ability1, ability2, ability_hidden FROM pokemon"
+                ).fetchall()
+                has_ko = False
+
+            for row in rows:
                 self._pokemon.append((row["name_ja"], row["name_en"]))
                 self._pokemon_rows[row["name_ja"]] = dict(row)
+                if has_ko and row["name_ko"]:
+                    self._pokemon_ko.append((row["name_ko"], row["name_ja"]))
 
             for row in conn.execute("SELECT name_ja, name_en FROM moves"):
                 self._moves.append((row["name_ja"], row["name_en"]))
@@ -120,16 +140,41 @@ class PokeClassifier:
         finally:
             conn.close()
 
+    # ── ハングル検出 ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_hangul(text: str) -> bool:
+        """文字列にハングル（AC00–D7A3）が1文字以上含まれるか判定する。"""
+        return any("\uAC00" <= ch <= "\uD7A3" for ch in text)
+
+    @staticmethod
+    def _is_pure_hangul(text: str) -> bool:
+        """スペースを除いた全文字がハングルかどうかを判定する。
+        韓国語ポケモン名は純粋なハングルのみで構成される（例: 뽀록나, 테라파고스）。
+        数字・英字・記号が混じるOCRノイズを除外するために使用する。
+        """
+        stripped = text.replace(" ", "")
+        return len(stripped) >= 2 and all("\uAC00" <= ch <= "\uD7A3" for ch in stripped)
+
     # ── メイン分類 ───────────────────────────────────────────────────────────
 
     def classify(self, text: str) -> ClassifyResult:
         """
         テキストを最もスコアが高いカテゴリに分類して返す。
 
+        ハングルを含む場合は韓国語ポケモン名リストで優先マッチングする。
         スコアが CANDIDATE_THRESHOLD 未満の場合は UNKNOWN を返す。
         """
         if not text or len(text) < 2:
             return _UNKNOWN
+
+        # 純粋なハングル（数字・記号混じりのOCRノイズを除外）の場合は韓国語ポケモン名で先にマッチング
+        if self._is_pure_hangul(text) and self._pokemon_ko:
+            ko_result = self._best_match_ko(text)
+            if ko_result and ko_result.score >= CANDIDATE_THRESHOLD:
+                log.debug("韓国語ポケモン名マッチ: %s → %s (%.1f)", text, ko_result.canonical_ja, ko_result.score)
+                return ko_result
+            return _UNKNOWN  # ハングル文字がポケモン名以外にマッチしないよう抑制
 
         best = _UNKNOWN
 
@@ -157,25 +202,68 @@ class PokeClassifier:
     def _best_match(
         self, text: str, entries: list[tuple[str, str]]
     ) -> ClassifyResult | None:
-        """rapidfuzz で最も近いエントリを返す（内部用）。"""
+        """rapidfuzz で最も近いエントリを返す（内部用）。
+        日本語名・英語名の両方を検索し、スコアの高い方を返す。
+        """
         if not entries:
             return None
 
         ja_names = [e[0] for e in entries]
+        en_names = [e[1] for e in entries]
 
         # WRatio: partial_ratio と token_sort_ratio を組み合わせた汎用スコアラー
         # 日本語の短い名前には ratio も有効だが、OCR 短縮（エルフー→エルフーン）に WRatio が有効
-        match = process.extractOne(text, ja_names, scorer=fuzz.WRatio)
-        if not match:
-            return None
+        ja_match = process.extractOne(text, ja_names, scorer=fuzz.WRatio)
+        en_match = process.extractOne(text, en_names, scorer=fuzz.WRatio) if any(en_names) else None
 
-        matched_ja, score, idx = match
-        matched_en = entries[idx][1]
+        # 日本語・英語のうちスコアが高い方を採用
+        best_match = None
+        best_score = 0.0
+        matched_ja = matched_en = ""
+
+        if ja_match and ja_match[1] > best_score:
+            matched_ja, best_score, idx = ja_match
+            matched_en = entries[idx][1]
+            best_match = (matched_ja, best_score, idx, "ja")
+
+        if en_match and en_match[1] > best_score:
+            matched_en_name, en_score, en_idx = en_match
+            matched_ja = entries[en_idx][0]
+            matched_en = matched_en_name
+            best_score = en_score
+            best_match = (matched_ja, best_score, en_idx, "en")
+
+        if not best_match:
+            return None
 
         return ClassifyResult(
             category=CATEGORY_UNKNOWN,   # 呼び出し元で上書き
             canonical_ja=matched_ja,
             canonical_en=matched_en,
+            score=float(best_score),
+            confident=best_score >= CONFIDENT_THRESHOLD,
+        )
+
+    def _best_match_ko(self, text: str) -> ClassifyResult | None:
+        """韓国語ポケモン名リストに対して rapidfuzz マッチングし、日本語名を返す（内部用）。"""
+        if not self._pokemon_ko:
+            return None
+
+        ko_names = [e[0] for e in self._pokemon_ko]
+        match = process.extractOne(text, ko_names, scorer=fuzz.WRatio)
+        if not match:
+            return None
+
+        matched_ko, score, idx = match
+        canonical_ja = self._pokemon_ko[idx][1]
+        # canonical_en は pokemon_rows から引く
+        row = self._pokemon_rows.get(canonical_ja)
+        canonical_en = row["name_en"] if row else ""
+
+        return ClassifyResult(
+            category=CATEGORY_POKEMON,
+            canonical_ja=canonical_ja,
+            canonical_en=canonical_en,
             score=float(score),
             confident=score >= CONFIDENT_THRESHOLD,
         )

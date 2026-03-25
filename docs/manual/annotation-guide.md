@@ -159,6 +159,76 @@ venv\Scripts\python.exe src/capture/screen_capture.py --yolo --model runs/detect
 
 ---
 
+## ボール検出専用データセット（Sprint 7 追加作業）
+
+### 背景
+
+フルフレーム学習ではボールアイコン（平均27×25px）が小さすぎてYOLOv8nが検出できなかった（Recall=0）。
+ROIクロップ画像に対して学習することでスケール問題を解消し、yolov8sで再学習する。
+
+### データセット生成（スクリプト自動実行済み）
+
+```bash
+python scripts/crop_ball_rois.py
+```
+
+- 出力先: `data/ball_dataset/`
+- 既存アノテーション（クラスID 7/8/9）をROI座標系に自動変換済み
+- train: 842枚（自動ラベル165枚・ネガティブ677枚）/ val: 210枚（自動ラベル49枚・ネガティブ161枚）
+
+### アノテーションツール（ボール専用データセット）
+
+> **Sprint 7 以降は Label Studio + ML Backend を使用**（LabelImg から移行済み）
+> セットアップ手順: `scripts/ls_ml_backend/README.md` を参照
+
+```powershell
+# Label Studio 起動
+$env:LOCAL_FILES_SERVING_ENABLED = "true"
+venv\Scripts\label-studio.exe start --port 8080
+
+# ML Backend 起動（別ウィンドウ）
+$env:YOLO_MODEL_PATH = "runs/detect/pretrain_ball/weights/best.pt"
+$env:BALL_DATASET_ROOT = "data/ball_dataset"
+venv\Scripts\python.exe scripts/ls_ml_backend/_wsgi.py
+```
+
+### クラス定義（3クラスのみ）
+
+| ID | クラス名 | 内容 |
+|----|---------|------|
+| 0 | ball_alive | 生存ポケモンのボール（白・通常色） |
+| 1 | ball_faint | 瀕死ポケモンのボール（暗い・×マーク） |
+| 2 | ball_status | 状態異常ポケモンのボール（黄色っぽい） |
+
+### 作業方針
+
+- `_opponent.png` → 画面右上のボール列クロップ
+- `_player.png` → 画面左下のボール列クロップ
+- YOLO の自動プレラベルを確認・修正して Submit
+- **ボールなし画像**: 枠を描かずそのまま **Submit**（Skip は使わない）
+
+### 再学習コマンド（アノテーション完了後）
+
+```powershell
+# Step 1: Label Studio から JSON エクスポート → プロジェクトルートに保存
+# Step 2: YOLO 形式に変換
+venv\Scripts\python.exe scripts/export_to_yolo.py annotations.json
+
+# Step 3: 本番モデル再学習
+venv\Scripts\yolo.exe train model=yolov8s.pt data=data/ball_dataset/data.yaml imgsz=640 epochs=100 batch=8
+```
+
+> ⚠️ モデルは `yolov8n.pt` → **`yolov8s.pt`** に変更（小物体検出精度向上のため）
+> ⚠️ `python -m ultralytics` は動かない。`yolo.exe` を使うこと。
+
+### yolo_detector.py への組み込み（学習完了後）
+
+学習完了後に `runs/detect/trainXX/weights/best.pt` を確認し、
+`pipeline.py` の `--model` 引数を新しいモデルパスに変更する。
+ただし新モデルはボール専用（クラスID 0/1/2）なので `CUSTOM_CLASS_NAMES` の更新も必要。
+
+---
+
 ## 既知の問題と対処
 
 ### LabelImg が Python 3.12 でエラーになる

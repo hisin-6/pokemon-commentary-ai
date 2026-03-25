@@ -35,6 +35,7 @@ log = logging.getLogger(__name__)
 # ─── 定数 ───────────────────────────────────────────────────────────────────
 
 # カスタム学習時のクラス定義（class_id → ラベル名）
+# train4 形式: 状態異常 0-6 + ボール 7-9
 CUSTOM_CLASS_NAMES: dict[int, str] = {
     0: "poison",       # どく
     1: "bad_poison",   # どくどく
@@ -46,6 +47,13 @@ CUSTOM_CLASS_NAMES: dict[int, str] = {
     7: "ball_alive",   # 生存ポケモンのボール
     8: "ball_faint",   # 瀕死ポケモンのボール
     9: "ball_status",  # 状態異常ポケモンのボール（黄色）
+}
+
+# ボール検出専用モデルのクラス定義（train5 形式: ボールのみ 0-2）
+BALL_CLASS_NAMES: dict[int, str] = {
+    0: "ball_alive",   # 生存ポケモンのボール（白）
+    1: "ball_faint",   # 瀕死ポケモンのボール（グレー）
+    2: "ball_status",  # 状態異常ポケモンのボール（黄色）
 }
 
 BALL_LABELS = {"ball_alive", "ball_faint", "ball_status"}
@@ -134,6 +142,7 @@ class YoloDetector:
     def __init__(
         self,
         model_path: str | None = None,
+        ball_model_path: str | None = None,
         device: str | None = None,
         conf: float = CONFIDENCE_THRESHOLD,
     ) -> None:
@@ -157,8 +166,20 @@ class YoloDetector:
             self._model = YOLO("yolov8n.pt")  # 自動DL（約6MB）
             self._mode = "pretrained_only"
 
+        # ボール検出専用モデル（train5 形式: 0=ball_alive / 1=ball_faint / 2=ball_status）
+        self._ball_model: object | None = None
+        if ball_model_path:
+            bp = Path(ball_model_path)
+            if not bp.exists():
+                raise FileNotFoundError(f"ボールモデルファイルが見つかりません: {ball_model_path}")
+            log.info(f"ボール検出専用モデルをロード: {ball_model_path}")
+            self._ball_model = YOLO(str(bp))
+
         self._device = device or self._auto_device()
-        log.info(f"YoloDetector 初期化完了 (mode={self._mode}, device={self._device})")
+        log.info(
+            f"YoloDetector 初期化完了 (mode={self._mode}, device={self._device}, "
+            f"ball_model={'あり' if self._ball_model else 'なし'})"
+        )
 
     @staticmethod
     def _auto_device() -> str:
@@ -249,13 +270,18 @@ class YoloDetector:
         ROIごとにクロップして推論する。
         フルフレーム推論より小さいアイコンの検出精度が高い。
         ball系ラベルは _balls ROIからのみ、状態異常ラベルは _status ROIからのみ採用する。
+        ball_model が指定されている場合、_balls ROI はボール専用モデルで推論する。
         """
         all_detections: list[Detection] = []
         for roi_name, roi_ratio in ROIS.items():
             crop, (x_off, y_off) = self.crop_roi(frame, roi_ratio)
             if crop.size == 0:
                 continue
-            results = self._model(crop, conf=self._conf, device=self._device, verbose=False)
+            is_ball_roi = roi_name.endswith("_balls")
+            # ボール ROI かつ専用モデルがある場合は ball_model を使う
+            model = self._ball_model if (is_ball_roi and self._ball_model) else self._model
+            class_names = BALL_CLASS_NAMES if (is_ball_roi and self._ball_model) else CUSTOM_CLASS_NAMES
+            results = model(crop, conf=self._conf, device=self._device, verbose=False)
             for r in results:
                 if r.boxes is None:
                     continue
@@ -263,10 +289,10 @@ class YoloDetector:
                     cls_id  = int(box.cls[0])
                     conf    = float(box.conf[0])
                     x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
-                    label   = CUSTOM_CLASS_NAMES.get(cls_id, f"class_{cls_id}")
+                    label   = class_names.get(cls_id, f"class_{cls_id}")
                     # ROI種別とラベル種別が一致しない検出は除外
                     # （opponent_status ROI にボールが映っても無視する等）
-                    if roi_name.endswith("_balls") != (label in BALL_LABELS):
+                    if is_ball_roi != (label in BALL_LABELS):
                         continue
                     all_detections.append(Detection(
                         class_id=cls_id,
@@ -276,6 +302,49 @@ class YoloDetector:
                         roi_name=roi_name,
                     ))
         return all_detections
+
+    def detect_balls(self, frame: np.ndarray, conf: float = 0.15, debug_dir: str | None = None) -> BattleState:
+        """
+        ボールROIのみ低い信頼度閾値で検出する（コマンド選択画面専用）。
+        通常の detect() より低い conf を使うことで、検出漏れを防ぐ。
+        debug_dir を指定するとROIクロップ画像を保存する（診断用）。
+        """
+        if not self._ball_model or not self._custom_model:
+            return BattleState(mode=self._mode)
+
+        import cv2, time
+        all_detections: list[Detection] = []
+        for roi_name, roi_ratio in ROIS.items():
+            if not roi_name.endswith("_balls"):
+                continue
+            crop, (x_off, y_off) = self.crop_roi(frame, roi_ratio)
+            if crop.size == 0:
+                continue
+            if debug_dir:
+                ts = int(time.time() * 1000) % 100000
+                cv2.imwrite(f"{debug_dir}/ball_roi_{roi_name}_{ts}.png", crop)
+            results = self._ball_model(crop, conf=conf, device=self._device, verbose=False)
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    confidence = float(box.conf[0])
+                    x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+                    label = BALL_CLASS_NAMES.get(cls_id, f"class_{cls_id}")
+                    all_detections.append(Detection(
+                        class_id=cls_id,
+                        label=label,
+                        confidence=confidence,
+                        bbox=(x1 + x_off, y1 + y_off, x2 + x_off, y2 + y_off),
+                        roi_name=roi_name,
+                    ))
+
+        state = BattleState(mode=self._mode)
+        state.detections = all_detections
+        state.player_balls   = self._count_balls(all_detections, "player_balls")
+        state.opponent_balls = self._count_balls(all_detections, "opponent_balls")
+        return state
 
     # ─── メイン検出 ──────────────────────────────────────────────────────────
 
@@ -366,7 +435,9 @@ def main() -> None:
     parser.add_argument("--image", required=True, metavar="PATH",
                         help="テスト用画像ファイルのパス")
     parser.add_argument("--model", metavar="PATH", default=None,
-                        help="カスタム学習済みモデルのパス（省略で yolov8n.pt）")
+                        help="カスタム学習済みモデルのパス（状態異常検出用・省略で yolov8n.pt）")
+    parser.add_argument("--ball-model", metavar="PATH", default=None,
+                        help="ボール検出専用モデルのパス（train5形式: 0=ball_alive/1=ball_faint/2=ball_status）")
     parser.add_argument("--save", metavar="PATH", default=None,
                         help="可視化画像の保存先（省略で debug/yolo_<元ファイル名>.png）")
     parser.add_argument("--conf", type=float, default=CONFIDENCE_THRESHOLD,
@@ -393,7 +464,12 @@ def main() -> None:
     log.info(f"画像サイズ: {frame.shape[1]}x{frame.shape[0]}")
 
     device = "cpu" if args.cpu else None
-    detector = YoloDetector(model_path=args.model, device=device, conf=args.conf)
+    detector = YoloDetector(
+        model_path=args.model,
+        ball_model_path=args.ball_model,
+        device=device,
+        conf=args.conf,
+    )
     state = detector.detect(frame)
 
     print("\n" + "=" * 50)

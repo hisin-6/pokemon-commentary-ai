@@ -1,0 +1,12 @@
+# ボール検出専用データセット
+# ROI クロップ学習でスケール問題を解消し、yolov8s で再学習する
+
+path: data/ball_dataset
+train: images/train
+val:   images/val
+
+nc: 3
+names:
+  0: ball_alive   # 生存ポケモンのボール（白）
+  1: ball_faint   # 瀕死ポケモンのボール（グレー）
+  2: ball_status  # 状態異常ポケモンのボール（黄色）

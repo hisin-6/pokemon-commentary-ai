@@ -42,7 +42,7 @@ _ROOT = str(Path(__file__).parent.parent)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from src.capture.screen_capture import DiffDetector, init_reader, run_ocr
+from src.capture.screen_capture import DiffDetector, init_reader, init_reader_ko, run_ocr
 from src.capture.yolo_detector import BattleState, YoloDetector
 from src.commentary.phi3_client import Phi3Client
 from src.output.audio_player import AudioPlayer
@@ -312,12 +312,14 @@ def _build_game_state(
     実況文生成の追加コンテキストとして渡す。
     """
     # YOLO から状態異常・ボール数を取得
+    # 状態異常は現在フレームから、ボール数はボールが見えていた最新フレーム（prev_yolo）から補完
     status_text = yolo_state.player_status or "なし"
     if yolo_state.opponent_status:
         status_text += f" / 相手: {yolo_state.opponent_status}"
 
-    p_balls = yolo_state.player_balls.alive
-    o_balls = yolo_state.opponent_balls.alive
+    ball_src = prev_yolo if prev_yolo else yolo_state
+    p_balls = ball_src.player_balls.alive
+    o_balls = ball_src.opponent_balls.alive
 
     structured = _extract_structured_info(ocr_results, classifier)
 
@@ -382,6 +384,16 @@ class BattlePhaseClassifier:
 
     def set_processing(self, v: bool) -> None:
         self._is_processing = v
+
+    def reset_after_processing(self) -> None:
+        """処理完了後にフェーズ履歴をリセットし、直後の誤発火を防ぐ。
+        処理中に _prev_phase が command_select で止まっていると、
+        処理完了直後のフレームで command_select → unknown 遷移として
+        move_used が即再発火する問題を防ぐ。
+        """
+        self._prev_phase = "unknown"
+        # move_used デバウンスを現在時刻に更新（処理完了直後の再発火を抑止）
+        self._last_event_time["move_used"] = time.time()
 
     def classify(self, ocr_results: list[dict]) -> str:
         """OCR 結果から現在のフェーズを判定する（優先度順）。"""
@@ -906,6 +918,7 @@ class Pipeline:
         self,
         camera_index: int,
         model_path: str | None,
+        ball_model_path: str | None,
         interval: float,
         speaker: int,
         gpu: bool,
@@ -918,8 +931,11 @@ class Pipeline:
         log.info("EasyOCR 初期化中...")
         self._reader = init_reader(gpu=gpu)
 
+        log.info("EasyOCR 韓国語リーダー初期化中（韓国語起源ポケモン名の検出用）...")
+        self._reader_ko = init_reader_ko(gpu=gpu)
+
         log.info("YoloDetector 初期化中...")
-        self._yolo = YoloDetector(model_path=model_path, conf=conf)
+        self._yolo = YoloDetector(model_path=model_path, ball_model_path=ball_model_path, conf=conf)
 
         log.info("Phi-3 クライアント初期化...")
         self._phi3 = Phi3Client()
@@ -941,6 +957,7 @@ class Pipeline:
         self._battle_tracker = BattleStateTracker()       # 戦況累積
         self._battle_active = False  # battle_start〜battle_end の間のみ True
         self._prev_yolo: BattleState | None = None
+        self._last_ball_yolo: BattleState | None = None  # ボールが見えたフレームの最新 YOLO 結果
         self._commentary_history: list[str] = []
         self._move_log: list[str] = []   # OCRから検出した「使われた技」のリングバッファ
         self._MAX_MOVE_LOG = 8
@@ -986,6 +1003,15 @@ class Pipeline:
                 yolo_state = self._yolo.detect(frame)
                 if yolo_state.detections:
                     log.debug(f"[YOLO] {yolo_state.summary()}")
+                # ボールが見えているフレームを記憶（イベント時は animation 中でボールが映らないため）
+                if yolo_state.player_balls.total > 0 or yolo_state.opponent_balls.total > 0:
+                    self._last_ball_yolo = yolo_state
+                elif self._phase_classifier._prev_phase == "command_select":
+                    # コマンド選択中はボールアイコンが必ず表示されるため低閾値で再検出
+                    ball_state = self._yolo.detect_balls(frame, conf=0.05)
+                    if ball_state.player_balls.total > 0 or ball_state.opponent_balls.total > 0:
+                        self._last_ball_yolo = ball_state
+                        log.debug(f"[YOLO/balls] コマンド選択時に検出: {ball_state.summary()}")
 
                 # ── 差分検出（静止フレームの OCR スキップ用）────────────────
                 diff_changed, diff_score = self._diff_detector.detect(frame)
@@ -1014,14 +1040,34 @@ class Pipeline:
                     # ── フェーズ分類 + イベント検知 ─────────────────────────
                     event_type = self._phase_classifier.detect(ocr_results)
 
+                    # フェーズ確定後にボール検出を補完（YOLO検出時点では_prev_phaseが未更新のため）
+                    if self._phase_classifier._prev_phase == "command_select":
+                        if not self._last_ball_yolo or self._last_ball_yolo.player_balls.total == 0:
+                            ball_state = self._yolo.detect_balls(frame, conf=0.05)
+                            if ball_state.player_balls.total > 0 or ball_state.opponent_balls.total > 0:
+                                self._last_ball_yolo = ball_state
+                                log.debug(f"[YOLO/balls] フェーズ確定後に検出: {ball_state.summary()}")
+
                     if event_type:
-                        turn += 1
-                        log.info(f"[ターン {turn}] イベント検知 (diff={diff_score:.1f}, type={event_type}, phase={self._phase_classifier._prev_phase})")
-                        self._phase_classifier.set_processing(True)
-                        try:
-                            self._process_event(frame, yolo_state, ocr_results, event_type, turn)
-                        finally:
-                            self._phase_classifier.set_processing(False)
+                        # ターンカウント前の品質チェック
+                        # OCR 件数不足 or バトル外画面の場合はカウントも実況もスキップ
+                        if event_type != "battle_end" and (
+                            len(ocr_results) < 2 or not _is_battle_screen(ocr_results)
+                        ):
+                            log.info(
+                                f"OCR 品質不足（{len(ocr_results)} 件）またはバトル外 → "
+                                f"イベント '{event_type}' をスキップ（ターン未カウント）"
+                            )
+                        else:
+                            turn += 1
+                            log.info(f"[ターン {turn}] イベント検知 (diff={diff_score:.1f}, type={event_type}, phase={self._phase_classifier._prev_phase})")
+                            self._phase_classifier.set_processing(True)
+                            try:
+                                self._process_event(frame, yolo_state, ocr_results, event_type, turn)
+                            finally:
+                                self._phase_classifier.set_processing(False)
+                                # 処理完了後にフェーズ状態をリセット（直後の誤発火防止）
+                                self._phase_classifier.reset_after_processing()
 
                 self._prev_yolo = yolo_state
 
@@ -1054,8 +1100,26 @@ class Pipeline:
             log.info(f"OCR 件数が少なすぎる（{len(ocr_results)} 件）→ スキップ")
             return
 
+        # ── 韓国語OCR（イベント時のみ追加実行してハングル結果をマージ）──────────
+        # 毎フレームではなくイベント処理時だけ実行し、遅延増加を最小限に抑える
+        ko_results = run_ocr(self._reader_ko, frame)
+        # 「全文字ハングル」かつ「信頼度0.5以上」のみ採用
+        # 数字・記号・英字が混じるOCRノイズ（'7--가지' 等）を除外する
+        hangul_hits = [
+            r for r in ko_results
+            if PokeClassifier._is_pure_hangul(r["text"]) and r["confidence"] >= 0.5
+        ]
+        if hangul_hits:
+            log.info(f"韓国語OCR: ハングル {len(hangul_hits)} 件 → {[r['text'] for r in hangul_hits]}")
+            ocr_results = ocr_results + hangul_hits
+
         # ── game_state 構築 ───────────────────────────────────────────────────
-        game_state = _build_game_state(ocr_results, yolo_state, event_type, self._prev_yolo, self._classifier)
+        # イベント時は animation 中でボールが映らないため、最後にボールが見えたフレームの結果を優先する
+        ball_yolo = self._last_ball_yolo if self._last_ball_yolo else yolo_state
+        # ボール数は最新の確認済み値で yolo_state を上書き（ログと実況に反映）
+        yolo_state.player_balls   = ball_yolo.player_balls
+        yolo_state.opponent_balls = ball_yolo.opponent_balls
+        game_state = _build_game_state(ocr_results, yolo_state, event_type, ball_yolo, self._classifier)
         log.info(f"[状態] {yolo_state.summary()} | OCR: {game_state['ocr_text']}")
         log.info(f"[構造化] HP={game_state['hp_values']} | 自分={game_state['name_candidates_player']} | 相手={game_state['name_candidates_opponent']}")
         _save_ocr_debug_image(frame, ocr_results, turn)
@@ -1067,6 +1131,7 @@ class Pipeline:
             self._battle_active = True
             self._commentary_history = []
             self._move_log = []
+            self._last_ball_yolo = None  # バトル開始時にボール情報をリセット
             log.info("[戦況] バトル開始 → トラッカーリセット")
 
         if self._battle_active:
@@ -1247,7 +1312,9 @@ def main() -> None:
     parser.add_argument("--camera",  type=int,   default=3,
                         help="OBS仮想カメラのデバイス番号（デフォルト: 3）")
     parser.add_argument("--model",   default=None,
-                        help="YOLOv8 カスタムモデルのパス（例: runs/detect/train4/weights/best.pt）")
+                        help="YOLOv8 カスタムモデルのパス（状態異常検出用・例: runs/detect/train4/weights/best.pt）")
+    parser.add_argument("--ball-model", default=None,
+                        help="ボール検出専用モデルのパス（例: runs/detect/train5/weights/best.pt）")
     parser.add_argument("--interval", type=float, default=1.0,
                         help="キャプチャ間隔（秒、デフォルト: 1.0）")
     parser.add_argument("--speaker", type=int,   default=1,
@@ -1266,6 +1333,7 @@ def main() -> None:
     pipeline = Pipeline(
         camera_index=args.camera,
         model_path=args.model,
+        ball_model_path=args.ball_model,
         interval=args.interval,
         speaker=args.speaker,
         gpu=not args.cpu,

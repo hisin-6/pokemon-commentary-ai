@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS pokemon (
     type2          TEXT,
     ability1       TEXT,
     ability2       TEXT,
-    ability_hidden TEXT
+    ability_hidden TEXT,
+    name_ko        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS moves (
@@ -167,6 +168,20 @@ CREATE INDEX IF NOT EXISTS idx_items_name_ja   ON items(name_ja);
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     conn.commit()
+
+    # 既存 DB へのマイグレーション（name_ko カラムがない古い DB に対応）
+    # ※ executescript の後に実行することで、インデックス作成前にカラムを確保する
+    try:
+        conn.execute("ALTER TABLE pokemon ADD COLUMN name_ko TEXT")
+        conn.commit()
+        log.info("マイグレーション: pokemon.name_ko カラムを追加しました")
+    except sqlite3.OperationalError:
+        pass  # カラムが既に存在する場合は無視
+
+    # name_ko のインデックスはカラム追加後に作成
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pokemon_name_ko ON pokemon(name_ko)")
+    conn.commit()
+
     log.info("DB スキーマ初期化完了")
 
 # ─── 技データ取得 ─────────────────────────────────────────────────────────────
@@ -301,6 +316,7 @@ def fetch_pokemon(conn: sqlite3.Connection) -> None:
         name_ja = _name(species.get("names", []), "ja-Hrkt", "ja")
         name_en = _name(species.get("names", []), "en")
         name_zh = _name(species.get("names", []), "zh-Hans", "zh-Hant")
+        name_ko = _name(species.get("names", []), "ko")
 
         if not name_ja or not name_en:
             log.warning("ID %d: 名前取得不能 → スキップ", pokemon_id)
@@ -326,9 +342,11 @@ def fetch_pokemon(conn: sqlite3.Connection) -> None:
                 ability2 = ja_name
 
         conn.execute(
-            "INSERT OR REPLACE INTO pokemon VALUES (?,?,?,?,?,?,?,?,?)",
+            """INSERT OR REPLACE INTO pokemon
+               (id, name_ja, name_en, name_zh, type1, type2, ability1, ability2, ability_hidden, name_ko)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (pokemon_id, name_ja, name_en, name_zh or None,
-             type1, type2, ability1, ability2, ability_hidden),
+             type1, type2, ability1, ability2, ability_hidden, name_ko or None),
         )
 
         # pokemon_moves: 覚えられる技をすべて登録

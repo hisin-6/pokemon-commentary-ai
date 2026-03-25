@@ -1,0 +1,3 @@
+ball_alive
+ball_faint
+ball_status

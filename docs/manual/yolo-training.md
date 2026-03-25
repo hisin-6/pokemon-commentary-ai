@@ -191,12 +191,19 @@ venv\Scripts\yolo detect train data=data/yolo_dataset/data.yaml model=yolov8n.pt
 ### 新作ポケモンへの対応
 新作ゲームが出た場合、UIデザイン・ボールアイコンのデザインが変わる可能性があるため**再学習が必要**。
 
-手順：
+#### 状態異常系（yolo_dataset）
 1. 新作の対戦画面で画像収集（`tools/collect_training_data.py`）
-2. LabelImgでアノテーション（各クラス100〜150枚目安）
+2. **LabelImg** でアノテーション（各クラス100〜150枚目安）→ `docs/manual/annotation-guide.md` 参照
 3. `tools/split_dataset.py` で train/val 分割
 4. `imgsz=1280 batch=4` で学習
 5. 動作確認
+
+#### ボール系（ball_dataset）
+1. `scripts/crop_ball_rois.py` で新作画像から ROI クロップ生成
+2. **Label Studio + ML Backend** でアノテーション → `scripts/ls_ml_backend/README.md` 参照
+   - 既存モデルが自動プレラベルを生成するので確認・修正のみ
+3. `scripts/export_to_yolo.py` で YOLO 形式に変換
+4. `venv\Scripts\yolo.exe train model=yolov8s.pt ...` で再学習
 
 ROI座標（`yolo_detector.py`）もUIレイアウトが変わった場合は要更新。
 
@@ -210,6 +217,9 @@ ROI座標（`yolo_detector.py`）もUIレイアウトが変わった場合は要
 | 2026-03-12 | 追加学習（freeze / sleep追加 / ball_alive / ball_faint / ball_status 追加） | mAP50: 0.988 / mAP50-95: 0.659（val未評価クラスあり・動作確認要） |
 | 2026-03-17 | OBSカメラデータで全クラス再学習（527枚・imgsz=640）→ train3 | mAP50: 0.753 / 状態異常系は0.99前後だがボール系Recall=0 |
 | 2026-03-17 | imgsz=1280に変更して再学習（527枚・batch=4）→ train4 | mAP50: 0.758 / 状態異常系は良好・ボール系はball_statusのみRecall改善（0.565）、ball_alive/ball_faintはRecall=0のまま |
+| 2026-03-24 | ボール専用データセット（ROIクロップ）で学習（yolov8s・3727枚・epochs=100・batch=8）→ train5 | ボール系Recall大幅改善・ただし暗いアリーナでは検出0件 |
+| 2026-03-25 | アノテーション追加後に再学習（3727枚・同パラメータ）→ train6 | all: P=0.285 / R=0.952 / mAP50=0.456 / Precision低め |
+| 2026-03-25 | 背景画像を1:1にバランス整理（3008→720枚）+ cls=2.0・cos_lr=true・patience=30・epochs=150→ train7（epoch35でEarlyStop） | all: P=0.330 / R=0.952 / mAP50=0.439 / Precision +16%改善（ball_faint +51%）|
 
 ### train4 クラス別詳細（現時点の最良モデル）
 

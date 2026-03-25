@@ -46,6 +46,17 @@ runs/
 # PyTorch モデルウェイト（自動DLされるもの・学習済みモデル）
 *.pt
 
+# ボール検出専用データセット（画像は大容量・ラベルは再生成可能）
+data/ball_dataset/images/
+data/ball_dataset/labels/
+data/ball_dataset/deleted_bg_labels.txt
+
+# Label Studio エクスポート（メールアドレス等の個人情報を含む可能性あり）
+annotations.json
+
+# 一時ファイル
+tmp/
+
 # OS
 .DS_Store
 Thumbs.db
