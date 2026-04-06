@@ -368,6 +368,18 @@ class TestBattlePhaseClassifier:
     def test_battle_end_loss(self):
         assert self.clf.classify(self._ocr_list("勝負に負けた")) == "battle_end"
 
+    def test_battle_end_split_ocr(self):
+        """OCRが「勝負に」+「勝った！」に分割した場合でも検知できる。"""
+        assert self.clf.classify(self._ocr_list("勝負に", "勝った！")) == "battle_end"
+
+    def test_battle_end_split_ocr_surrender(self):
+        """OCRが「降参が」+「選ばれました」に分割した場合でも検知できる。"""
+        assert self.clf.classify(self._ocr_list("降参が", "選ばれました")) == "battle_end"
+
+    def test_battle_end_result_waiting_screen(self):
+        """成績更新待ち画面（正常決着後のフォールバック）を検知できる。"""
+        assert self.clf.classify(self._ocr_list("成績が", "更新されるまで", "少し時間がかかります")) == "battle_end"
+
     def test_selection_screen(self):
         assert self.clf.classify(self._ocr_list("ポケモンを選んで")) == "selection_screen"
 
@@ -461,6 +473,11 @@ def _make_game_state(
         "hp_values":                hp_values or [],
         "status":                   status,
         "ocr_text":                 ocr_text,
+        # スロット別HP（x座標ソート）: テストでは座標なしのためhp_playerと同値で代用
+        "hp_player_by_slot":        hp_player or [],
+        "hp_opponent_by_slot":      hp_opponent or [],
+        "name_player_with_cx":      [],
+        "name_opponent_with_cx":    [],
     }
 
 

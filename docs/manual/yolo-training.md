@@ -220,6 +220,7 @@ ROI座標（`yolo_detector.py`）もUIレイアウトが変わった場合は要
 | 2026-03-24 | ボール専用データセット（ROIクロップ）で学習（yolov8s・3727枚・epochs=100・batch=8）→ train5 | ボール系Recall大幅改善・ただし暗いアリーナでは検出0件 |
 | 2026-03-25 | アノテーション追加後に再学習（3727枚・同パラメータ）→ train6 | all: P=0.285 / R=0.952 / mAP50=0.456 / Precision低め |
 | 2026-03-25 | 背景画像を1:1にバランス整理（3008→720枚）+ cls=2.0・cos_lr=true・patience=30・epochs=150→ train7（epoch35でEarlyStop） | all: P=0.330 / R=0.952 / mAP50=0.439 / Precision +16%改善（ball_faint +51%）|
+| 2026-03-30 | 終了画面検出モデル新規学習（yolov8n・84枚・epochs=50）→ train_end_screen2 | P=0.989 / R=1.000 / mAP50=0.995 / mAP50-95=0.805 ✅ ただしバトル中に誤発火あり（要再学習）|
 
 ### train4 クラス別詳細（現時点の最良モデル）
 

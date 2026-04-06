@@ -1,0 +1,10 @@
+# 終了画面検出専用データセット
+# バトル終了画面（勝ち・負け・降参）を検出する
+
+path: data/end_screen_dataset
+train: images/train
+val:   images/val
+
+nc: 1
+names:
+  0: battle_end   # バトル終了テキストオーバーレイ（左下）

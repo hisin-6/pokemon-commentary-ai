@@ -29,6 +29,7 @@ import base64
 import logging
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,7 @@ _ROOT = str(Path(__file__).parent.parent)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from src.capture.hpbar_analyzer import HpBarAnalyzer
 from src.capture.screen_capture import DiffDetector, init_reader, init_reader_ko, run_ocr
 from src.capture.yolo_detector import BattleState, YoloDetector
 from src.commentary.phi3_client import Phi3Client
@@ -99,6 +101,10 @@ _NON_BATTLE_KEYWORDS = {
 }
 
 OCR_MAX_CHARS = 120  # Phi-3 に渡す OCR テキストの最大文字数
+
+# 終了画面確認用 OCR キーワード（YOLO検出との AND 条件で誤発火を防ぐ）
+# 勝ち: 「勝った」/ 負け: 「負けた」/ 降参: 「選ばれました」
+_END_SCREEN_OCR_KEYWORDS = ("勝った", "負けた", "選ばれました")
 
 # 画面上半分（y < この値）= 相手エリア、下半分 = 自分エリア（1080p 基準）
 _PLAYER_Y_THRESHOLD = 500
@@ -165,6 +171,35 @@ def _ocr_results_to_text(
     return text[:OCR_MAX_CHARS]
 
 
+def _proximity_pair(
+    names: list[tuple[str, float, float]],
+    hp_values: list[tuple[str, float, float]],
+) -> list[tuple[str, str]]:
+    """名前とHP値を近傍マッチング（Euclidean距離）でペアリングする。
+    zip による y 座標順マッチングの代替。
+    ダブルバトルで横並びの2匹はy座標が近くx座標が大きく異なるため、
+    Euclidean距離でペアリングすると正しく対応付けられる。
+    """
+    if not names or not hp_values:
+        return []
+    pairs: list[tuple[str, str]] = []
+    used: set[int] = set()
+    for name, nx, ny in names:
+        best_idx = -1
+        best_dist = float("inf")
+        for i, (hp, hx, hy) in enumerate(hp_values):
+            if i in used:
+                continue
+            dist = ((nx - hx) ** 2 + (ny - hy) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        if best_idx >= 0:
+            pairs.append((name, hp_values[best_idx][0]))
+            used.add(best_idx)
+    return pairs
+
+
 def _extract_structured_info(
     ocr_results: list[dict],
     classifier: PokeClassifier | None = None,
@@ -182,16 +217,19 @@ def _extract_structured_info(
     _HP_MIN_DENOM = 50
 
     hp_values: list[str] = []
-    hp_values_player: list[str] = []    # y >= _PLAYER_Y_THRESHOLD: 自分側HP
-    hp_values_opponent: list[str] = []  # y < _PLAYER_Y_THRESHOLD:  相手側HP
-    name_candidates_player: list[str] = []    # 下半分 = 自分のポケモンエリア
-    name_candidates_opponent: list[str] = []  # 上半分 = 相手のポケモンエリア
+    hp_player_with_xy: list[tuple[str, float, float]] = []   # (hp_str, center_x, center_y) 自分側
+    hp_opponent_with_xy: list[tuple[str, float, float]] = []  # (hp_str, center_x, center_y) 相手側
+    name_player_with_xy: list[tuple[str, float, float]] = []   # (name, center_x, center_y) 自分側
+    name_opponent_with_xy: list[tuple[str, float, float]] = [] # (name, center_x, center_y) 相手側
 
     # 「相手を見る」状態確認パネル検出
     # "戦闘中" はこのパネル専用テキスト。ここではポケモンが画面上に並ぶため
     # y 座標ベースの自分/相手分類が信頼できない → 名前候補の収集をスキップする
     all_texts = {r["text"] for r in ocr_results if r["confidence"] >= 0.4}
-    is_status_panel = any("戦闘中" in t for t in all_texts)
+    is_status_panel = any(
+        "戦闘中" in t or "たたかえない" in t or "たたかえる" in t
+        for t in all_texts
+    )
     if is_status_panel:
         log.debug("「相手を見る」パネル検出 → ポケモン名候補収集をスキップ")
 
@@ -210,38 +248,53 @@ def _extract_structured_info(
                 # y座標で自分/相手側に分類（HP値を場のポケモンに紐付けるため）
                 bbox_hp = r.get("bbox", [])
                 if bbox_hp:
+                    cx = (bbox_hp[0][0] + bbox_hp[2][0]) / 2
                     cy = (bbox_hp[0][1] + bbox_hp[2][1]) / 2
                     if cy < _PLAYER_Y_THRESHOLD:
-                        hp_values_opponent.append(hp_str)
+                        hp_opponent_with_xy.append((hp_str, cx, cy))
                     elif cy < _COMMAND_Y_MIN:
-                        hp_values_player.append(hp_str)
+                        hp_player_with_xy.append((hp_str, cx, cy))
                 else:
-                    hp_values_player.append(hp_str)  # bbox なし → 自分側に追加
+                    hp_player_with_xy.append((hp_str, 960.0, 999.0))  # bbox なし → 自分側に追加
             continue
 
         # 状態確認パネル中は名前候補収集しない（HP値は上で収集済み）
         if is_status_panel:
             continue
 
+        # 「ポケモン名」形式（ゆけ！アニメ中）の山括弧を除去してポケモン名として取り出す
+        # 例: 「ガブリアス」→ ガブリアス / 「ガブリアス！」→ ガブリアス！
+        if text.startswith("「") or text.endswith("」"):
+            text = text.strip("「」").strip()
+            if not text:
+                continue
+
         # 共通の軽量フィルター（DB 照合前に除外）
+        # _UI_OVERLAY_WORDS は PokeClassifier 使用時も必ず適用（通信中・待機中等のシステムテキスト除外）
         if (text.startswith("Lv") or re.match(r'^[\d\s/]+$', text)
-                or text in _UI_WORDS or text in _BATTLE_RESULT_WORDS
+                or text in _UI_WORDS or text in _UI_OVERLAY_WORDS
+                or text in _BATTLE_RESULT_WORDS
                 or any(kw in text for kw in _BATTLE_RESULT_WORDS)
                 or (re.match(r'^[A-Za-z0-9\s]+$', text) and len(text) < 4)
-                or text.endswith("の") or text.endswith("」") or text.endswith("!")):
+                or text.endswith("の") or text.endswith("「") or text.endswith("!")):
             continue
 
         # タイプ表示テキスト除外（「タイプ」→「タイプ：ヌル」への誤 fuzzy マッチ防止）
         if "タイプ" in text or "テラスタイプ" in text:
             continue
 
-        # bbox の中心 y 座標で自分/相手エリアを判定
+        # bbox の中心 x/y 座標で自分/相手エリアを判定
+        # PokeClassifier がある場合はコマンドエリアフィルターをスキップ:
+        #   技名・特性名は classifier が "move"/"ability" として除外できるため、
+        #   フィルターで自分ポケモン名（画面下部 y>700）まで除外してしまう問題を回避する
         bbox = r.get("bbox", [])
         if bbox:
+            center_x = (bbox[0][0] + bbox[2][0]) / 2
             center_y = (bbox[0][1] + bbox[2][1]) / 2
-            if center_y > _COMMAND_Y_MIN:
-                continue  # コマンドメニュー内は除外
+            if classifier is None and center_y > _COMMAND_Y_MIN:
+                continue  # PokeClassifier なし時のみコマンドメニュー内を除外
         else:
+            center_x = 960  # bbox なし → 中央扱い
             center_y = 999  # bbox なし → 自分側扱い
 
         # ── PokeClassifier で分類 ─────────────────────────────────────────
@@ -257,7 +310,7 @@ def _extract_structured_info(
                     has_kana = any('\u3040' <= c <= '\u30ff' for c in text)
                     if has_cjk and not has_kana:
                         log.debug("中国語ポケモン名候補: %s", text)
-                        name_candidates_opponent.append(text)
+                        name_opponent_with_xy.append((text, center_x, center_y))
                 # ポケモン名でなければ除外（技・特性・アイテム・不明）
                 continue
             # 正規化された名前（OCR 誤読を補正）を使う
@@ -269,18 +322,45 @@ def _extract_structured_info(
                 continue
             canonical = text
 
-        # 自分/相手エリアに振り分け
+        # 自分/相手エリアに振り分け（x/y座標も記録）
         if center_y < _PLAYER_Y_THRESHOLD:
-            name_candidates_opponent.append(canonical)
+            name_opponent_with_xy.append((canonical, center_x, center_y))
         else:
-            name_candidates_player.append(canonical)
+            name_player_with_xy.append((canonical, center_x, center_y))
+
+    # y座標（同y時はx座標）でソート（画面の上から下の順）
+    hp_player_with_xy.sort(key=lambda t: (t[2], t[1]))
+    hp_opponent_with_xy.sort(key=lambda t: (t[2], t[1]))
+    name_player_with_xy.sort(key=lambda t: (t[2], t[1]))
+    name_opponent_with_xy.sort(key=lambda t: (t[2], t[1]))
+
+    hp_values_player   = [hp for hp, _, _ in hp_player_with_xy[:2]]
+    hp_values_opponent = [hp for hp, _, _ in hp_opponent_with_xy[:2]]
+    name_candidates_player   = [n for n, _, _ in name_player_with_xy[:5]]
+    name_candidates_opponent = [n for n, _, _ in name_opponent_with_xy[:5]]
+
+    # 名前+HPペア: 近傍マッチング（Euclidean距離）で対応付け
+    # ダブルバトルでは横並びの2匹のyが近く zip だと順序が逆転するケースがあるため
+    player_pokemon_hp   = _proximity_pair(name_player_with_xy[:5],   hp_player_with_xy[:2])
+    opponent_pokemon_hp = _proximity_pair(name_opponent_with_xy[:5], hp_opponent_with_xy[:2])
+
+    # x座標でソートしてスロット別HP（0=左スロット, 1=右スロット）を作成
+    # 近傍マッチングに依存せず画面左右の固定位置でHPを割り当てるため
+    hp_player_by_slot   = [hp for hp, _, _ in sorted(hp_player_with_xy,   key=lambda t: t[1])[:2]]
+    hp_opponent_by_slot = [hp for hp, _, _ in sorted(hp_opponent_with_xy, key=lambda t: t[1])[:2]]
 
     return {
-        "hp_values":          hp_values,
-        "hp_values_player":   hp_values_player[:2],    # ダブルバトル: 最大2匹分
-        "hp_values_opponent": hp_values_opponent[:2],
-        "name_candidates_player":   name_candidates_player[:5],
-        "name_candidates_opponent": name_candidates_opponent[:5],
+        "hp_values":              hp_values,
+        "hp_values_player":       hp_values_player,
+        "hp_values_opponent":     hp_values_opponent,
+        "name_candidates_player":   name_candidates_player,
+        "name_candidates_opponent": name_candidates_opponent,
+        "player_pokemon_hp":    player_pokemon_hp,    # [(name, hp), ...] y座標ソート済み
+        "opponent_pokemon_hp":  opponent_pokemon_hp,
+        "hp_player_by_slot":    hp_player_by_slot,    # [左HP, 右HP] x座標ソート
+        "hp_opponent_by_slot":  hp_opponent_by_slot,
+        "name_player_with_cx":   [(n, cx) for n, cx, _ in name_player_with_xy[:5]],
+        "name_opponent_with_cx": [(n, cx) for n, cx, _ in name_opponent_with_xy[:5]],
     }
 
 
@@ -338,6 +418,12 @@ def _build_game_state(
         "hp_values_opponent": structured["hp_values_opponent"],
         "name_candidates_player":   structured["name_candidates_player"],
         "name_candidates_opponent": structured["name_candidates_opponent"],
+        "player_pokemon_hp":        structured["player_pokemon_hp"],
+        "opponent_pokemon_hp":      structured["opponent_pokemon_hp"],
+        "hp_player_by_slot":        structured["hp_player_by_slot"],
+        "hp_opponent_by_slot":      structured["hp_opponent_by_slot"],
+        "name_player_with_cx":      structured["name_player_with_cx"],
+        "name_opponent_with_cx":    structured["name_opponent_with_cx"],
     }
 
 
@@ -368,12 +454,28 @@ class BattlePhaseClassifier:
     # これらはバトル最初のコマンド選択画面より前に出るため battle_start の早期検知に使う
     _COMMAND_KW    = {"たたかう", "どうする", "ゆけつ", "いけつ"}
     _SWITCH_KW     = {"こうたい", "ポケモンをえらんで"}
-    _ANIM_KW       = {"バツグンだ", "いまひとつ", "こうかなし", "きゅうしょ", "急所", "ひんし"}
-    _END_KW        = {"勝負に勝", "勝負に負", "降参が選ばれ", "通信エラー", "切断されました"}
+    # 技選択画面の型相性ラベル（これが見えている = 技選択UI が開いている = command_select 継続）
+    # 「こうかあり」はバトルメッセージには出ず技選択UIにのみ出現するため安全な指標
+    # 「いまひとつ」「こうかなし」は技選択UIにも出るため _ANIM_KW から除外済み
+    _TECH_SELECT_KW = {"こうかあり"}
+    # バツグンだ・きゅうしょ・ひんし は技選択UIに出ないためアニメーション指標として残す
+    _ANIM_KW       = {"バツグンだ", "きゅうしょ", "急所", "ひんし"}
+    _END_KW        = {"勝負に勝", "勝負に負", "降参が選ばれ", "通信エラー", "切断されました",
+                     "更新されるまで"}  # 成績更新待ち画面（正常決着後のフォールバック）
     # 選出画面キーワード（この画面中はバトルイベントを発火させない）
     _SELECTION_KW  = {"ポケモンを選んで", "選出", "きめる", "リーダー", "選出順"}
     # L50競技ポケモンの最低HPは約50以上なので、分母が50未満は除外
     _HP_ZERO_RE    = re.compile(r'\b0/([5-9]\d|\d{3})\b')
+
+    # イベント別デバウンス秒数（_debounce はデフォルト値）
+    _DEBOUNCE_OVERRIDES: dict[str, float] = {
+        "turn_start": 15.0,  # ダブルバトル2匹目コマンド選択での余分な turn_start 発火を防ぐ
+        "move_used":  15.0,  # faint後のダブルバトルで1匹目コマンド確定直後に2匹目コマンド確定が
+                              # 同ゲームターン内で ~11s 後に来るケースを抑制する
+                              # (turn_start が15s デバウンスされても command_select→unknown 遷移で
+                              #  move_used が発火するため、こちらも同等デバウンスが必要)
+        "faint":      25.0,  # 相手を見るパネルが0/211を表示し続けることで多重発火する問題の防止
+    }
 
     def __init__(self, debounce_seconds: float = 10.0):
         self._debounce = debounce_seconds
@@ -385,21 +487,29 @@ class BattlePhaseClassifier:
     def set_processing(self, v: bool) -> None:
         self._is_processing = v
 
-    def reset_after_processing(self) -> None:
+    def reset_after_processing(self, event_type: str | None = None) -> None:
         """処理完了後にフェーズ履歴をリセットし、直後の誤発火を防ぐ。
         処理中に _prev_phase が command_select で止まっていると、
         処理完了直後のフレームで command_select → unknown 遷移として
         move_used が即再発火する問題を防ぐ。
         """
         self._prev_phase = "unknown"
+        now = time.time()
         # move_used デバウンスを現在時刻に更新（処理完了直後の再発火を抑止）
-        self._last_event_time["move_used"] = time.time()
+        self._last_event_time["move_used"] = now
+        # faint後・move_used後は command_select 誤分類による turn_start 多重発火を抑制
+        # （move_used: アニメーション中に一瞬 command_select が映り turn_start が早期発火する問題）
+        if event_type in ("faint", "move_used"):
+            self._last_event_time["turn_start"] = now
 
     def classify(self, ocr_results: list[dict]) -> str:
         """OCR 結果から現在のフェーズを判定する（優先度順）。"""
         texts = {r["text"] for r in ocr_results if r["confidence"] >= 0.4}
+        # OCR が1テキストを複数に分割するケースに対応（例:「勝負に」+「勝った！」）
+        # ocr_results の順序（上→下・左→右）を維持して結合し、キーワードの分断を吸収する
+        joined = "".join(r["text"].replace(" ", "") for r in ocr_results if r["confidence"] >= 0.4)
 
-        if any(kw in t for kw in self._END_KW for t in texts):
+        if any(kw in t for kw in self._END_KW for t in texts) or any(kw in joined for kw in self._END_KW):
             return "battle_end"
         # 選出画面: バトル前のポケモン選択画面（ここでのイベント発火を防ぐ）
         if any(kw in t for kw in self._SELECTION_KW for t in texts):
@@ -409,6 +519,10 @@ class BattlePhaseClassifier:
         if any(kw in t for kw in self._SWITCH_KW for t in texts):
             return "switch_select"
         if any(kw in t for kw in self._COMMAND_KW for t in texts):
+            return "command_select"
+        # 技選択画面中（「こうかあり」が表示）は command_select 継続とみなす
+        # → 技選択UIの「いまひとつ」「こうかなし」が animation と誤判定されるのを防ぐ
+        if any(kw in t for kw in self._TECH_SELECT_KW for t in texts):
             return "command_select"
         if any(kw in t for kw in self._ANIM_KW for t in texts):
             return "animation"
@@ -426,6 +540,9 @@ class BattlePhaseClassifier:
         if self._is_processing:
             if curr == "battle_end" and prev != "battle_end":
                 self._battle_started = False
+                # battle_end後の結果画面が command_select と誤分類されて
+                # turn_start が発火するのを抑制する
+                self._last_event_time["turn_start"] = time.time()
                 log.info(f"[フェーズ] {prev} → {curr} | イベント: battle_end (実況中割り込み)")
                 return "battle_end"
             return None
@@ -439,6 +556,10 @@ class BattlePhaseClassifier:
         if curr == "command_select" and not self._battle_started:
             self._battle_started = True
             event = "battle_start"
+        elif (curr == "command_select" and self._battle_started
+              and prev not in ("command_select", "selection_screen")):
+            # 2回目以降の command_select 出現 = ターン開始（技・交代アニメ終了後）
+            event = "turn_start"
         elif prev == "command_select" and curr != "command_select":
             # unknown = アニメーション中（特殊テキストなし）でも move_used を発火させる
             event = "switch" if curr == "switch_select" else "move_used"
@@ -449,20 +570,187 @@ class BattlePhaseClassifier:
         elif curr == "battle_end" and prev != "battle_end":
             event = "battle_end"
             self._battle_started = False  # 次の試合の battle_start を正しく検知するためリセット
+            # battle_end後の結果画面が command_select と誤分類されて
+            # turn_start が発火するのを抑制する
+            self._last_event_time["turn_start"] = time.time()
 
         if curr != prev:
-            log.info(f"[フェーズ] {prev} → {curr}" + (f" | イベント: {event}" if event else ""))
+            if event:
+                log.info(f"[フェーズ] {prev} → {curr} | イベント: {event}")
+            else:
+                log.debug(f"[フェーズ] {prev} → {curr}")
 
         if event:
             now = time.time()
             no_debounce = {"battle_start", "battle_end"}
+            debounce = self._DEBOUNCE_OVERRIDES.get(event, self._debounce)
             last = self._last_event_time.get(event, 0.0)
-            if event not in no_debounce and now - last < self._debounce:
-                log.debug(f"デバウンス中のためスキップ: {event} (残り {self._debounce-(now-last):.1f}s)")
+            if event not in no_debounce and now - last < debounce:
+                log.debug(f"デバウンス中のためスキップ: {event} (残り {debounce-(now-last):.1f}s)")
                 return None
             self._last_event_time[event] = now
+            # move_used 確定時点で即 turn_start デバウンスをリセット
+            # （Bedrock完了を待たずにデバウンス起点を早めることで、
+            #   ダブルバトル2匹目コマンド選択での余分な turn_start 発火を確実に抑制）
+            if event == "move_used":
+                self._last_event_time["turn_start"] = now
 
         return event
+
+
+# ─── バトルメッセージ解析 ──────────────────────────────────────────────────────
+
+# メッセージボックスROIから「[ポケモン名]の[技名]」を抜き出す正規表現
+# 例: "バドレックスのブリザードランス！" → group(1)=バドレックス, group(2)=ブリザードランス
+_MOVE_IN_MSG_RE = re.compile(r'(.{2,12})の(.{3,15}?)(?:[！!」]|$)')
+
+# OCR変形表記 → 正規技名 のマッピング
+# PokeClassifier が技として認識できない OCR 誤読・変形表記を事前に正規化する。
+# 例: ゲーム内テキスト「手助けする」は技名「てだすけ」に対応する表現で、
+#     OCR がそのまま読んだ場合 PokeClassifier では「move」判定されない。
+# 新しい変形表記が見つかったらここに追加するだけで対応できる。
+_MOVE_ALIAS_MAP: dict[str, str] = {
+    "手助けする":          "てだすけ",
+    "手助けした":          "てだすけ",
+    "手助け":              "てだすけ",
+    "攻撃から身を守った":  "まもる",
+}
+
+# OCR 大文字かな→小文字かな正規化テーブル
+# 例: 「サイドチエンジ」→「サイドチェンジ」、「きよじゆうだん」→「きょじゅうだん」
+_OCR_KANA_NORM_RE = re.compile(
+    r'(?<=[きしちにひみりぎじびぴ])[よゆ]|'  # ひらがな: きよ→きょ, じゆ→じゅ 等
+    r'(?<=[チシジ])[エユ]|'                   # カタカナ: チエ→チェ, シユ→シュ 等
+    r'(?<=[ファフヴ])[オアイエ]|'              # フォ/ファ/ヴォ 等
+    r'デイ|テイ'                              # ディ/ティ
+)
+_OCR_KANA_NORM_MAP = {
+    'よ': 'ょ', 'ゆ': 'ゅ',
+    'エ': 'ェ', 'ユ': 'ュ',
+    'オ': 'ォ', 'ア': 'ァ', 'イ': 'ィ', 'エ': 'ェ',
+    'デイ': 'ディ', 'テイ': 'ティ',
+}
+
+
+def _normalize_ocr_kana(text: str) -> str:
+    """OCR が大文字かなを小文字かなとして誤読する頻出パターンを補正する。
+
+    例: サイドチエンジ → サイドチェンジ
+        きよじゆうだん → きょじゅうだん
+        ボデイプレス   → ボディプレス
+        ワイドフオース → ワイドフォース
+    """
+    def _replace(m: re.Match) -> str:
+        s = m.group(0)
+        return _OCR_KANA_NORM_MAP.get(s, _OCR_KANA_NORM_MAP.get(s[-1], s))
+
+    return _OCR_KANA_NORM_RE.sub(_replace, text)
+
+
+class BattleMessageParser:
+    """
+    バトル中に左下のメッセージボックスに表示されるテキストを解析し、
+    フェーズ分類に頼らない詳細なバトルイベントを検出する。
+
+    SVのメッセージボックスROI: x < 520, 740 < center_y < 930 (1920x1080)
+
+    検出イベント:
+      faint      ─ ○○は/が たおれた
+      switch_in  ─ ○○、ゆけ / ○○が とびだした
+      switch_out ─ もどれ、○○ / ○○と こうたいした
+    """
+
+    MSG_X_MAX  = 520
+    MSG_Y_MIN  = 740
+    MSG_Y_MAX  = 930
+    DEDUP_TTL  = 8.0   # 同一イベントの重複発火を防ぐ秒数
+
+    _FAINT_RE      = re.compile(r'(.{2,12})(?:は|が)\s*たおれた')
+    # 自分がポケモンを繰り出すメッセージのパターン:
+    #   旧: 「〇〇、ゆけ！」（名前が前）
+    #   新: 「ゆけつ！ (げんきいっぱいの) 〇〇！」（名前が後ろ・SVの実際の表示形式）
+    _SWITCH_IN_RE  = re.compile(
+        r'(.{2,12})、?\s*ゆけ'                      # 「〇〇、ゆけ！」（名前が前・旧パターン保持）
+        r'|ゆけ\S*\s+(?:\S+の\s+)?(\S{2,12})'      # 「ゆけつ！ (げんきいっぱいの) 〇〇！」
+        r'|(.{2,12})が\s*とびだした'                 # 「〇〇が とびだした」
+    )
+    # 相手がポケモンを繰り出すメッセージ: 「〇〇をくりだした！」
+    # ダブルバトルの「AとBをくりだした」は B のみ捕捉（A は名前に "と" が混入するため無視）
+    _OPPONENT_SWITCH_IN_RE = re.compile(r'(?:.{2,12}と\s*)?(.{2,12})をくりだした')
+    _SWITCH_OUT_RE = re.compile(r'もどれ[、,]\s*(.{2,12})|(.{2,12})と\s*こうたいした')
+    # 状態異常メッセージ: 「〇〇は まひじょうたいになった」等
+    _STATUS_RE = re.compile(
+        r'(.{2,12})(?:は|が)\s*(まひ|やけど|どく|もうどく|こおり|ねむり)\s*(?:じょうたい|状態)?'
+    )
+
+    def __init__(self) -> None:
+        self._seen: dict[tuple[str, str], float] = {}
+
+    def _extract_msg_text(self, ocr_results: list[dict]) -> str:
+        """メッセージボックスROI内のテキストをy→x順に結合して返す。"""
+        items: list[tuple[float, float, str]] = []
+        for r in ocr_results:
+            if r["confidence"] < 0.35:
+                continue
+            bbox = r.get("bbox", [])
+            if not bbox:
+                continue
+            cx = (bbox[0][0] + bbox[2][0]) / 2
+            cy = (bbox[0][1] + bbox[2][1]) / 2
+            if cx < self.MSG_X_MAX and self.MSG_Y_MIN < cy < self.MSG_Y_MAX:
+                items.append((cy, cx, r["text"]))
+        items.sort(key=lambda t: (round(t[0] / 40), t[1]))
+        return " ".join(t[2] for t in items)
+
+    def parse(self, ocr_results: list[dict]) -> list[dict]:
+        """OCR結果からメッセージイベントのリストを返す（重複はデバウンスでスキップ）。"""
+        text = self._extract_msg_text(ocr_results)
+        now = time.time()
+        events: list[dict] = []
+
+        def _emit(event_type: str, pokemon: str, raw: str = "") -> None:
+            # 末尾の感嘆符・括弧・読点はOCRノイズなので除去
+            pokemon = pokemon.strip().rstrip('！!」、')
+            if not pokemon:
+                return
+            key = (event_type, pokemon)
+            if now - self._seen.get(key, 0.0) < self.DEDUP_TTL:
+                return
+            self._seen[key] = now
+            events.append({"type": event_type, "pokemon": pokemon, "raw": raw or text})
+
+        if text:
+            m = self._FAINT_RE.search(text)
+            if m:
+                _emit("faint", m.group(1))
+
+            m = self._SWITCH_IN_RE.search(text)
+            if m:
+                _emit("switch_in", (m.group(1) or m.group(2) or m.group(3) or ""))
+
+            m = self._OPPONENT_SWITCH_IN_RE.search(text)
+            if m:
+                _emit("opponent_switch_in", m.group(1))
+
+            m = self._SWITCH_OUT_RE.search(text)
+            if m:
+                _emit("switch_out", (m.group(1) or m.group(2) or ""))
+
+        # 状態異常はROI外も含めた全OCRから検索（メッセージ表示フレームを取りこぼす場合に備える）
+        full_text = " ".join(r["text"] for r in ocr_results if r["confidence"] >= 0.35)
+        status_text = f"{text} {full_text}" if text else full_text
+        m = self._STATUS_RE.search(status_text)
+        if m:
+            pokemon_name = m.group(1).strip().rstrip('！!」、')
+            status = m.group(2)
+            if pokemon_name:
+                key = ("status", pokemon_name)
+                if now - self._seen.get(key, 0.0) >= self.DEDUP_TTL:
+                    self._seen[key] = now
+                    events.append({"type": "status", "pokemon": pokemon_name,
+                                   "status": status, "raw": status_text})
+
+        return events
 
 
 # ─── 戦況トラッカー ────────────────────────────────────────────────────────────
@@ -472,12 +760,14 @@ class FieldPokemon:
     """1匹のポケモンの戦況スロット（ダブルバトル対応）。"""
     name: str
     hp: str | None = None                        # "176/176" 形式（最新HP）
+    hp_pct_pixel: float | None = None            # ピクセル解析によるHP% (0.0-1.0)
     status: str | None = None                    # まひ / やけど / どく / ひんし
     moves_used: list[str] = field(default_factory=list)  # このポケモンが使った技リスト
     on_field: bool = False                        # 現在場にいるか
     fainted: bool = False                         # 気絶済みフラグ
     confidence: int = 0                           # 検出回数（信頼度）
     last_seen_turn: int = 0                       # 最後に検出されたターン番号
+    slot_index: int | None = None                 # 画面スロット番号: 0=左(x<960), 1=右(x>=960)
 
 
 class BattleStateTracker:
@@ -493,14 +783,21 @@ class BattleStateTracker:
     MAX_ON_FIELD    = 2    # ダブルバトル: 同時に場に出せる最大数
     MAX_EVENTS      = 8
     # on_field=True でこのターン数以上不検出なら場にいないと判断
-    _ON_FIELD_MISS_THRESHOLD = 5
+    _ON_FIELD_MISS_THRESHOLD = 3
     _HP_RE = re.compile(r'(\d{1,3})/(\d{1,3})')
+    # 画面中央x座標: これより左がスロット0（左）、右がスロット1（右）
+    _SLOT_X_CENTER = 960
 
     def __init__(self):
-        self.turn = 0
+        self.turn = 0       # 内部イベントカウンター（_ON_FIELD_MISS_THRESHOLD 用）
+        self.game_turn = 0  # 実際のゲームターン数（command_select 出現ごとに +1）
         self._player:   list[FieldPokemon] = []  # 自分の最大4匹
         self._opponent: list[FieldPokemon] = []  # 相手の最大4匹
         self._event_log: list[str] = []
+        # ボール数トラッキング（気絶推定・控え不明表示用）
+        self._prev_opponent_alive: int | None = None  # 前ターンの相手生存数
+        self._player_alive_count:  int | None = None  # 最新の自分生存数
+        self._opponent_alive_count: int | None = None # 最新の相手生存数
 
     # ── 内部ヘルパー ─────────────────────────────────────────────────────────
 
@@ -533,6 +830,114 @@ class BattleStateTracker:
             if i < len(on_field):
                 on_field[i].hp = hp
 
+    def _assign_hp_to_on_field_smart(
+        self,
+        slots: list[FieldPokemon],
+        hp_list: list[str],
+        pokemon_hp_pairs: list[tuple[str, str]],
+        allow_zero_hp: bool = False,
+        has_name_candidates: bool = True,
+    ) -> None:
+        """HPを割り当てる。ペア情報があれば名前マッチ、なければインデックスベース（y座標ソート済み）。
+        allow_zero_hp=False（デフォルト）の場合、HP=0/X は割り当てない（faintイベント以外での誤気絶防止）。
+        has_name_candidates=False の場合、faintイベントで0/Xのインデックスベース割り当てをスキップ
+        （is_status_panel時に名前なしで0/Xが誤ったポケモンに割り当てられる問題を防ぐ）。
+        """
+        # faintイベント以外では HP=0/X を除外（バドレックスのHP=0がミライドンに誤割り当てされる問題を防ぐ）
+        if not allow_zero_hp:
+            hp_list = [hp for hp in hp_list if not hp.startswith("0/")]
+            pokemon_hp_pairs = [(n, hp) for n, hp in pokemon_hp_pairs if not hp.startswith("0/")]
+
+        on_field = [s for s in slots if s.on_field]
+        if pokemon_hp_pairs:
+            # 名前ベースで割り当て（y座標ソート済みのペアを使用）
+            matched: set[int] = set()
+            for name, hp in pokemon_hp_pairs:
+                for slot in on_field:
+                    if id(slot) not in matched:
+                        if slot.name == name or name in slot.name or slot.name in name:
+                            slot.hp = hp
+                            matched.add(id(slot))
+                            break
+        else:
+            # フォールバック: インデックスベース（hp_list は y座標ソート済み）
+            # has_name_candidates=False（is_status_panel等で名前未検出）かつfaintイベント中に
+            # 0/X HP が含まれる場合はスキップ:
+            #   相手を見るパネル表示中にHP値が誤った位置に分類され、
+            #   インデックスベースで0/Xが別のポケモンに割り当てられる問題を防ぐ
+            if not has_name_candidates and allow_zero_hp and any(hp.startswith("0/") for hp in hp_list):
+                log.debug("[戦況] faintイベントで名前未検出・HP=0/X → インデックスベース割り当てをスキップ")
+                return
+            for i, hp in enumerate(hp_list):
+                if i < len(on_field):
+                    on_field[i].hp = hp
+
+    def _assign_slot_indices(
+        self,
+        slots: list[FieldPokemon],
+        name_with_cx: list[tuple[str, float]],
+    ) -> None:
+        """初登場時に OCR x座標からスロット番号（0=左, 1=右）を割り当てる。
+        固定閾値ではなく、同フレームで見えた未割り当てポケモン同士の相対x順で決定する。
+        （SV のプレイヤー側2匹のHPバーは両方とも画面左半分に表示されるため
+        cx=960 の固定閾値は使えない）
+        既に slot_index が設定済みのポケモンはスキップする。
+        """
+        # 名前マッチングで未割り当て on_field スロットと cx を収集
+        candidates: list[tuple[FieldPokemon, float]] = []
+        for name, cx in name_with_cx:
+            for slot in slots:
+                if slot.name == name or name in slot.name or slot.name in name:
+                    if slot.on_field and slot.slot_index is None:
+                        candidates.append((slot, cx))
+                    break
+
+        if not candidates:
+            return
+
+        # cx 昇順（画面左→右）でソートし、小さい方をスロット0、大きい方をスロット1
+        candidates.sort(key=lambda t: t[1])
+        for i, (slot, cx) in enumerate(candidates[:2]):
+            slot.slot_index = i
+            log.info(f"[スロット] {slot.name} → スロット{slot.slot_index} (cx={cx:.0f})")
+
+    def _assign_hp_by_slot(
+        self,
+        slots: list[FieldPokemon],
+        hp_by_slot: list[str],
+        allow_zero_hp: bool = False,
+    ) -> None:
+        """スロット番号（0=左, 1=右）でHPをポケモンに割り当てる。
+        slot_index が設定済みのポケモンはスロット番号で割り当て。
+        slot_index 未設定のポケモンはインデックス順フォールバックで割り当てる
+        （テスト環境・初登場フレームで座標が未取得の場合の互換性維持）。
+        allow_zero_hp=False の場合、HP=0/X は割り当てない（faintイベント以外での誤気絶防止）。
+        """
+        if not hp_by_slot:
+            return
+        effective = [
+            hp if (allow_zero_hp or not hp.startswith("0/")) else None
+            for hp in hp_by_slot
+        ]
+        on_field = [s for s in slots if s.on_field]
+        assigned_slots: set[int] = set()  # スロット番号ベースで割り当て済みのスロット
+
+        # パス1: slot_index 設定済みのポケモンはスロット番号で割り当て
+        for slot in on_field:
+            if slot.slot_index is not None:
+                i = slot.slot_index
+                if i < len(effective) and effective[i]:
+                    slot.hp = effective[i]
+                    assigned_slots.add(i)
+
+        # パス2: slot_index 未設定のポケモンは残りのHP値をインデックス順で割り当て
+        remaining_hp = [hp for i, hp in enumerate(effective) if i not in assigned_slots and hp]
+        idx = 0
+        for slot in on_field:
+            if slot.slot_index is None and idx < len(remaining_hp):
+                slot.hp = remaining_hp[idx]
+                idx += 1
+
     # ── メイン更新 ───────────────────────────────────────────────────────────
 
     def update(self, game_state: dict, event_type: str) -> None:
@@ -544,8 +949,11 @@ class BattleStateTracker:
 
         # ── ポケモン名の蓄積・on_field 更新（自分側） ──────────────────────
         for name in current_player_names:
-            if any(s.name == name for s in self._opponent):
-                continue  # 相手側に登録済みは混入させない
+            # 相手側に登録済みかつ今フレームの相手エリアにも見えている場合 → 同名ポケモンの可能性あり → 両側に登録
+            # 相手側に登録済みだが今フレームで自分エリアにしか見えない場合 → y座標誤分類の可能性 → スキップ
+            already_in_opponent = any(s.name == name for s in self._opponent)
+            if already_in_opponent and name not in current_opponent_names:
+                continue  # 相手側に登録済みで相手エリアにも見えていない → 誤分類として除外
             slot = self._get_or_create(self._player, name)
             if slot:
                 slot.confidence += 1
@@ -562,37 +970,106 @@ class BattleStateTracker:
 
         # ── ポケモン名の蓄積・on_field 更新（相手側） ──────────────────────
         for name in current_opponent_names:
-            if any(s.name == name for s in self._player):
-                continue
+            already_in_player = any(s.name == name for s in self._player)
+            if already_in_player and name not in current_player_names:
+                continue  # 自分側に登録済みで自分エリアにも見えていない → 誤分類として除外
             slot = self._get_or_create(self._opponent, name)
             if slot:
                 slot.confidence += 1
                 slot.last_seen_turn = self.turn
-                if not slot.fainted:
+                if slot.fainted:
+                    # OCR で再検出されたにもかかわらず fainted=True → 誤ひんし判定を解除
+                    # （ボール数ロジックの誤判定でひんし扱いされたポケモンが復帰できるようにする）
+                    slot.fainted = False
+                    slot.on_field = True
+                    log.warning("[戦況] %s が fainted=True だが OCR 再検出 → 誤ひんし解除", slot.name)
+                else:
                     slot.on_field = True
 
+        newly_removed_opponent: list[FieldPokemon] = []
         for slot in self._opponent:
             if slot.on_field and not slot.fainted:
-                if self.turn - slot.last_seen_turn > self._ON_FIELD_MISS_THRESHOLD:
+                # OCR で相手名が検出されている場合: そのフレームで見えないなら即座に降ろす
+                # （交代直後に旧ポケモンが残り続けるのを防ぐ）
+                if current_opponent_names and slot.name not in current_opponent_names:
+                    quick_threshold = 1
+                    if self.turn - slot.last_seen_turn >= quick_threshold:
+                        slot.on_field = False
+                        newly_removed_opponent.append(slot)
+                        log.info(f"[戦況] {slot.name} がOCR不検出（{slot.name} not in {current_opponent_names}）→ 場から降ろす")
+                elif self.turn - slot.last_seen_turn > self._ON_FIELD_MISS_THRESHOLD:
                     slot.on_field = False
+                    newly_removed_opponent.append(slot)
                     log.info(f"[戦況] {slot.name} が{self._ON_FIELD_MISS_THRESHOLD}ターン不検出 → 場から降ろす")
 
         # ダブルバトル制約: 場のポケモンは最大 2 匹
         self._cap_on_field(self._player)
         self._cap_on_field(self._opponent)
 
-        # ── HP 値を場のポケモンに紐付け ──────────────────────────────────
-        # y座標で側分類した HP（player=自分側、opponent=相手側）を優先使用
-        hp_player   = game_state.get("hp_values_player", [])
-        hp_opponent = game_state.get("hp_values_opponent", [])
-        if not hp_player and not hp_opponent:
-            # フォールバック: 全HP値を均等分配（前後2個ずつ）
-            all_hp = game_state.get("hp_values", [])
-            hp_player   = all_hp[:2]
-            hp_opponent = all_hp[2:4]
+        # ── スロット番号の割り当て（初登場時・x座標ベース） ─────────────────
+        # battle_start はゆけ！アニメーション中のフレームで、両ポケモン名が
+        # 画面左側に集まって表示されるためスロット判定が不正確になる。
+        # turn_start/move_used 以降の安定したフレームでのみスロットを確定する。
+        if event_type != "battle_start":
+            player_name_cx   = game_state.get("name_player_with_cx", [])
+            opponent_name_cx = game_state.get("name_opponent_with_cx", [])
+            self._assign_slot_indices(self._player,   player_name_cx)
+            self._assign_slot_indices(self._opponent, opponent_name_cx)
 
-        self._assign_hp_to_on_field(self._player,   hp_player)
-        self._assign_hp_to_on_field(self._opponent, hp_opponent)
+        # ── HP値をスロット番号（x座標）で割り当て ───────────────────────────
+        # 近傍マッチングに依存せず左/右スロットの固定x座標位置でHPを割り当てることで
+        # 交代直後フレームでの名前-HP誤ペアリングを防ぐ
+        hp_player_by_slot   = game_state.get("hp_player_by_slot", [])
+        hp_opponent_by_slot = game_state.get("hp_opponent_by_slot", [])
+        # フォールバック: y座標分類が完全に失敗して両方空の場合、hp_values を均等分配
+        if not hp_player_by_slot and not hp_opponent_by_slot:
+            all_hp = game_state.get("hp_values", [])
+            hp_player_by_slot   = all_hp[:2]
+            hp_opponent_by_slot = all_hp[2:4]
+        allow_zero = (event_type == "faint")
+        self._assign_hp_by_slot(self._player,   hp_player_by_slot,   allow_zero)
+        self._assign_hp_by_slot(self._opponent, hp_opponent_by_slot, allow_zero)
+
+        # ── ボール数トラッキング＆相手気絶推定 ──────────────────────────────
+        balls = game_state.get("balls_remaining", [])
+        cur_p_alive = balls[0] if len(balls) > 0 else None
+        cur_o_alive = balls[1] if len(balls) > 1 else None
+        # 相手のボール生存数が減少 + 今ターン降ろしたポケモンがいる → 気絶確定
+        if (cur_o_alive is not None and self._prev_opponent_alive is not None
+                and cur_o_alive < self._prev_opponent_alive
+                and newly_removed_opponent):
+            diff = self._prev_opponent_alive - cur_o_alive
+            for slot in newly_removed_opponent[:diff]:
+                if not slot.fainted:
+                    slot.fainted = True
+                    log.info(f"[戦況] {slot.name} が気絶（ボール数減少で確定: {self._prev_opponent_alive}→{cur_o_alive}）")
+        # ボール数を更新（非None・非ゼロのみ採用してノイズを無視）
+        if cur_p_alive:
+            self._player_alive_count = cur_p_alive
+        if cur_o_alive:
+            self._opponent_alive_count = cur_o_alive
+            self._prev_opponent_alive = cur_o_alive
+
+        # 把握済み相手生存数 > ボール数 → 超過分を気絶確定
+        # ボール数変化なし（ex. 2匹同時倒れでボールが一段階しか減らない）でも
+        # 場から外れたまま再登場しないポケモンを気絶扱いにして控えを正確にする
+        # newly_removed_opponent が存在する場合は check #1 で処理済み or
+        # 交代アニメーション中のボール数一時ズレの可能性があるためスキップ。
+        # current_opponent_names が空の場合（faintイベント・アニメーション中等）は
+        # 相手の場の状態が不明なためボール数比較を信頼せずスキップ。
+        if (not newly_removed_opponent
+                and current_opponent_names
+                and cur_o_alive is not None
+                and cur_o_alive > 0):
+            known_opponent_alive = len([s for s in self._opponent if not s.fainted])
+            if known_opponent_alive > cur_o_alive:
+                suspects = [s for s in self._opponent if not s.fainted and not s.on_field]
+                excess = known_opponent_alive - cur_o_alive
+                for s in suspects[:excess]:
+                    s.fainted = True
+                    log.info(
+                        f"[戦況] {s.name} が気絶（把握数{known_opponent_alive}＞ボール数{cur_o_alive}で確定）"
+                    )
 
         # ── 状態異常の更新（YOLO 由来） ─────────────────────────────────────
         status_raw = game_state.get("status", "")
@@ -609,12 +1086,24 @@ class BattleStateTracker:
 
         # ── 気絶検知（faintイベント時: HP=0 に加えて明示的なマーク） ────────
         if event_type == "faint":
+            newly_fainted_player = 0
+            newly_fainted_opponent = 0
             for side in (self._player, self._opponent):
                 for slot in side:
                     if slot.hp and slot.hp.startswith("0/") and not slot.fainted:
                         slot.fainted = True
                         slot.on_field = False
                         log.info(f"[戦況] {slot.name} が気絶（faintイベント）")
+                        if side is self._player:
+                            newly_fainted_player += 1
+                        else:
+                            newly_fainted_opponent += 1
+            # ボール数が遅延している場合（アニメーション中）は fainted 数分デクリメント
+            if newly_fainted_player and self._player_alive_count:
+                self._player_alive_count = max(0, self._player_alive_count - newly_fainted_player)
+            if newly_fainted_opponent and self._opponent_alive_count:
+                self._opponent_alive_count = max(0, self._opponent_alive_count - newly_fainted_opponent)
+                self._prev_opponent_alive = self._opponent_alive_count
 
         # ── イベントログ追記 ─────────────────────────────────────────────────
         ocr_snip = game_state.get("ocr_text", "")[:25]
@@ -622,9 +1111,122 @@ class BattleStateTracker:
         if len(self._event_log) > self.MAX_EVENTS:
             self._event_log.pop(0)
 
-    def update_move(self, pokemon_name: str, move_name: str) -> None:
-        """ポケモンが技を使ったことを記録する（per-pokemon 技リスト更新）。"""
-        for side in (self._player, self._opponent):
+    def update_status_by_name(self, name: str, status: str) -> bool:
+        """メッセージ由来の状態異常を名前で検索して記録する。"""
+        slot = self._find_slot(name)
+        if slot:
+            slot.status = status
+            log.info(f"[戦況] {slot.name} 状態異常: {status}（メッセージ由来）")
+            return True
+        return False
+
+    def update_status_from_yolo(self, side: str, status: str, slot_idx: int | None) -> None:
+        """YOLOアイコン/OCR bbox 検出による状態異常を場のポケモンに反映する。
+        slot_idx が指定されている場合はそのスロットのポケモンにのみ付与する。
+        slot_idx が None の場合、状態異常なしのポケモンが1匹だけなら付与する。
+        いずれの場合も、対象ポケモンが既に同じ状態異常を持っていればスキップ。
+        """
+        target_side = self._opponent if side == "opponent" else self._player
+        candidates = [p for p in target_side if p.on_field and not p.fainted]
+
+        if slot_idx is not None:
+            # スロット指定あり: そのスロットのポケモンにのみ付与（他スロットの状態は無関係）
+            for p in candidates:
+                if p.slot_index == slot_idx:
+                    if not p.status:
+                        p.status = status
+                        log.info(f"[戦況] {p.name} 状態異常: {status}（OCRアイコン slot{slot_idx}）")
+                    return  # 既設定済みでもスキップして終了
+            # slot_indexが一致しない場合: status未設定の候補が1匹のみなら付与
+            # （slot_index競合や未割り当ての両方を吸収する）
+            no_status = [p for p in candidates if not p.status]
+            if len(no_status) == 1:
+                no_status[0].status = status
+                log.info(f"[戦況] {no_status[0].name} 状態異常: {status}（OCRアイコン slot{slot_idx}）")
+        else:
+            no_status = [p for p in candidates if not p.status]
+            if len(no_status) == 1:
+                no_status[0].status = status
+                log.info(f"[戦況] {no_status[0].name} 状態異常: {status}（OCRアイコン スロット不明）")
+
+    # 確定状態異常技テーブル (技名 → (状態異常, 全体技かどうか))
+    # 技名はpokedb.sqlite の moves.name_ja と一致させること
+    # ※ でんじは（単体技）はYOLOアイコン検出で正確なターゲットを特定するため除外
+    _STATUS_MOVE_TABLE: dict[str, tuple[str, bool]] = {
+        "おにび":         ("やけど",  True),    # 全体技
+        "どくどく":       ("もうどく", False),
+        "どくのこな":     ("どく",    False),
+        "キノコのほうし": ("ねむり",  False),
+        "さいみんじゅつ": ("ねむり",  False),
+        "うたう":         ("ねむり",  False),
+    }
+
+    def apply_status_from_move(self, user_name: str, move_name: str) -> None:
+        """確定状態異常技の効果から相手チームへ状態異常を推定付与する。
+        OCRでメッセージが取れなかった場合の補完用。
+        既に状態異常があるポケモン・気絶済みポケモンはスキップ。
+        単体技でも場に複数いる場合は全員に付与する（ダブルバトルでターゲット特定不能のため）。
+        """
+        entry = self._STATUS_MOVE_TABLE.get(move_name)
+        if not entry:
+            return
+        status, _is_spread = entry
+
+        # 使用者がどちらのチームか判定（部分一致で対応）
+        in_player = any(
+            s.name == user_name or user_name in s.name or s.name in user_name
+            for s in self._player
+        )
+        target_side = self._opponent if in_player else self._player
+        targets = [s for s in target_side if s.on_field and not s.fainted and not s.status]
+
+        for target in targets:
+            target.status = status
+            log.info(f"[戦況] {target.name} 状態異常: {status}（{user_name}の{move_name}効果推定）")
+
+    def update_pixel_hp(self, pixel_hp: dict[str, float | None]) -> None:
+        """ピクセル解析HP%でFieldPokemonのhp_pct_pixelを更新する。
+        slot_index 設定済みポケモンに優先割り当て。未設定が1匹だけなら
+        物理スロット位置から早期割り当てを行う（T2等のOCR取得前フレームに対応）。
+        """
+        side_map: dict[str, tuple[list[FieldPokemon], int]] = {
+            "player_0":   (self._player,   0),
+            "player_1":   (self._player,   1),
+            "opponent_0": (self._opponent, 0),
+            "opponent_1": (self._opponent, 1),
+        }
+        for key, pct in pixel_hp.items():
+            if pct is None:
+                continue
+            slots, slot_idx = side_map[key]
+
+            # パス1: slot_index 設定済みのポケモンに割り当て
+            matched = False
+            for p in slots:
+                if p.on_field and p.slot_index == slot_idx:
+                    old = p.hp_pct_pixel
+                    p.hp_pct_pixel = pct
+                    if old is None or abs(pct - old) >= 0.05:
+                        log.info("[HPpx] %s %s → %.1f%%", key, p.name, pct * 100)
+                    matched = True
+                    break
+
+            # パス2: 未割り当てが1匹だけなら位置ベース早期割り当て
+            if not matched:
+                unassigned = [p for p in slots if p.on_field and p.slot_index is None]
+                if len(unassigned) == 1:
+                    p = unassigned[0]
+                    p.slot_index = slot_idx
+                    log.info("[スロット早期割] %s → スロット%d (HPpxフォールバック)", p.name, slot_idx)
+                    p.hp_pct_pixel = pct
+                    log.info("[HPpx] %s %s → %.1f%%", key, p.name, pct * 100)
+
+    def update_move(self, pokemon_name: str, move_name: str, is_opponent: bool = False) -> None:
+        """ポケモンが技を使ったことを記録する（per-pokemon 技リスト更新）。
+        is_opponent=True の場合は相手チームのみを検索する（同名ポケモンの誤登録防止）。
+        """
+        sides = [self._opponent] if is_opponent else [self._player, self._opponent]
+        for side in sides:
             for slot in side:
                 if slot.name == pokemon_name:
                     if move_name not in slot.moves_used:
@@ -647,6 +1249,59 @@ class BattleStateTracker:
                         return True
         return False
 
+    # ── メッセージ由来イベント ────────────────────────────────────────────────
+
+    def _find_slot(self, name: str) -> FieldPokemon | None:
+        """名前で両チームを検索してスロットを返す（部分一致OK）。"""
+        for slot in self._player + self._opponent:
+            if slot.name == name or name in slot.name or slot.name in name:
+                return slot
+        return None
+
+    def confirm_faint_by_name(self, name: str) -> bool:
+        """メッセージ由来の気絶確認: 名前でスロットを検索してfaintedフラグを立てる。"""
+        slot = self._find_slot(name)
+        if slot and not slot.fainted:
+            slot.fainted = True
+            slot.on_field = False
+            if slot.hp and "/" in slot.hp:
+                slot.hp = f"0/{slot.hp.split('/')[1]}"
+            log.info(f"[戦況] {slot.name} 気絶確認（メッセージ由来）")
+            return True
+        return slot is not None
+
+    def mark_on_field_by_name(self, name: str) -> bool:
+        """メッセージ由来の繰り出し確認: 名前でスロットを検索してon_field=Trueにする。"""
+        slot = self._find_slot(name)
+        if slot and not slot.fainted:
+            slot.on_field = True
+            slot.last_seen_turn = self.turn
+            log.info(f"[戦況] {slot.name} 繰り出し確認（メッセージ由来）")
+            return True
+        return False
+
+    def register_opponent_on_field(self, name: str) -> bool:
+        """相手の繰り出し確認: スロット未登録なら新規登録してon_fieldにする。"""
+        slot = self._get_or_create(self._opponent, name)
+        if slot is None:
+            log.warning(f"[戦況] 相手スロットが満杯のため {name} を登録できません")
+            return False
+        if not slot.fainted:
+            slot.on_field = True
+            slot.confidence += 1
+            slot.last_seen_turn = self.turn
+            log.info(f"[戦況] 相手 {slot.name} 繰り出し確認（メッセージ由来）")
+        return True
+
+    def mark_bench_by_name(self, name: str) -> bool:
+        """メッセージ由来の引っ込め確認: 名前でスロットを検索してon_field=Falseにする。"""
+        slot = self._find_slot(name)
+        if slot:
+            slot.on_field = False
+            log.info(f"[戦況] {slot.name} 引っ込め確認（メッセージ由来）")
+            return True
+        return False
+
     # ── コンテキスト生成 ─────────────────────────────────────────────────────
 
     def _format_pokemon(self, p: FieldPokemon) -> str:
@@ -661,6 +1316,12 @@ class BattleStateTracker:
                 pct = int(m.group(1)) / int(m.group(2)) * 100
                 if pct <= 25:
                     s += "★ピンチ"
+        elif p.hp_pct_pixel is not None:
+            # OCR HP なし（相手側など）: ピクセル解析値を使用
+            pct_px = p.hp_pct_pixel * 100
+            s += f" HP:{pct_px:.0f}%(px)"
+            if pct_px <= 25:
+                s += "★ピンチ"
         if p.moves_used:
             s += f" 技=[{', '.join(p.moves_used[-4:])}]"
         return s
@@ -686,12 +1347,25 @@ class BattleStateTracker:
         player_bench_str  = " / ".join(self._format_bench(p) for p in bench_p)       or "なし"
         opponent_bench_str = " / ".join(self._format_bench(p) for p in bench_o)      or "なし"
 
+        # ボール数から未把握の控えポケモンを「不明×N」で補完
+        # 把握済み生存数 = fainted でないポケモン数
+        known_p_alive = len([p for p in self._player   if not p.fainted])
+        known_o_alive = len([p for p in self._opponent if not p.fainted])
+        if self._player_alive_count and self._player_alive_count > known_p_alive:
+            unk = self._player_alive_count - known_p_alive
+            suffix = f"不明×{unk}"
+            player_bench_str = suffix if player_bench_str == "なし" else f"{player_bench_str} / {suffix}"
+        if self._opponent_alive_count and self._opponent_alive_count > known_o_alive:
+            unk = self._opponent_alive_count - known_o_alive
+            suffix = f"不明×{unk}"
+            opponent_bench_str = suffix if opponent_bench_str == "なし" else f"{opponent_bench_str} / {suffix}"
+
         # RAG 用: 蓄積済み全ポケモン名リスト（信頼度順）
         player_names   = [p.name for p in sorted(self._player,   key=lambda p: -p.confidence)]
         opponent_names = [p.name for p in sorted(self._opponent, key=lambda p: -p.confidence)]
 
         return {
-            "turn":             self.turn,
+            "turn":             self.game_turn,
             "player_field":     player_field_str,
             "player_bench":     player_bench_str,
             "opponent_field":   opponent_field_str,
@@ -709,7 +1383,7 @@ class BattleStateTracker:
 
 _HP_RE_DEBUG = re.compile(r'\d{1,3}/\d{1,3}')
 
-def _save_ocr_debug_image(frame: np.ndarray, ocr_results: list[dict], turn: int) -> None:
+def _save_ocr_debug_image(frame: np.ndarray | None, ocr_results: list[dict], turn: int) -> None:
     """
     OCR 結果を frame 上に描画して debug/ に保存する。
     色分け:
@@ -718,6 +1392,8 @@ def _save_ocr_debug_image(frame: np.ndarray, ocr_results: list[dict], turn: int)
       青  = HP 値
       灰  = フィルター済み / 低信頼度
     """
+    if frame is None:
+        return
     img = frame.copy()
     for r in ocr_results:
         bbox = r.get("bbox")
@@ -785,7 +1461,9 @@ def _clean_commentary(text: str) -> str:
     # "---" 以降を除去
     text = text.split("---")[0]
 
-    # "【" 以降を除去（「【画面分析】...」が漏れてくる場合）
+    # 先頭の「【...】」ラベルを除去（例: 「【バトル開始！】テキスト」→「テキスト」）
+    text = re.sub(r'^(【[^】]*】\s*)+', '', text)
+    # 中間に残った「【」以降を除去（Phi-3 の「【画面分析】...」が漏れてくる場合）
     text = text.split("【")[0]
 
     # "指示" "質問" "注:" を含む行以降を除去
@@ -832,7 +1510,11 @@ def _call_bedrock_vision(
     """
     try:
         # 縮小してから PNG エンコード（nginx の 5MB 制限対策）
-        small = cv2.resize(frame, (800, 450), interpolation=cv2.INTER_AREA)
+        # frame=None の場合（動画末尾フォールバック等）は黒ダミー画像を使用
+        if frame is None:
+            small = np.zeros((450, 800, 3), dtype=np.uint8)
+        else:
+            small = cv2.resize(frame, (800, 450), interpolation=cv2.INTER_AREA)
         _, buf = cv2.imencode(".png", small)
         image_b64 = base64.b64encode(buf.tobytes()).decode()
 
@@ -884,6 +1566,7 @@ def _call_bedrock_vision(
                 "name_candidates_opponent": " / ".join(names_opponent) if names_opponent else "不明",
                 "rag_pokemon_info":         rag_info,
                 "detected_moves":           " / ".join(move_log) if move_log else "なし",
+                "faint_context":            game_state.get("faint_context", ""),  # 直前のfaint情報（統合時のみ）
             },
             "history": commentary_history[-3:],
             "battle_state": battle_context or {},
@@ -919,12 +1602,15 @@ class Pipeline:
         camera_index: int,
         model_path: str | None,
         ball_model_path: str | None,
+        end_model_path: str | None,
         interval: float,
         speaker: int,
         gpu: bool,
         conf: float,
         ec2_url: str | None,
         audio_device: int | None,
+        video_path: str | None = None,
+        video_sample_fps: float = 2.0,
     ):
         log.info("=== パイプライン初期化 ===")
 
@@ -935,7 +1621,7 @@ class Pipeline:
         self._reader_ko = init_reader_ko(gpu=gpu)
 
         log.info("YoloDetector 初期化中...")
-        self._yolo = YoloDetector(model_path=model_path, ball_model_path=ball_model_path, conf=conf)
+        self._yolo = YoloDetector(model_path=model_path, ball_model_path=ball_model_path, end_model_path=end_model_path, conf=conf)
 
         log.info("Phi-3 クライアント初期化...")
         self._phi3 = Phi3Client()
@@ -947,6 +1633,8 @@ class Pipeline:
         self._player = AudioPlayer(device=audio_device)
 
         self._camera_index = camera_index
+        self._video_path = video_path
+        self._video_sample_fps = video_sample_fps
         self._interval = interval
         self._ec2_url = ec2_url
         self._diff_detector = DiffDetector()             # 静止フレームのスキップ用
@@ -955,12 +1643,30 @@ class Pipeline:
         self._PERIODIC_OCR_INTERVAL_BATTLE = 1.5         # バトル中: 終了画面を取りこぼさないよう短め
         self._PERIODIC_OCR_INTERVAL_IDLE   = 3.0         # バトル外: 重くならないよう長め
         self._battle_tracker = BattleStateTracker()       # 戦況累積
+        self._hpbar_analyzer = HpBarAnalyzer()             # HPバーピクセル解析
+        self._msg_parser = BattleMessageParser()           # バトルメッセージ解析
         self._battle_active = False  # battle_start〜battle_end の間のみ True
+        self._last_battle_end_time: float = 0.0  # battle_end 後のクールダウン用
+        self._BATTLE_START_COOLDOWN = 10.0  # battle_end 後この秒数は battle_start をブロック
+        self._end_screen_count: int = 0  # 終了画面連続検出カウント
+        self._END_SCREEN_CONFIRM = 3      # この回数連続で検出したら battle_end 確定
+        self._battle_active_since: float = 0.0  # battle_start の時刻
+        self._MIN_BATTLE_DURATION = 25.0  # バトル開始からこの秒数は終了画面チェックをスキップ
         self._prev_yolo: BattleState | None = None
         self._last_ball_yolo: BattleState | None = None  # ボールが見えたフレームの最新 YOLO 結果
+        self._pre_battle_opponent: list[str] = []  # battle_start前に検出した相手ポケモン名キャッシュ
         self._commentary_history: list[str] = []
+        self._dense_scan_remaining: int = 0  # move_used後の高密度メッセージROIスキャン残りフレーム数
+        self._was_in_communication: bool = False  # 直前フレームが通信中だったかフラグ（通信中終了検出用）
         self._move_log: list[str] = []   # OCRから検出した「使われた技」のリングバッファ
         self._MAX_MOVE_LOG = 8
+        self._speech_thread: threading.Thread | None = None  # 音声再生スレッド
+        # faint保留送信: faintイベントのBedrockを即送信せず次のmove_usedで統合する
+        self._pending_faint_state: dict | None = None
+        self._pending_faint_battle_context: dict | None = None
+        self._pending_faint_frame: "np.ndarray | None" = None
+        self._pending_faint_time: float = 0.0
+        self._FAINT_PENDING_TIMEOUT: float = 12.0  # この秒数内にmove_usedが来なければ単独送信
 
         # PokeDB 分類器（DB がなければ None でフォールバック動作）
         log.info("PokeClassifier 初期化中...")
@@ -973,19 +1679,32 @@ class Pipeline:
         log.info("=== 初期化完了 ===")
 
     def run(self) -> None:
-        cap = cv2.VideoCapture(self._camera_index)
+        _is_video = self._video_path is not None
+        cap = cv2.VideoCapture(self._video_path if _is_video else self._camera_index)
         if not cap.isOpened():
-            log.error(f"カメラ {self._camera_index} を開けませんでした（OBS仮想カメラが起動中か確認）")
+            if _is_video:
+                log.error(f"動画ファイルを開けませんでした: {self._video_path}")
+            else:
+                log.error(f"カメラ {self._camera_index} を開けませんでした（OBS仮想カメラが起動中か確認）")
             sys.exit(1)
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        for _ in range(10):
-            cap.read()
+        if not _is_video:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            for _ in range(10):
+                cap.read()
 
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        log.info(f"カメラ {self._camera_index} オープン: {w}x{h}")
+        if _is_video:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            # デフォルト2fps（技名などの短時間表示を取りこぼしにくくする）
+            _video_frame_skip = max(1, int(fps // self._video_sample_fps))
+            _video_frame_pos = 0
+            log.info(f"動画ファイル: {self._video_path} ({w}x{h}, {fps:.1f}fps, {total}フレーム, skip={_video_frame_skip})")
+        else:
+            log.info(f"カメラ {self._camera_index} オープン: {w}x{h}")
         log.info("パイプライン開始（Ctrl+C で終了）")
 
         turn = 0
@@ -995,6 +1714,18 @@ class Pipeline:
 
                 ret, frame = cap.read()
                 if not ret:
+                    if _is_video:
+                        log.info("動画ファイルの末尾に達しました。終了します。")
+                        if self._battle_active:
+                            log.info("[battle_end] 動画末尾到達 → 試合終了イベントを合成発行")
+                            turn += 1
+                            self._phase_classifier.set_processing(True)
+                            try:
+                                self._process_event(None, None, [], "battle_end", turn)
+                            finally:
+                                self._phase_classifier.set_processing(False)
+                                self._phase_classifier._battle_started = False
+                        break
                     log.warning("フレーム取得失敗。再試行します...")
                     time.sleep(0.5)
                     continue
@@ -1003,6 +1734,16 @@ class Pipeline:
                 yolo_state = self._yolo.detect(frame)
                 if yolo_state.detections:
                     log.debug(f"[YOLO] {yolo_state.summary()}")
+                # YOLOアイコン → BattleStateTracker に状態異常を同期
+                if self._battle_active:
+                    if yolo_state.opponent_status:
+                        self._battle_tracker.update_status_from_yolo(
+                            "opponent", yolo_state.opponent_status, yolo_state.opponent_status_slot
+                        )
+                    if yolo_state.player_status:
+                        self._battle_tracker.update_status_from_yolo(
+                            "player", yolo_state.player_status, yolo_state.player_status_slot
+                        )
                 # ボールが見えているフレームを記憶（イベント時は animation 中でボールが映らないため）
                 if yolo_state.player_balls.total > 0 or yolo_state.opponent_balls.total > 0:
                     self._last_ball_yolo = yolo_state
@@ -1012,6 +1753,36 @@ class Pipeline:
                     if ball_state.player_balls.total > 0 or ball_state.opponent_balls.total > 0:
                         self._last_ball_yolo = ball_state
                         log.debug(f"[YOLO/balls] コマンド選択時に検出: {ball_state.summary()}")
+
+                # ── 終了画面 YOLO 検知（毎フレーム・連続確認あり）──────────
+                _battle_elapsed = time.time() - self._battle_active_since
+                if (self._battle_active
+                        and not self._phase_classifier._is_processing
+                        and _battle_elapsed >= self._MIN_BATTLE_DURATION):
+                    if self._yolo.detect_end_screen(frame):
+                        self._end_screen_count += 1
+                        log.debug(f"[YOLO] 終了画面検出 {self._end_screen_count}/{self._END_SCREEN_CONFIRM}")
+                        if self._end_screen_count >= self._END_SCREEN_CONFIRM:
+                            # OCR で勝敗テキストを確認（誤発火防止の AND 条件）
+                            _end_ocr = run_ocr(self._reader, frame)
+                            _end_joined = "".join(r["text"] for r in _end_ocr)
+                            if not any(kw in _end_joined for kw in _END_SCREEN_OCR_KEYWORDS):
+                                log.info(f"[YOLO] 終了画面{self._end_screen_count}回検出 → OCRキーワード不一致のため誤発火と判定 (OCR: {_end_joined[:60]})")
+                                self._end_screen_count = 0
+                            else:
+                                log.info(f"[YOLO] 終了画面を{self._end_screen_count}回連続検出 + OCR確認済 → battle_end")
+                                self._end_screen_count = 0
+                                turn += 1
+                                self._phase_classifier.set_processing(True)
+                                try:
+                                    self._process_event(frame, yolo_state, [], "battle_end", turn)
+                                finally:
+                                    self._phase_classifier.set_processing(False)
+                                    self._phase_classifier._battle_started = False
+                                    self._phase_classifier._last_event_time["turn_start"] = time.time()
+                                continue
+                    else:
+                        self._end_screen_count = 0
 
                 # ── 差分検出（静止フレームの OCR スキップ用）────────────────
                 diff_changed, diff_score = self._diff_detector.detect(frame)
@@ -1026,19 +1797,69 @@ class Pipeline:
                     ocr_results = run_ocr(self._reader, frame)
                     self._last_ocr_time = time.perf_counter()
                     ocr_texts = [r["text"] for r in ocr_results if r["confidence"] >= 0.4]
-                    log.info(f"OCR({reason}): {len(ocr_results)} 件 | {' / '.join(ocr_texts[:10])}")
+                    if self._battle_active and ocr_texts:
+                        log.info("[OCR] %s", " / ".join(ocr_texts[:15]))
+                    else:
+                        log.debug(f"OCR({reason}): {len(ocr_results)} 件 | {' / '.join(ocr_texts[:10])}")
 
                     # 定期OCR時はデバッグ画像を保存（終了画面など未検知フェーズの診断用）
                     if periodic_ocr and ocr_results:
                         _save_ocr_debug_image(frame, ocr_results, turn * 1000 + int(now) % 1000)
 
+                    # ── HPバーピクセル解析（バトル中の毎OCRサイクル）──────────
+                    if self._battle_active:
+                        pixel_hp = self._hpbar_analyzer.analyze(frame)
+                        self._battle_tracker.update_pixel_hp(pixel_hp)
+
                     # ── 技使用・交代メッセージの検出（バトル中は常時監視）──────
                     if self._battle_active:
                         self._update_move_log(ocr_results)
                         self._update_switch_out(ocr_results)
+                        # OCR bbox 位置から状態異常アイコンを検出してトラッカーに反映
+                        fh, fw = frame.shape[:2]
+                        self._sync_status_from_ocr_bbox(ocr_results, fh, fw)
+                        # メッセージボックス解析（左下ROI・気絶/交代の補完）
+                        for ev in self._msg_parser.parse(ocr_results):
+                            log.info(
+                                "[メッセージ] %s: %s / 「%s」",
+                                ev["type"], ev["pokemon"], ev["raw"],
+                            )
+                            self._handle_message_event(ev)
+                    else:
+                        # バトル開始前: 全OCRテキストから「をくりだした」を検出してキャッシュ
+                        # ROIフィルタなし（開始演出では通常のメッセージボックス外に表示される可能性あり）
+                        pre_ocr_texts = [r["text"] for r in ocr_results if r["confidence"] >= 0.35]
+                        log.debug("[事前OCR] %s", " / ".join(pre_ocr_texts[:15]))
+                        # OCR誤読（くり→くゆ等）に対応した緩いパターン
+                        _KURI_RE = re.compile(r'く[りゆ]だした')
+                        if any(_KURI_RE.search(t) for t in pre_ocr_texts) and self._classifier:
+                            # 「くりだした」が見つかったフレームで全トークンをPokeClassifierでスキャン
+                            for token in pre_ocr_texts:
+                                clean = token.strip().rstrip('とをは！!」、')
+                                if len(clean) < 2:
+                                    continue
+                                result = self._classifier.classify(clean)
+                                if result and result.category == CATEGORY_POKEMON and result.score >= 80:
+                                    if result.canonical_ja not in self._pre_battle_opponent:
+                                        self._pre_battle_opponent.append(result.canonical_ja)
+                                        log.info("[事前検出] 相手 %s をくりだした（battle_start待ち）", result.canonical_ja)
 
                     # ── フェーズ分類 + イベント検知 ─────────────────────────
                     event_type = self._phase_classifier.detect(ocr_results)
+
+                    # battle_end はバトル中のみ有効（バトル未開始時の成績更新画面等を誤検知しない）
+                    if event_type == "battle_end" and not self._battle_active:
+                        log.debug("battle_end を検知したがバトル未開始のためスキップ")
+                        event_type = None
+
+                    # battle_end 後クールダウン中は battle_start をブロック
+                    # （リザルト画面・ロビー画面の command_select 誤検知対策）
+                    if (event_type == "battle_start"
+                            and self._last_battle_end_time > 0
+                            and time.time() - self._last_battle_end_time < self._BATTLE_START_COOLDOWN):
+                        remaining = self._BATTLE_START_COOLDOWN - (time.time() - self._last_battle_end_time)
+                        log.debug(f"battle_end 後クールダウン中のため battle_start をスキップ (残り {remaining:.1f}s)")
+                        event_type = None
 
                     # フェーズ確定後にボール検出を補完（YOLO検出時点では_prev_phaseが未更新のため）
                     if self._phase_classifier._prev_phase == "command_select":
@@ -1049,6 +1870,14 @@ class Pipeline:
                                 log.debug(f"[YOLO/balls] フェーズ確定後に検出: {ball_state.summary()}")
 
                     if event_type:
+                        # move_used 検知時は品質チェック結果に関わらず dense scan を即起動する。
+                        # オンライン対戦では move_used 直後に「通信中」（OCR 1件）となり品質チェックを
+                        # 通過しないことが多いが、通信完了後のバトルメッセージ（てだすけ等）を
+                        # 取りこぼさないために dense scan は必ず開始する。
+                        if event_type == "move_used" and self._battle_active:
+                            self._dense_scan_remaining = 12
+                            log.debug("[密集OCR] move_used 検知 → 高密度スキャン開始 (12フレーム)")
+
                         # ターンカウント前の品質チェック
                         # OCR 件数不足 or バトル外画面の場合はカウントも実況もスキップ
                         if event_type != "battle_end" and (
@@ -1066,33 +1895,120 @@ class Pipeline:
                                 self._process_event(frame, yolo_state, ocr_results, event_type, turn)
                             finally:
                                 self._phase_classifier.set_processing(False)
-                                # 処理完了後にフェーズ状態をリセット（直後の誤発火防止）
-                                self._phase_classifier.reset_after_processing()
+                                # turn_start はリセットしない: _prev_phase=command_select を保持することで
+                                # 次のOCRで再び unknown→command_select が起きて多重発火するのを防ぐ
+                                # また command_select→other で move_used が正しく検知されるようになる
+                                if event_type != "turn_start":
+                                    self._phase_classifier.reset_after_processing(event_type)
+
+                # ── 通信中終了検出: 通信中→非通信中 の遷移で dense scan を再起動 ──────
+                # 問題: move_used確定後にdense scanが起動するが、コマンド選択画面で
+                #       12フレームを全消費してしまう。その後14秒の通信中を経て
+                #       てだすけ等の技メッセージが出現した時点でdense scan残=0となる。
+                # 解決: 通信中終了時点でdense scanを再起動し、直後のバトルメッセージを確実に捕捉する。
+                _now_in_comm = any("通信中" in r["text"] for r in ocr_results)
+                if self._battle_active and self._was_in_communication and not _now_in_comm:
+                    self._dense_scan_remaining = 12
+                    log.debug("[密集OCR] 通信中終了 → dense scan 再起動 (12フレーム)")
+                self._was_in_communication = _now_in_comm
+
+                # ── 密集メッセージROIスキャン（move_used後の高速テキスト取りこぼし対策）──
+                # move_used 後の技名テキストは < 1秒で消えることがある（まもるで防がれた場合など）。
+                # diff_changed に依存せず毎フレーム実行し、メッセージボックスROIのみをスキャンする。
+                if self._battle_active and self._dense_scan_remaining > 0:
+                    # 通信中フレームは dense scan を一時停止（フレームカウントを消費しない）
+                    if any("通信中" in r["text"] for r in ocr_results):
+                        pass  # 通信中はスキップ
+                    else:
+                        self._dense_scan_remaining -= 1
+                    _D_Y1 = BattleMessageParser.MSG_Y_MIN   # 740
+                    _D_Y2 = BattleMessageParser.MSG_Y_MAX   # 930
+                    _D_X2 = BattleMessageParser.MSG_X_MAX   # 520
+                    msg_roi = frame[_D_Y1:_D_Y2, 0:_D_X2]
+                    dense_raw = run_ocr(self._reader, msg_roi)
+                    # bbox y座標をオリジナルフレーム座標系にオフセット補正
+                    dense_results = [
+                        {
+                            "text": r["text"],
+                            "confidence": r["confidence"],
+                            "bbox": [[pt[0], pt[1] + _D_Y1] for pt in r["bbox"]],
+                        }
+                        for r in dense_raw
+                    ]
+                    dense_texts = [r["text"] for r in dense_results if r["confidence"] >= 0.4]
+                    if dense_texts:
+                        log.info("[密集OCR] %s", " / ".join(dense_texts[:10]))
+                        self._update_move_log(dense_results)
 
                 self._prev_yolo = yolo_state
 
-                elapsed = time.perf_counter() - loop_start
-                time.sleep(max(0.0, self._interval - elapsed))
+                if _is_video:
+                    # 動画モード: 密集スキャン中はフレームスキップを 1/5 に縮小して技名テキストを取りこぼさない
+                    if self._dense_scan_remaining > 0:
+                        _video_frame_pos += max(1, _video_frame_skip // 5)
+                    else:
+                        _video_frame_pos += _video_frame_skip
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, _video_frame_pos)
+                else:
+                    # ライブモード: 密集スキャン中はsleepを短縮（0.1s = 10fps相当）
+                    elapsed = time.perf_counter() - loop_start
+                    if self._dense_scan_remaining > 0:
+                        time.sleep(max(0.0, 0.1 - elapsed))
+                    else:
+                        time.sleep(max(0.0, self._interval - elapsed))
 
         except KeyboardInterrupt:
             log.info(f"終了します（総ターン数: {turn}）")
         finally:
             cap.release()
+            self._generate_battle_template()
+
+    def _generate_battle_template(self) -> None:
+        """終了時にログから対戦記録ひな型を自動生成する。"""
+        try:
+            import sys as _sys
+            scripts_dir = Path(__file__).parent.parent / "scripts"
+            if str(scripts_dir) not in _sys.path:
+                _sys.path.insert(0, str(scripts_dir))
+            from generate_battle_template import parse_log, format_template  # type: ignore
+
+            result = parse_log(log_file_path)
+            output = format_template(result)
+
+            records_dir = Path("records")
+            records_dir.mkdir(exist_ok=True)
+            out_path = records_dir / f"{log_file_path.stem}.txt"
+            out_path.write_text(output, encoding="utf-8")
+            log.info(f"対戦記録ひな型を出力しました: {out_path}")
+        except Exception as e:
+            log.warning(f"対戦記録ひな型の生成に失敗しました: {e}")
 
     def _process_event(
         self,
-        frame: np.ndarray,
-        yolo_state: BattleState,
+        frame: np.ndarray | None,
+        yolo_state: BattleState | None,
         ocr_results: list[dict],
         event_type: str,
         turn: int,
     ) -> None:
         """イベント発生時の一連の処理（game_state 構築 → Phi-3 / Bedrock → VOICEVOX → 再生）。"""
-        log.info(f"OCR: {len(ocr_results)} 件")
+        log.debug(f"OCR: {len(ocr_results)} 件")
+
+        # ── ターン開始イベント: ゲームターンカウントのみ（実況は不要）────────
+        if event_type == "turn_start":
+            self._battle_tracker.game_turn += 1
+            log.info(f"[ターン] T{self._battle_tracker.game_turn} 開始")
+            # 保留中のfaintがタイムアウトしていれば単独Bedrock送信でフラッシュ
+            if (self._pending_faint_state is not None
+                    and time.time() - self._pending_faint_time >= self._FAINT_PENDING_TIMEOUT):
+                log.info("[faintフラッシュ] タイムアウト(%gs超過) → 保留faintを単独送信",
+                         self._FAINT_PENDING_TIMEOUT)
+                self._flush_pending_faint()
+            return
 
         # ── バトル外画面はスキップ（battle_end は終了画面なので除外しない）────
         if event_type != "battle_end" and not _is_battle_screen(ocr_results):
-            log.info("バトル外の画面を検知 → スキップ")
+            log.debug("バトル外の画面を検知 → スキップ")
             return
 
         # OCR 件数が少なすぎる場合はスキップ（battle_end は例外）
@@ -1102,7 +2018,10 @@ class Pipeline:
 
         # ── 韓国語OCR（イベント時のみ追加実行してハングル結果をマージ）──────────
         # 毎フレームではなくイベント処理時だけ実行し、遅延増加を最小限に抑える
-        ko_results = run_ocr(self._reader_ko, frame)
+        if frame is None:
+            ko_results = []
+        else:
+            ko_results = run_ocr(self._reader_ko, frame)
         # 「全文字ハングル」かつ「信頼度0.5以上」のみ採用
         # 数字・記号・英字が混じるOCRノイズ（'7--가지' 等）を除外する
         hangul_hits = [
@@ -1110,11 +2029,14 @@ class Pipeline:
             if PokeClassifier._is_pure_hangul(r["text"]) and r["confidence"] >= 0.5
         ]
         if hangul_hits:
-            log.info(f"韓国語OCR: ハングル {len(hangul_hits)} 件 → {[r['text'] for r in hangul_hits]}")
+            log.debug(f"韓国語OCR: ハングル {len(hangul_hits)} 件 → {[r['text'] for r in hangul_hits]}")
             ocr_results = ocr_results + hangul_hits
 
         # ── game_state 構築 ───────────────────────────────────────────────────
         # イベント時は animation 中でボールが映らないため、最後にボールが見えたフレームの結果を優先する
+        # frame/yolo_state が None の場合（動画末尾フォールバック）は空の BattleState を使う
+        if yolo_state is None:
+            yolo_state = BattleState()
         ball_yolo = self._last_ball_yolo if self._last_ball_yolo else yolo_state
         # ボール数は最新の確認済み値で yolo_state を上書き（ログと実況に反映）
         yolo_state.player_balls   = ball_yolo.player_balls
@@ -1129,18 +2051,32 @@ class Pipeline:
             # バトル開始: トラッカーをリセットしてアクティブ化
             self._battle_tracker = BattleStateTracker()
             self._battle_active = True
+            self._battle_active_since = time.time()
+            self._end_screen_count = 0
             self._commentary_history = []
             self._move_log = []
             self._last_ball_yolo = None  # バトル開始時にボール情報をリセット
             log.info("[戦況] バトル開始 → トラッカーリセット")
+            # バトル開始前にキャッシュした相手ポケモンを登録
+            for name in self._pre_battle_opponent:
+                self._battle_tracker.register_opponent_on_field(name)
+            self._pre_battle_opponent.clear()
+
+        # battle_start が OCR品質不足でスキップされた場合のフォールバック
+        # バトルイベントが来た時点でアクティブ化（トラッカーはリセットしない・既存情報を保持）
+        if not self._battle_active and event_type in {"move_used", "faint", "switch"}:
+            log.warning("[戦況] battle_start 未検知 → バトルをアクティブ化（遅延起動）")
+            self._battle_active = True
+            self._battle_active_since = time.time()
 
         if self._battle_active:
             self._battle_tracker.update(game_state, event_type)
 
         battle_context = self._battle_tracker.to_context()
         log.info(
-            "[戦況] T%s 場(自)=%s | 場(相)=%s",
-            battle_context["turn"],
+            "[戦況] T%s(G%s) 場(自)=%s | 場(相)=%s",
+            self._battle_tracker.turn,
+            self._battle_tracker.game_turn,
             battle_context["player_field"],
             battle_context["opponent_field"],
         )
@@ -1155,9 +2091,39 @@ class Pipeline:
         bedrock_commentary: str | None = None
         bedrock_analysis: str | None = None
         if self._ec2_url and event_type in BEDROCK_EVENTS and self._battle_active:
-            log.info("Bedrock Vision 呼び出し中...")
+            # ── faint保留: 即送信せず次のmove_usedと統合するため保留する ──
+            if event_type == "faint":
+                log.info("[faint保留] Bedrock送信を保留（次のmove_usedで統合予定）")
+                self._pending_faint_state = game_state
+                self._pending_faint_battle_context = battle_context
+                self._pending_faint_frame = frame
+                self._pending_faint_time = time.time()
+                # 実況・VOICEVOX もスキップして終了（戦況更新は済み）
+                return
+
+            # ── move_usedで保留中のfaint情報があれば統合 ──
+            if event_type == "move_used" and self._pending_faint_state is not None:
+                elapsed = time.time() - self._pending_faint_time
+                if elapsed < self._FAINT_PENDING_TIMEOUT:
+                    log.info("[faint統合] 保留faint(%.1f秒前)をmove_usedに統合", elapsed)
+                    # 保留faintの戦況を「直前の気絶情報」としてgame_stateに追加
+                    pending_ctx = self._pending_faint_battle_context or {}
+                    game_state = dict(game_state)
+                    game_state["faint_context"] = (
+                        f"場(自)={pending_ctx.get('player_field','')} | "
+                        f"場(相)={pending_ctx.get('opponent_field','')}"
+                    )
+                else:
+                    # タイムアウト: 先に単独送信してからmove_usedを処理
+                    log.info("[faint統合] タイムアウト(%.1f秒) → 先にフラッシュ", elapsed)
+                    self._flush_pending_faint()
+                self._pending_faint_state = None
+                self._pending_faint_battle_context = None
+                self._pending_faint_frame = None
+
+            log.debug("Bedrock Vision 呼び出し中...")
             if self._move_log:
-                log.info(f"[技ログ] {' / '.join(self._move_log[-5:])}")
+                log.debug(f"[技ログ] {' / '.join(self._move_log[-5:])}")
             t0 = time.perf_counter()
             bedrock_commentary, bedrock_analysis = _call_bedrock_vision(
                 self._ec2_url, frame, game_state, event_type,
@@ -1175,7 +2141,7 @@ class Pipeline:
         else:
             # フォールバック: Phi-3 で生成
             phi3_context = bedrock_analysis or game_state["ocr_text"]
-            log.info("Phi-3 実況文生成中（フォールバック）...")
+            log.debug("Phi-3 実況文生成中（フォールバック）...")
             t0 = time.perf_counter()
             try:
                 commentary = self._phi3.generate_commentary(game_state, bedrock_analysis=phi3_context)
@@ -1196,37 +2162,108 @@ class Pipeline:
         if len(self._commentary_history) > 5:
             self._commentary_history.pop(0)
 
-        # ── VOICEVOX 音声合成 ─────────────────────────────────────────────────
-        log.info("VOICEVOX 音声合成中...")
-        t0 = time.perf_counter()
-        try:
-            wav_bytes = self._voicevox.generate_wav(commentary)
-            log.info(f"音声合成完了 ({time.perf_counter()-t0:.2f}s): {len(wav_bytes)} bytes")
-        except requests.exceptions.ConnectionError:
-            log.error("VOICEVOX が起動していません。VOICEVOX を起動してください。")
-            return
-        except Exception as e:
-            log.error(f"VOICEVOX エラー: {e}")
-            return
-
-        # ── 音声再生 ──────────────────────────────────────────────────────────
-        log.info("音声再生中...")
-        t0 = time.perf_counter()
-        try:
-            self._player.play(wav_bytes)
-            log.info(f"再生完了 ({time.perf_counter()-t0:.2f}s)")
-        except Exception as e:
-            log.error(f"音声再生エラー: {e}")
+        # ── VOICEVOX 音声合成 + 再生（非同期）──────────────────────────────────
+        self._speak_async(commentary)
 
         # バトル終了後にアクティブフラグをリセット（Bedrock呼び出し後）
         if event_type == "battle_end":
             self._battle_active = False
+            self._last_battle_end_time = time.time()
+            self._pre_battle_opponent.clear()
             log.info("[戦況] バトル終了 → トラッカー非アクティブ化")
 
         # デバッグ用スクリーンショット保存
         debug_dir = Path("debug")
         debug_dir.mkdir(exist_ok=True)
         cv2.imwrite(str(debug_dir / f"pipeline_turn_{turn:03d}.png"), frame)
+
+    def _flush_pending_faint(self) -> None:
+        """タイムアウトした保留faintを単独でBedrock送信して実況する。"""
+        if self._pending_faint_state is None:
+            return
+        game_state      = self._pending_faint_state
+        battle_context  = self._pending_faint_battle_context
+        frame           = self._pending_faint_frame
+        self._pending_faint_state          = None
+        self._pending_faint_battle_context = None
+        self._pending_faint_frame          = None
+
+        if not (self._ec2_url and self._battle_active):
+            return
+
+        t0 = time.perf_counter()
+        bedrock_commentary, _ = _call_bedrock_vision(
+            self._ec2_url, frame, game_state, "faint",
+            self._commentary_history, battle_context, self._classifier,
+            self._move_log[-5:],
+        )
+        if bedrock_commentary:
+            commentary = _clean_commentary(bedrock_commentary)
+            log.info("[faintフラッシュ] Bedrock完了 (%.2fs): 「%s」",
+                     time.perf_counter() - t0, commentary)
+            self._commentary_history.append(commentary)
+            if len(self._commentary_history) > 5:
+                self._commentary_history.pop(0)
+            self._speak_async(commentary)
+
+    def _speak_async(self, commentary: str) -> None:
+        """VOICEVOX 音声合成・再生を別スレッドで実行する（メインループをブロックしない）。
+        前の再生が残っていれば停止してから新しい音声を流す。
+        """
+        def _run() -> None:
+            try:
+                t0 = time.perf_counter()
+                wav_bytes = self._voicevox.generate_wav(commentary)
+                log.debug(f"音声合成完了 ({time.perf_counter()-t0:.2f}s): {len(wav_bytes)} bytes")
+            except requests.exceptions.ConnectionError:
+                log.error("VOICEVOX が起動していません。VOICEVOX を起動してください。")
+                return
+            except Exception as e:
+                log.error(f"VOICEVOX エラー: {e}")
+                return
+            # 前の再生が残っていれば停止
+            self._player.stop()
+            try:
+                t0 = time.perf_counter()
+                self._player.play(wav_bytes)
+                log.debug(f"再生完了 ({time.perf_counter()-t0:.2f}s)")
+            except Exception as e:
+                log.error(f"音声再生エラー: {e}")
+
+        self._speech_thread = threading.Thread(target=_run, daemon=True)
+        self._speech_thread.start()
+
+    # 状態異常アイコンとして画面に表示される単語（OCRで単体トークンとして検出される）
+    _STATUS_ICON_WORDS: frozenset[str] = frozenset({"まひ", "やけど", "どく", "もうどく", "ねむり", "こおり", "こんらん"})
+    # HPバーROI境界（フレーム幅/高さに対する比率）
+    _OPP_STATUS_X_MIN  = 0.57   # 相手エリア左端
+    _OPP_STATUS_Y_MAX  = 0.28   # 相手エリア下端
+    _PLR_STATUS_X_MAX  = 0.43   # 自分エリア右端
+    _PLR_STATUS_Y_MIN  = 0.69   # 自分エリア上端
+    _OPP_SLOT_SPLIT    = 1496 / 1920  # 相手スロット0/1境界（hpbar_analyzer実測値）
+    _PLR_SLOT_SPLIT    = 408  / 1920  # 自分スロット0/1境界
+
+    def _sync_status_from_ocr_bbox(self, ocr_results: list[dict], frame_h: int, frame_w: int) -> None:
+        """OCRテキストの bbox 位置から状態異常アイコンを検出してトラッカーに反映する。
+        YOLOモデルが状態異常アイコンを取りこぼした場合の補完として機能する。
+        HP バー表示エリア（相手: 右上 / 自分: 左下）に現れる「まひ」等の単体トークンを対象とする。
+        """
+        for r in ocr_results:
+            text = r["text"].strip()
+            if text not in self._STATUS_ICON_WORDS:
+                continue
+            bbox = r.get("bbox")
+            if not bbox:
+                continue
+            # bbox は [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] 形式
+            cx = sum(p[0] for p in bbox) / 4 / frame_w  # 相対x（0.0-1.0）
+            cy = sum(p[1] for p in bbox) / 4 / frame_h  # 相対y
+            if cx >= self._OPP_STATUS_X_MIN and cy <= self._OPP_STATUS_Y_MAX:
+                slot = 0 if cx < self._OPP_SLOT_SPLIT else 1
+                self._battle_tracker.update_status_from_yolo("opponent", text, slot)
+            elif cx <= self._PLR_STATUS_X_MAX and cy >= self._PLR_STATUS_Y_MIN:
+                slot = 0 if cx < self._PLR_SLOT_SPLIT else 1
+                self._battle_tracker.update_status_from_yolo("player", text, slot)
 
     def _update_switch_out(self, ocr_results: list[dict]) -> None:
         """「〜は戻っていく」テキストを検出してポケモンを場から降ろす。
@@ -1251,58 +2288,146 @@ class Pipeline:
                 if found:
                     log.info(f"[交代検知] {pokemon_name_candidate} が場から退いた（「戻っていく」テキスト検出）")
 
+    def _handle_message_event(self, ev: dict) -> None:
+        """BattleMessageParser から受け取ったメッセージイベントで戦況を補完する。"""
+        event_type = ev["type"]
+        pokemon = ev["pokemon"]
+        if event_type == "faint":
+            self._battle_tracker.confirm_faint_by_name(pokemon)
+        elif event_type == "switch_in":
+            self._battle_tracker.mark_on_field_by_name(pokemon)
+        elif event_type == "opponent_switch_in":
+            # PokeClassifierで正規化してから相手スロットに登録
+            canonical = pokemon
+            if self._classifier:
+                result = self._classifier.classify(pokemon)
+                if result and result.canonical_ja:
+                    canonical = result.canonical_ja
+            self._battle_tracker.register_opponent_on_field(canonical)
+        elif event_type == "switch_out":
+            self._battle_tracker.mark_bench_by_name(pokemon)
+        elif event_type == "status":
+            self._battle_tracker.update_status_by_name(pokemon, ev.get("status", ""))
+
     def _update_move_log(self, ocr_results: list[dict]) -> None:
         """OCR 結果から「〜の → 技名」パターンを検出して _move_log に追記する。
 
-        例: ["トルネロスの", "ハリケーン"] → "トルネロスのハリケーン" として蓄積。
-        classifier で技名確認済みのものだけを登録（OCR誤読対策）。
+        スキャン対象:
+          1. 全 OCR トークンの隣接ペア「[X]の」→「技名」（グローバルスキャン）
+          2. メッセージボックスROI の結合テキスト内の「[ポケモン名]の[技名]」（ROIスキャン）
+             ROI: x < 520, 740 < cy < 930 (BattleMessageParser と同じ領域)
         """
-        # ポケモン名として無効な「〜の」プレフィックス（UIテキスト・バトルメッセージ等）
-        _INVALID_POKEMON_PREFIXES = {"相手", "あいて", "とも", "自分", "じぶん", "ともの"}
+        _INVALID_POKEMON_KEYWORDS = {"相手", "あいて", "とも", "自分", "じぶん"}
 
-        texts = [r["text"].strip() for r in ocr_results if r["confidence"] >= 0.4]
-        for i, text in enumerate(texts):
-            if not text.endswith("の"):
-                continue
-            if i + 1 >= len(texts):
-                continue
-            pokemon_name = text[:-1]  # 末尾の「の」を除去（事前チェック用）
-            # 「相手の」「あいての」等はポケモン名ではない
-            if pokemon_name in _INVALID_POKEMON_PREFIXES:
-                continue
-            next_text = texts[i + 1].rstrip("！!」")
-            # 3文字未満は OCR の断片ノイズ（"こう"等が WRatio 部分マッチで誤検出される）
-            if not next_text or len(next_text) < 3:
-                continue
+        def _is_invalid_pokemon(name: str) -> bool:
+            """「相手」「あいて」等を含む名前は無効（ROI結合テキストの部分マッチ誤登録を防ぐ）"""
+            return any(kw in name for kw in _INVALID_POKEMON_KEYWORDS)
+
+        def _try_register(pokemon_name: str, move_candidate: str, is_opponent: bool = False) -> bool:
+            """ポケモン名+技名候補を検証して _move_log に登録。登録したら True を返す。
+            is_opponent=True の場合は update_move で相手チームのみを検索する。
+            """
+            pokemon_name = pokemon_name.strip().rstrip("！!」、")
+            move_candidate = move_candidate.strip().rstrip("！!」、")
+            if not pokemon_name or _is_invalid_pokemon(pokemon_name):
+                return False
+            if not move_candidate or len(move_candidate) < 3:
+                return False
             if self._classifier:
-                result = self._classifier.classify(next_text)
-                # 技名でない（特性・アイテム等）は除外
+                # ポケモン名を正規化（OCR揺らぎ補正: 例 イエツサン → イエッサン）
+                # entry の重複チェックを確実に機能させるため、技名分類より先に実施する
+                p_result = self._classifier.classify(_normalize_ocr_kana(pokemon_name))
+                if p_result and p_result.category == CATEGORY_POKEMON and p_result.score >= 80:
+                    pokemon_name = p_result.canonical_ja or pokemon_name
+                # OCR 大文字かな誤読を補正してから分類（例: チエ→チェ, きよじゆ→きょじゅ）
+                normalized = _normalize_ocr_kana(move_candidate)
+                result = self._classifier.classify(normalized)
+                # score < 80 は誤検出リスクが高いため除外
+                # confident=False(80-90点台) でも category=move なら採用
                 if result.category != "move":
-                    continue
-                # スコア90未満（confidentでない）は OCR 誤読の可能性が高いため除外
-                # 例: "ぼうぎよ"（防御の誤読）→ "ぼうぎょしれい" にマッチするケース
-                if not result.confident:
-                    continue
-                # OCR テキストが技名の末尾/中間にしか一致しない部分マッチを除外
-                # 例: "こうげき"(4文字) → "ヘドロこうげき"(7文字): WRatio は部分一致で100点になるが
-                #     これは "がむしゃらこうげき" の OCR 分割ノイズ
-                # canonical が OCR テキストの 1.5 倍超なら部分マッチアーティファクトと判断
-                if len(result.canonical_ja) > len(next_text) * 1.5:
-                    continue
-                move_name = result.canonical_ja or next_text
+                    return False
+                if result.score < 80:
+                    return False
+                if len(result.canonical_ja) > len(move_candidate) * 1.5:
+                    return False
+                move_name = result.canonical_ja or move_candidate
             else:
-                # classifier なし: 技名フィルターは行わずそのまま登録
-                move_name = next_text
-            # pokemon_name はループ上部で既に取得済み（text[:-1]）
-            entry = f"{pokemon_name}の{move_name}"
-            if not self._move_log or self._move_log[-1] != entry:
+                move_name = move_candidate
+            turn_label = self._battle_tracker.game_turn if self._battle_active else "?"
+            entry = f"T{turn_label}:{pokemon_name}の{move_name}"
+            if entry not in self._move_log[-3:]:
                 self._move_log.append(entry)
                 if len(self._move_log) > self._MAX_MOVE_LOG:
                     self._move_log.pop(0)
                 log.info(f"[技ログ] 検出: {entry}")
-                # ポケモンごとの技リストも更新
                 if self._battle_active:
-                    self._battle_tracker.update_move(pokemon_name, move_name)
+                    self._battle_tracker.update_move(pokemon_name, move_name, is_opponent=is_opponent)
+                    self._battle_tracker.apply_status_from_move(pokemon_name, move_name)
+                    # まもる検出時は「まもるを」テキスト(~6秒)が消えた後に相手技テキストが来るため、
+                    # 長めに密集スキャンを再起動してワイドフォース等を捕捉する
+                    if move_name == "まもる":
+                        self._dense_scan_remaining = 60
+                        log.debug("[密集OCR] まもる検出 → 高密度スキャン再起動 (60フレーム)")
+                    # 技検出成功時: 次の技メッセージを取りこぼさないよう dense scan を最低 30 フレーム維持。
+                    # ダブルバトルでは複数の技が連続して出るため（例: ワイドフォース → でんじは）、
+                    # 各技検出後に約3秒のバッファを保証することで連続技の取りこぼしを防ぐ。
+                    # まもるの 60 フレームは上書きしない（< 30 の条件）。
+                    elif self._dense_scan_remaining < 30:
+                        self._dense_scan_remaining = 30
+                        log.debug("[密集OCR] 技検出 → dense scan 最低 30 フレーム維持")
+                return True
+            return False
+
+        # ── スキャン1: 全トークンのペアスキャン「[X]の/は」→「技名」 ──────────────
+        # 「の」エンディング: 直後トークンを技名候補として試みる
+        #   例: 「バドレックスの」→「ブリザードランス」
+        # 「は」エンディング: 後続 _HA_SCAN_WINDOW 個のトークンを技名候補として試みる
+        #   例: 「イエツサンは」→「ザマゼンタを」「てだす」… 「手助けする」
+        #       → _MOVE_ALIAS_MAP で「てだすけ」に変換 → PokeClassifier が move と判定して登録
+        #   例: 「バドレックスは」→「まもるを」→ 末尾助詞除去で「まもる」→ move 判定して登録
+        # どちらも PokeClassifier (score >= 80, category == move) が誤登録を防ぐ。
+        _HA_SCAN_WINDOW = 4
+        texts = [r["text"].strip() for r in ocr_results if r["confidence"] >= 0.4]
+        for i, text in enumerate(texts):
+            is_opp = i > 0 and any(kw in texts[i - 1] for kw in {"相手", "あいて"})
+            if text.endswith("の"):
+                pokemon_name = text[:-1]
+                if not _is_invalid_pokemon(pokemon_name) and i + 1 < len(texts):
+                    _try_register(pokemon_name, texts[i + 1], is_opponent=is_opp)
+            elif text.endswith("は"):
+                pokemon_name = text[:-1]
+                if _is_invalid_pokemon(pokemon_name):
+                    continue
+                for j in range(i + 1, min(i + 1 + _HA_SCAN_WINDOW, len(texts))):
+                    # _MOVE_ALIAS_MAP で変形表記を先に正規化（例: 「手助けする」→「てだすけ」）
+                    candidate = _MOVE_ALIAS_MAP.get(texts[j], texts[j])
+                    # 末尾の助詞・句読点を除去（例: 「まもるを」→「まもる」）
+                    candidate = candidate.rstrip("をにはがもでて！!」、")
+                    _try_register(pokemon_name, candidate, is_opponent=is_opp)
+
+        # ── スキャン2: メッセージボックスROI の結合テキスト ─────────────────
+        # BattleMessageParser と同じ ROI からトークンを収集・結合し、
+        # 「[ポケモン名]の[技名]」パターンを正規表現で抽出する。
+        # スキャン1で拾えなかった「の」入り単一トークンや前後に文字が混じるケースを補完。
+        msg_items: list[tuple[float, float, str]] = []
+        for r in ocr_results:
+            if r["confidence"] < 0.35:
+                continue
+            bbox = r.get("bbox", [])
+            if not bbox:
+                continue
+            cx = (bbox[0][0] + bbox[2][0]) / 2
+            cy = (bbox[0][1] + bbox[2][1]) / 2
+            if (cx < BattleMessageParser.MSG_X_MAX
+                    and BattleMessageParser.MSG_Y_MIN < cy < BattleMessageParser.MSG_Y_MAX):
+                msg_items.append((cy, cx, r["text"].strip()))
+        if msg_items:
+            msg_items.sort(key=lambda t: (round(t[0] / 40), t[1]))
+            msg_text = "".join(t[2] for t in msg_items)
+            if msg_text.strip():
+                log.info("[OCR/メッセージ] %s", msg_text[:120])
+            for m in _MOVE_IN_MSG_RE.finditer(msg_text):
+                _try_register(m.group(1), m.group(2))
 
 
 # ─── エントリポイント ──────────────────────────────────────────────────────────
@@ -1311,10 +2436,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ポケモン対戦実況AI パイプライン（Sprint 5）")
     parser.add_argument("--camera",  type=int,   default=3,
                         help="OBS仮想カメラのデバイス番号（デフォルト: 3）")
+    parser.add_argument("--input",   default=None,
+                        help="動画ファイルのパス（指定時はカメラの代わりに動画を使用）")
     parser.add_argument("--model",   default=None,
                         help="YOLOv8 カスタムモデルのパス（状態異常検出用・例: runs/detect/train4/weights/best.pt）")
     parser.add_argument("--ball-model", default=None,
-                        help="ボール検出専用モデルのパス（例: runs/detect/train5/weights/best.pt）")
+                        help="ボール検出専用モデルのパス（例: runs/detect/train7/weights/best.pt）")
+    parser.add_argument("--end-model", default=None,
+                        help="終了画面検出モデルのパス（例: runs/detect/train_end_screen2/weights/best.pt）")
     parser.add_argument("--interval", type=float, default=1.0,
                         help="キャプチャ間隔（秒、デフォルト: 1.0）")
     parser.add_argument("--speaker", type=int,   default=1,
@@ -1327,6 +2456,9 @@ def main() -> None:
                         help="EC2 API の URL（例: http://<EC2-IP>:5000）。指定時に Bedrock Vision を使用。")
     parser.add_argument("--audio-device", type=int, default=None,
                         help="音声出力デバイス番号（省略でシステムデフォルト）")
+    parser.add_argument("--video-fps", type=float, default=2.0,
+                        help="動画解析時のサンプリングレート（fps、デフォルト: 2.0）"
+                             " ─ 高いほど技名取りこぼしが減るがCPU負荷増")
 
     args = parser.parse_args()
 
@@ -1334,12 +2466,15 @@ def main() -> None:
         camera_index=args.camera,
         model_path=args.model,
         ball_model_path=args.ball_model,
+        end_model_path=args.end_model,
         interval=args.interval,
         speaker=args.speaker,
         gpu=not args.cpu,
         conf=args.conf,
         ec2_url=args.ec2_url,
         audio_device=args.audio_device,
+        video_path=args.input,
+        video_sample_fps=args.video_fps,
     )
     pipeline.run()
 

@@ -53,6 +53,15 @@ data/ball_dataset/deleted_bg_labels.txt
 
 # Label Studio エクスポート（メールアドレス等の個人情報を含む可能性あり）
 annotations.json
+annotations_balls.json
+
+# パイプライン実行ログ
+records/
+
+# 終了画面学習データセット（画像バイナリ・data.yamlは管理対象）
+data/end_screen_dataset/images/
+data/end_screen_dataset/labels/
+data/end_screen_dataset/raw/
 
 # 一時ファイル
 tmp/

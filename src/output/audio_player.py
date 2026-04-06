@@ -13,6 +13,7 @@ VOICEVOX が生成した WAV データを指定デバイスに再生する。
 """
 
 import io
+import time
 
 import sounddevice as sd
 import soundfile as sf
@@ -50,7 +51,7 @@ class AudioPlayer:
         with io.BytesIO(wav_bytes) as f:
             data, samplerate = sf.read(f)
         sd.play(data, samplerate, device=self.device)
-        sd.wait()
+        self._wait_interruptible()
 
     def play_file(self, path: str) -> None:
         """
@@ -61,7 +62,23 @@ class AudioPlayer:
         """
         data, samplerate = sf.read(path)
         sd.play(data, samplerate, device=self.device)
-        sd.wait()
+        self._wait_interruptible()
+
+    @staticmethod
+    def _wait_interruptible() -> None:
+        """再生完了まで待機する。sd.wait() はC層でブロックしてCtrl+Cを受け付けないため
+        time.sleep() ポーリングで代替する。例外発生時は必ず sd.stop() でストリームを解放する。"""
+        try:
+            while sd.get_stream().active:
+                time.sleep(0.05)
+        except Exception:
+            sd.stop()
+            raise
+
+    @staticmethod
+    def stop() -> None:
+        """再生中の音声を即座に停止する。"""
+        sd.stop()
 
     @staticmethod
     def list_devices() -> None:

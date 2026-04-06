@@ -83,6 +83,12 @@ ROIS: dict[str, tuple[float, float, float, float]] = {
 
 CONFIDENCE_THRESHOLD = 0.5
 
+# ダブルバトルでのスロット境界（1920x1080 絶対座標・hpbar_analyzer.py の実測値より）
+# opponent slot0: x=1270-1461 / slot1: x=1532-1839 → 境界: (1461+1532)//2 = 1496
+# player  slot0: x=106-385   / slot1: x=432-711    → 境界: (385+432)//2   = 408
+_OPP_SLOT_SPLIT_X = 1496
+_PLR_SLOT_SPLIT_X = 408
+
 
 # ─── データクラス ────────────────────────────────────────────────────────────
 
@@ -112,6 +118,8 @@ class BattleState:
     """1フレームのバトル状態"""
     player_status: str | None = None
     opponent_status: str | None = None
+    player_status_slot: int | None = None    # 状態異常アイコンのスロット番号（0 or 1、None=不明）
+    opponent_status_slot: int | None = None  # 状態異常アイコンのスロット番号（0 or 1、None=不明）
     player_balls: BallCount = field(default_factory=BallCount)
     opponent_balls: BallCount = field(default_factory=BallCount)
     detections: list[Detection] = field(default_factory=list)
@@ -143,6 +151,7 @@ class YoloDetector:
         self,
         model_path: str | None = None,
         ball_model_path: str | None = None,
+        end_model_path: str | None = None,
         device: str | None = None,
         conf: float = CONFIDENCE_THRESHOLD,
     ) -> None:
@@ -175,10 +184,20 @@ class YoloDetector:
             log.info(f"ボール検出専用モデルをロード: {ball_model_path}")
             self._ball_model = YOLO(str(bp))
 
+        # 終了画面検出モデル（battle_end クラス 1種類）
+        self._end_model: object | None = None
+        if end_model_path:
+            ep = Path(end_model_path)
+            if not ep.exists():
+                raise FileNotFoundError(f"終了画面モデルファイルが見つかりません: {end_model_path}")
+            log.info(f"終了画面検出モデルをロード: {end_model_path}")
+            self._end_model = YOLO(str(ep))
+
         self._device = device or self._auto_device()
         log.info(
             f"YoloDetector 初期化完了 (mode={self._mode}, device={self._device}, "
-            f"ball_model={'あり' if self._ball_model else 'なし'})"
+            f"ball_model={'あり' if self._ball_model else 'なし'}, "
+            f"end_model={'あり' if self._end_model else 'なし'})"
         )
 
     @staticmethod
@@ -303,13 +322,28 @@ class YoloDetector:
                     ))
         return all_detections
 
+    def detect_end_screen(self, frame: np.ndarray, conf: float = 0.9) -> bool:
+        """終了画面（battle_end クラス）を検出する。
+
+        Returns:
+            True: 終了画面テキストが検出された
+            False: 未検出 or モデル未ロード
+        """
+        if self._end_model is None:
+            return False
+        results = self._end_model(frame, conf=conf, device=self._device, verbose=False)
+        for r in results:
+            if r.boxes is not None and len(r.boxes) > 0:
+                return True
+        return False
+
     def detect_balls(self, frame: np.ndarray, conf: float = 0.15, debug_dir: str | None = None) -> BattleState:
         """
         ボールROIのみ低い信頼度閾値で検出する（コマンド選択画面専用）。
         通常の detect() より低い conf を使うことで、検出漏れを防ぐ。
         debug_dir を指定するとROIクロップ画像を保存する（診断用）。
         """
-        if not self._ball_model or not self._custom_model:
+        if not self._ball_model:
             return BattleState(mode=self._mode)
 
         import cv2, time
@@ -351,14 +385,15 @@ class YoloDetector:
     def detect(self, frame: np.ndarray) -> BattleState:
         """
         バトル画面フレームに対して検出を実行し BattleState を返す。
-        カスタムモデル使用時はROIクロップ推論、事前学習モデルはフルフレーム推論。
+        カスタムモデルまたはボール専用モデルがある場合はROIクロップ推論、
+        どちらもない場合はフルフレーム推論（パイプライン動作確認用）。
 
         Args:
             frame: BGR 形式の numpy 配列（cv2.imread の出力）。
         """
         state = BattleState(mode=self._mode)
 
-        if self._custom_model:
+        if self._custom_model or self._ball_model:
             all_detections = self._run_on_rois(frame)
         else:
             raw = self._run_on_full_frame(frame)
@@ -367,24 +402,39 @@ class YoloDetector:
         state.detections = all_detections
 
         if self._custom_model:
-            state.player_status   = self._extract_status(all_detections, "player_status")
-            state.opponent_status = self._extract_status(all_detections, "opponent_status")
+            state.player_status,   state.player_status_slot   = self._extract_status(all_detections, "player_status")
+            state.opponent_status, state.opponent_status_slot = self._extract_status(all_detections, "opponent_status")
+
+        if self._custom_model or self._ball_model:
             state.player_balls    = self._count_balls(all_detections, "player_balls")
             state.opponent_balls  = self._count_balls(all_detections, "opponent_balls")
 
         return state
 
     @staticmethod
-    def _extract_status(detections: list[Detection], roi_name: str) -> str | None:
-        """指定 ROI から状態異常ラベルを抽出（最高信頼度のもの）。"""
+    def _extract_status(detections: list[Detection], roi_name: str) -> tuple[str | None, int | None]:
+        """指定 ROI から状態異常ラベルとスロット番号を抽出（最高信頼度のもの）。
+        Returns:
+            (status_jp, slot): status_jp は日本語状態名（なければ None）、
+                               slot はダブルバトルでのスロット番号 0/1（シングルや不明は None）。
+        """
         candidates = [
             d for d in detections
             if d.roi_name == roi_name and d.label in STATUS_JP
         ]
         if not candidates:
-            return None
+            return None, None
         best = max(candidates, key=lambda d: d.confidence)
-        return STATUS_JP.get(best.label)
+        status = STATUS_JP.get(best.label)
+        # アイコンの x 中心座標でスロット判定
+        cx = (best.bbox[0] + best.bbox[2]) / 2
+        if roi_name == "opponent_status":
+            slot = 0 if cx < _OPP_SLOT_SPLIT_X else 1
+        elif roi_name == "player_status":
+            slot = 0 if cx < _PLR_SLOT_SPLIT_X else 1
+        else:
+            slot = None
+        return status, slot
 
     @staticmethod
     def _count_balls(detections: list[Detection], roi_name: str) -> BallCount:

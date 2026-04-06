@@ -229,6 +229,76 @@ venv\Scripts\yolo.exe train model=yolov8s.pt data=data/ball_dataset/data.yaml im
 
 ---
 
+## 終了画面検出データセット（Sprint 7 追加作業・2026-03-30）
+
+### 概要
+
+「勝負に勝った！」「負けた！」「降参が選ばれました」の左下テキストオーバーレイを検出する。
+タイムアウト機構の代替として YOLO で確実に終了を検知するために導入。
+
+### 画像収集
+
+```powershell
+# OBS仮想カメラ（番号3）起動後に実行。sキーで保存。
+venv\Scripts\python.exe scripts\capture_end_screen.py
+```
+
+- 保存先: `data/end_screen_dataset/raw/`
+- 勝ち・負け・降参 各10〜15枚が目安（通信エラーは3枚未満なら除外）
+
+### アノテーション（Label Studio）
+
+ML Backend は不要。手動アノテーションで十分。
+
+1. Label Studio 起動（`$env:LOCAL_FILES_SERVING_ENABLED = "true"` を設定してから）
+2. プロジェクト作成 → `data\end_screen_dataset\raw\` の画像をインポート
+3. Labeling Interface に以下の XML を設定:
+
+```xml
+<View>
+  <Image name="image" value="$image"/>
+  <RectangleLabels name="label" toName="image">
+    <Label value="battle_end" background="#FF0000"/>
+  </RectangleLabels>
+</View>
+```
+
+4. **終了テキストが表示されている画像**: 左下テキスト部分を `battle_end` でBBox
+5. **終了テキストなし（バトル中フレーム等）**: BBoxなしで **Submit**（ネガティブ例として重要）
+6. **Skip は使わない**（未作業扱いになりエクスポートに含まれない）
+
+### データセット準備 & 学習
+
+```powershell
+# Step 1: Label Studio から JSON エクスポート → プロジェクトルートに保存
+# Step 2: YOLO形式変換 + train/val分割
+venv\Scripts\python.exe scripts\prepare_end_screen_dataset.py annotations.json
+
+# Step 3: 学習
+venv\Scripts\yolo.exe train model=yolov8n.pt data=data/end_screen_dataset/data.yaml imgsz=640 epochs=50 batch=8 patience=15 name=train_end_screen
+```
+
+### クラス定義
+
+| ID | クラス名 | 内容 |
+|----|---------|------|
+| 0 | battle_end | バトル終了テキストオーバーレイ（左下） |
+
+### pipeline への組み込み
+
+```powershell
+# --end-model 引数で指定
+venv\Scripts\python.exe src/pipeline.py --end-model runs/detect/train_end_screen2/weights/best.pt ...
+```
+
+### 既知の問題（2026-03-30 時点）
+
+- **バトル中に誤発火**: 技アニメーション等を終了画面と誤認識する
+  - 暫定対策: バトル開始25秒後から検査・3フレーム連続確認
+  - **根本解決策**: バトル中フレームを negative サンプルに追加して再学習が必要
+
+---
+
 ## 既知の問題と対処
 
 ### LabelImg が Python 3.12 でエラーになる
