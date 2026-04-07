@@ -676,7 +676,12 @@ class BattleMessageParser:
     )
     # 相手がポケモンを繰り出すメッセージ: 「〇〇をくりだした！」
     # ダブルバトルの「AとBをくりだした」は B のみ捕捉（A は名前に "と" が混入するため無視）
-    _OPPONENT_SWITCH_IN_RE = re.compile(r'(?:.{2,12}と\s*)?(.{2,12})をくりだした')
+    # OCR誤読バリアント: くりだした → くゆだした（り→ゆ誤読）等に対応
+    # トークン間スペース対応: 「ウルガモスを くゆだした」のようにスペース区切りでも捕捉
+    # プレイヤー名の「は」を読み飛ばし: 「たかひとはウルガモスを」→ ウルガモスのみ捕捉
+    _OPPONENT_SWITCH_IN_RE = re.compile(
+        r'(?:[^\s]{2,12}と\s*)?(?:[^\s]*は\s*)?([^\s]{2,12}?)を\s*く[りゆ]だした'
+    )
     _SWITCH_OUT_RE = re.compile(r'もどれ[、,]\s*(.{2,12})|(.{2,12})と\s*こうたいした')
     # 状態異常メッセージ: 「〇〇は まひじょうたいになった」等
     _STATUS_RE = re.compile(
@@ -1658,7 +1663,9 @@ class Pipeline:
         self._commentary_history: list[str] = []
         self._dense_scan_remaining: int = 0  # move_used後の高密度メッセージROIスキャン残りフレーム数
         self._was_in_communication: bool = False  # 直前フレームが通信中だったかフラグ（通信中終了検出用）
+        self._last_full_ocr_results: list[dict] = []  # メインOCR最新結果（dense scan時の使い手特定に使用）
         self._move_log: list[str] = []   # OCRから検出した「使われた技」のリングバッファ
+        self._tentative_opponent_moves: list[dict] = []  # dense scan フォールバックで仮確定した相手技（後付け修正用）
         self._MAX_MOVE_LOG = 8
         self._speech_thread: threading.Thread | None = None  # 音声再生スレッド
         # faint保留送信: faintイベントのBedrockを即送信せず次のmove_usedで統合する
@@ -1666,7 +1673,9 @@ class Pipeline:
         self._pending_faint_battle_context: dict | None = None
         self._pending_faint_frame: "np.ndarray | None" = None
         self._pending_faint_time: float = 0.0
-        self._FAINT_PENDING_TIMEOUT: float = 12.0  # この秒数内にmove_usedが来なければ単独送信
+        self._pending_faint_game_turn: int = 0   # faint保留時点の game_turn（統合時に繰り上げ要否を判断）
+        self._FAINT_PENDING_TIMEOUT: float = 75.0  # この秒数内にmove_usedが来なければ単独送信
+        self._skip_next_turn_start: bool = False  # faint統合でgame_turnを繰り上げた後、直後のturn_startをスキップするフラグ
 
         # PokeDB 分類器（DB がなければ None でフォールバック動作）
         log.info("PokeClassifier 初期化中...")
@@ -1796,6 +1805,7 @@ class Pipeline:
                     t_ocr = time.perf_counter()
                     ocr_results = run_ocr(self._reader, frame)
                     self._last_ocr_time = time.perf_counter()
+                    self._last_full_ocr_results = ocr_results  # dense scan時の使い手特定用にキャッシュ
                     ocr_texts = [r["text"] for r in ocr_results if r["confidence"] >= 0.4]
                     if self._battle_active and ocr_texts:
                         log.info("[OCR] %s", " / ".join(ocr_texts[:15]))
@@ -1813,7 +1823,7 @@ class Pipeline:
 
                     # ── 技使用・交代メッセージの検出（バトル中は常時監視）──────
                     if self._battle_active:
-                        self._update_move_log(ocr_results)
+                        self._update_move_log(ocr_results, is_main_ocr=True)
                         self._update_switch_out(ocr_results)
                         # OCR bbox 位置から状態異常アイコンを検出してトラッカーに反映
                         fh, fw = frame.shape[:2]
@@ -1887,6 +1897,21 @@ class Pipeline:
                                 f"OCR 品質不足（{len(ocr_results)} 件）またはバトル外 → "
                                 f"イベント '{event_type}' をスキップ（ターン未カウント）"
                             )
+                            # ── faint早期フラッシュ: OCR品質不足でもmove_usedが来たら即送信 ──
+                            # 「ゆけつ！」アニメーション中（OCR 0件）や通信中（1件）で
+                            # move_used がスキップされると、15秒デバウンスで次の機会も
+                            # 通らず 75秒タイムアウトまで待ってしまう問題を防ぐ。
+                            if (event_type == "move_used"
+                                    and self._pending_faint_state is not None):
+                                elapsed = time.time() - self._pending_faint_time
+                                log.info(
+                                    "[faint早期フラッシュ] OCR品質不足だがmove_usedが来たので"
+                                    "保留faintを単独送信 (%.1f秒後)", elapsed
+                                )
+                                self._flush_pending_faint()
+                                self._pending_faint_state = None
+                                self._pending_faint_battle_context = None
+                                self._pending_faint_frame = None
                         else:
                             turn += 1
                             log.info(f"[ターン {turn}] イベント検知 (diff={diff_score:.1f}, type={event_type}, phase={self._phase_classifier._prev_phase})")
@@ -1996,8 +2021,13 @@ class Pipeline:
 
         # ── ターン開始イベント: ゲームターンカウントのみ（実況は不要）────────
         if event_type == "turn_start":
-            self._battle_tracker.game_turn += 1
-            log.info(f"[ターン] T{self._battle_tracker.game_turn} 開始")
+            if self._skip_next_turn_start:
+                # faint統合でgame_turnを繰り上げ済み。直後のturn_startはスキップして二重加算を防ぐ。
+                log.info(f"[ターン] turn_start スキップ（faint統合繰り上げ済み・T{self._battle_tracker.game_turn} 維持）")
+                self._skip_next_turn_start = False
+            else:
+                self._battle_tracker.game_turn += 1
+                log.info(f"[ターン] T{self._battle_tracker.game_turn} 開始")
             # 保留中のfaintがタイムアウトしていれば単独Bedrock送信でフラッシュ
             if (self._pending_faint_state is not None
                     and time.time() - self._pending_faint_time >= self._FAINT_PENDING_TIMEOUT):
@@ -2098,6 +2128,7 @@ class Pipeline:
                 self._pending_faint_battle_context = battle_context
                 self._pending_faint_frame = frame
                 self._pending_faint_time = time.time()
+                self._pending_faint_game_turn = self._battle_tracker.game_turn
                 # 実況・VOICEVOX もスキップして終了（戦況更新は済み）
                 return
 
@@ -2106,6 +2137,18 @@ class Pipeline:
                 elapsed = time.time() - self._pending_faint_time
                 if elapsed < self._FAINT_PENDING_TIMEOUT:
                     log.info("[faint統合] 保留faint(%.1f秒前)をmove_usedに統合", elapsed)
+                    # turn_start がデバウンスで飛ばされた場合のみ繰り上げが必要。
+                    # 保留時点から game_turn が変わっていなければ turn_start 未発火 → 繰り上げる。
+                    # 既に turn_start が来て game_turn が進んでいれば繰り上げ不要。
+                    if self._battle_tracker.game_turn == self._pending_faint_game_turn:
+                        self._battle_tracker.game_turn += 1
+                        log.info(f"[ターン] T{self._battle_tracker.game_turn} 開始（faint統合による繰り上げ）")
+                        self._skip_next_turn_start = True  # 直後のturn_startによる二重加算を防ぐ
+                    else:
+                        log.info(
+                            f"[faint統合] turn_start 済み (T{self._battle_tracker.game_turn}) → "
+                            "ターン繰り上げスキップ"
+                        )
                     # 保留faintの戦況を「直前の気絶情報」としてgame_stateに追加
                     pending_ctx = self._pending_faint_battle_context or {}
                     game_state = dict(game_state)
@@ -2309,23 +2352,69 @@ class Pipeline:
         elif event_type == "status":
             self._battle_tracker.update_status_by_name(pokemon, ev.get("status", ""))
 
-    def _update_move_log(self, ocr_results: list[dict]) -> None:
+    def _update_move_log(self, ocr_results: list[dict], is_main_ocr: bool = False) -> None:
         """OCR 結果から「〜の → 技名」パターンを検出して _move_log に追記する。
 
         スキャン対象:
           1. 全 OCR トークンの隣接ペア「[X]の」→「技名」（グローバルスキャン）
           2. メッセージボックスROI の結合テキスト内の「[ポケモン名]の[技名]」（ROIスキャン）
              ROI: x < 520, 740 < cy < 930 (BattleMessageParser と同じ領域)
+        is_main_ocr=True の場合: dense scan フォールバックで仮確定した相手技の後付け修正も行う。
         """
         _INVALID_POKEMON_KEYWORDS = {"相手", "あいて", "とも", "自分", "じぶん"}
+
+        # ── 後付け修正: メインOCR時に仮確定エントリを正しい使い手で更新 ──────────
+        # dense scan 時は msg ROI のみのため、_find_attacker_from_full_ocr() が空振りして
+        # _get_active_opponent_name()（場の1匹目）で仮登録することがある。
+        # その後のメインOCR で「ゴリランダーの」等のトークンが見つかれば上書き修正する。
+        if is_main_ocr and self._tentative_opponent_moves and self._classifier:
+            known_opps = {s.name for s in self._battle_tracker._opponent}
+            all_toks = [(r.get("text", "").strip(), i)
+                        for i, r in enumerate(ocr_results)
+                        if r.get("confidence", 0) >= 0.25]
+            for tidx, (tok, _) in enumerate(all_toks):
+                if not tok.endswith("の"):
+                    continue
+                cand = tok[:-1].strip()
+                if not cand or any(kw in cand for kw in _INVALID_POKEMON_KEYWORDS):
+                    continue
+                p_res = self._classifier.classify(_normalize_ocr_kana(cand))
+                if not (p_res and p_res.category == CATEGORY_POKEMON and p_res.score >= 80):
+                    continue
+                canonical = p_res.canonical_ja or cand
+                if canonical not in known_opps:
+                    continue
+                # 次トークンが技名か確認
+                if tidx + 1 >= len(all_toks):
+                    continue
+                next_tok = all_toks[tidx + 1][0].rstrip("！!」、")
+                mv_res = self._classifier.classify(_normalize_ocr_kana(next_tok))
+                if not (mv_res and mv_res.category == "move" and mv_res.score >= 80):
+                    continue
+                move_name = mv_res.canonical_ja or next_tok
+                # 仮確定エントリと突合（同ターン・同技名・異なるポケモンの場合のみ修正）
+                cur_turn = str(self._battle_tracker.game_turn if self._battle_active else "?")
+                for tent in self._tentative_opponent_moves[:]:
+                    if (tent["move_name"] == move_name
+                            and tent["turn_label"] == cur_turn
+                            and tent["fallback_pokemon"] != canonical):
+                        old_entry = tent["old_entry"]
+                        new_entry = f"T{tent['turn_label']}:{canonical}の{move_name}"
+                        for idx, e in enumerate(self._move_log):
+                            if e == old_entry:
+                                self._move_log[idx] = new_entry
+                                log.info("[技ログ] 後付け修正: %s → %s", old_entry, new_entry)
+                                break
+                        self._tentative_opponent_moves.remove(tent)
 
         def _is_invalid_pokemon(name: str) -> bool:
             """「相手」「あいて」等を含む名前は無効（ROI結合テキストの部分マッチ誤登録を防ぐ）"""
             return any(kw in name for kw in _INVALID_POKEMON_KEYWORDS)
 
-        def _try_register(pokemon_name: str, move_candidate: str, is_opponent: bool = False) -> bool:
+        def _try_register(pokemon_name: str, move_candidate: str, is_opponent: bool = False, tentative: bool = False) -> bool:
             """ポケモン名+技名候補を検証して _move_log に登録。登録したら True を返す。
             is_opponent=True の場合は update_move で相手チームのみを検索する。
+            tentative=True の場合は後付け修正の対象として _tentative_opponent_moves に記録する。
             """
             pokemon_name = pokemon_name.strip().rstrip("！!」、")
             move_candidate = move_candidate.strip().rstrip("！!」、")
@@ -2339,6 +2428,13 @@ class Pipeline:
                 p_result = self._classifier.classify(_normalize_ocr_kana(pokemon_name))
                 if p_result and p_result.category == CATEGORY_POKEMON and p_result.score >= 80:
                     pokemon_name = p_result.canonical_ja or pokemon_name
+                # is_opponent=True の場合、相手チームにいないポケモンは登録しない
+                # 例: OCRが「オーロンゲ」→「オーダイル」と誤読しても、対戦に出ていなければ弾く
+                if is_opponent:
+                    known_opp = {s.name for s in self._battle_tracker._opponent}
+                    if known_opp and pokemon_name not in known_opp:
+                        log.debug("[技ログ] is_opponent=True だが相手チームに未登録のためスキップ: %s", pokemon_name)
+                        return False
                 # OCR 大文字かな誤読を補正してから分類（例: チエ→チェ, きよじゆ→きょじゅ）
                 normalized = _normalize_ocr_kana(move_candidate)
                 result = self._classifier.classify(normalized)
@@ -2359,26 +2455,175 @@ class Pipeline:
                 self._move_log.append(entry)
                 if len(self._move_log) > self._MAX_MOVE_LOG:
                     self._move_log.pop(0)
-                log.info(f"[技ログ] 検出: {entry}")
+                log.info("[技ログ] 検出: %s%s", entry, "（仮確定）" if tentative else "")
+                if tentative:
+                    self._tentative_opponent_moves.append({
+                        "old_entry": entry,
+                        "move_name": move_name,
+                        "turn_label": str(turn_label),
+                        "fallback_pokemon": pokemon_name,
+                    })
                 if self._battle_active:
                     self._battle_tracker.update_move(pokemon_name, move_name, is_opponent=is_opponent)
                     self._battle_tracker.apply_status_from_move(pokemon_name, move_name)
                     # まもる検出時は「まもるを」テキスト(~6秒)が消えた後に相手技テキストが来るため、
                     # 長めに密集スキャンを再起動してワイドフォース等を捕捉する
                     if move_name == "まもる":
-                        self._dense_scan_remaining = 60
-                        log.debug("[密集OCR] まもる検出 → 高密度スキャン再起動 (60フレーム)")
-                    # 技検出成功時: 次の技メッセージを取りこぼさないよう dense scan を最低 30 フレーム維持。
-                    # ダブルバトルでは複数の技が連続して出るため（例: ワイドフォース → でんじは）、
-                    # 各技検出後に約3秒のバッファを保証することで連続技の取りこぼしを防ぐ。
-                    # まもるの 60 フレームは上書きしない（< 30 の条件）。
-                    elif self._dense_scan_remaining < 30:
-                        self._dense_scan_remaining = 30
-                        log.debug("[密集OCR] 技検出 → dense scan 最低 30 フレーム維持")
+                        self._dense_scan_remaining = 90
+                        log.debug("[密集OCR] まもる検出 → 高密度スキャン再起動 (90フレーム)")
+                    # 技検出成功時: 次の技メッセージを取りこぼさないよう dense scan を最低 90 フレーム維持。
+                    # ダブルバトルでは1ターンに2匹が行動し、2つ目の技メッセージは1つ目の検出から
+                    # 7〜9秒後に出ることがある（アニメーション＋効果表示分）。
+                    # dense scan は約10fps で消費されるため 90 フレーム≒9秒が必要。
+                    # まもるの 60 フレームは上書きしない（< 90 の条件で逆転しないよう 60→90 に統一）。
+                    elif self._dense_scan_remaining < 90:
+                        self._dense_scan_remaining = 90
+                        log.debug("[密集OCR] 技検出 → dense scan 最低 90 フレーム維持")
                 return True
             return False
 
-        # ── スキャン1: 全トークンのペアスキャン「[X]の/は」→「技名」 ──────────────
+        def _get_active_opponent_name() -> str | None:
+            """場に出ている相手ポケモン名を返す（複数いる場合は1匹目）。
+            「相手の[技]」のように相手名がROI外でトークン未取得の場合の代替用。
+            """
+            on_field_o = [p for p in self._battle_tracker._opponent
+                          if p.on_field and not p.fainted]
+            return on_field_o[0].name if on_field_o else None
+
+        def _find_attacker_from_full_ocr() -> str | None:
+            """全OCR結果（ROI外含む）から「Xの」形式の相手ポケモン名トークンを探す。
+            「相手のザマゼンタのきょじゅうだん」のように相手名がROI外に出るケースに対応。
+            dense scan 時は msg ROI のみのため、キャッシュしたメインOCR結果も検索する。
+            known_opponents に含まれるポケモン名のみ採用することで誤マッチを防ぐ。
+            上部HPバー等の誤マッチを防ぐためメッセージボックス付近（cy > 600）のみ対象。
+            """
+            if not self._classifier:
+                return None
+            known_opponents = {s.name for s in self._battle_tracker._opponent}
+            # メッセージボックス直上エリアのみ対象（cy > 600）。
+            # 上部HPバー（y≈50-200）やUI中段（y≈200-600）の誤マッチを防ぐ。
+            # メッセージ付近（y≈600-740）に出るポケモン名トークンのみを拾う。
+            _MSG_AREA_Y_MIN = BattleMessageParser.MSG_Y_MIN - 140  # 600
+            # dense scan 時は ocr_results が msg ROI のみ → メインOCRキャッシュも合わせて検索する
+            search_sources = ocr_results if ocr_results is not self._last_full_ocr_results else ocr_results
+            if self._last_full_ocr_results and self._last_full_ocr_results is not ocr_results:
+                search_sources = list(ocr_results) + self._last_full_ocr_results
+            for r in search_sources:
+                if r["confidence"] < 0.25:
+                    continue
+                bbox = r.get("bbox", [])
+                if not bbox:
+                    continue
+                cy_r = (bbox[0][1] + bbox[2][1]) / 2
+                if cy_r < _MSG_AREA_Y_MIN:
+                    continue  # 上部HPバー・ポケモン名表示エリアは除外
+                text = r.get("text", "").strip()
+                # 「Xの」（所有格）または「Xは」（主語助詞）で終わるトークンを使い手候補とする。
+                # 例: 「バドレックスの」→ バドレックス / 「イエツサンは」→ イエッサン
+                if text.endswith("の") or text.endswith("は"):
+                    candidate = text[:-1].strip()
+                else:
+                    continue
+                if not candidate or _is_invalid_pokemon(candidate):
+                    continue
+                result = self._classifier.classify(_normalize_ocr_kana(candidate))
+                if (result
+                        and result.category == CATEGORY_POKEMON
+                        and result.score >= 80):
+                    canonical = result.canonical_ja or candidate
+                    if canonical in known_opponents:
+                        return canonical
+            return None
+
+        def _try_register_opponent_attack(move_cand: str) -> bool:
+            """「相手の[move_cand]」パターンの技登録。
+            move_cand が「ポケモン略称+技名」の連結OCR誤読の場合は分割して正しい使い手で登録。
+            例: 「イエてだすけ」→ イエッサンのてだすけ として登録。
+            通常ケースは _find_attacker_from_full_ocr → _get_active_opponent_name の順で使い手を特定。
+            """
+            cleaned_cand = move_cand.rstrip("！!」、")
+            if not cleaned_cand:
+                return False
+            # ── 先頭2文字がポケモン略称 + 残りが有効な技 → 分割登録 ────────────
+            # 「イエてだすけ」= イエッサン略称 + てだすけ の連結誤読を修正する。
+            # remainder が有効な技かを事前確認し、有効なら split パスで完結する。
+            # （重複登録で _try_register が False を返した場合も通常ルートには進まない）
+            # ブリザードランスのように「ブリ」=ブリムオン略称で誤判定されても
+            # 「ザードランス」が技として無効なら通常ルートへフォールスルーする。
+            if self._classifier and len(cleaned_cand) >= 4:
+                prefix2 = cleaned_cand[:2]
+                # OCR 清音→濁音誤読を考慮した候補を生成。
+                # 例: 「バト」→「バド」（バドレックス の OCR 誤読）
+                # ト→ド, テ→デ はポケモン名頭文字の混同で最頻出。
+                _DAKUTEN = {"ト": "ド", "テ": "デ", "ツ": "ズ"}
+                prefix_variants = [prefix2]
+                if len(prefix2) == 2 and prefix2[1] in _DAKUTEN:
+                    prefix_variants.append(prefix2[0] + _DAKUTEN[prefix2[1]])
+                known_opp_set = {s.name for s in self._battle_tracker._opponent}
+                for pfx in prefix_variants:
+                    p_pfx = self._classifier.classify(_normalize_ocr_kana(pfx))
+                    if not (p_pfx
+                            and p_pfx.category == CATEGORY_POKEMON
+                            and p_pfx.score >= 80):
+                        continue
+                    canonical = p_pfx.canonical_ja or pfx
+                    # Classifierが同スコアで別ポケモン（例: バド→バンバドロ）を返した場合、
+                    # known_opponents に pfx で始まる実際の対戦ポケモンがいればそちらを優先する。
+                    if canonical not in known_opp_set:
+                        alt = next((n for n in known_opp_set if n.startswith(pfx)), None)
+                        if not alt:
+                            continue
+                        canonical = alt
+                    remainder = cleaned_cand[2:].lstrip()
+                    if len(remainder) >= 3:
+                        rem_result = self._classifier.classify(_normalize_ocr_kana(remainder))
+                        if rem_result and rem_result.category == "move" and rem_result.score >= 80:
+                            # 分割パスが有効 → 登録（重複でも通常ルートには進まない）
+                            _try_register(canonical, remainder, is_opponent=True)
+                            return True
+                    # remainder が技でない → 通常ルートへフォールスルー
+                    break
+            # ── 通常ルート: 全OCR → active opponent の順で使い手を特定 ────────
+            # 同ターン・同技がすでに別ポケモンで登録済みなら重複スキップ。
+            # 例: 「イエッサンのてだすけ」登録済み → 「相手のてだすけ」でザマゼンタ重複を防ぐ。
+            if self._classifier:
+                mv_check = self._classifier.classify(_normalize_ocr_kana(cleaned_cand))
+                if mv_check and mv_check.category == "move" and mv_check.score >= 80:
+                    canonical_move = mv_check.canonical_ja or cleaned_cand
+                    turn_label = self._battle_tracker.game_turn if self._battle_active else "?"
+                    for recent in self._move_log[-6:]:
+                        if (recent.startswith(f"T{turn_label}:")
+                                and recent.endswith(f"の{canonical_move}")):
+                            log.debug("[技ログ] 同ターン同技が登録済みのためスキップ: %s", canonical_move)
+                            return False
+            attacker = _find_attacker_from_full_ocr()
+            if attacker:
+                return _try_register(attacker, cleaned_cand, is_opponent=True)
+            # フォールバック: 場の1匹目を使い手とする（仮確定・後付け修正の対象）
+            fallback = _get_active_opponent_name()
+            if fallback:
+                return _try_register(fallback, cleaned_cand, is_opponent=True, tentative=True)
+            return False
+
+        # ── メッセージボックスROI トークン収集 ──────────────────────────────────
+        # スキャン1・2・2フォールバック共通: MSG ROI 内のトークンのみを対象とする。
+        # ROI外（HPバー・コマンドUI等）のOCR誤読による誤検出を防ぐ。
+        msg_items: list[tuple[float, float, str]] = []
+        for r in ocr_results:
+            if r["confidence"] < 0.35:
+                continue
+            bbox = r.get("bbox", [])
+            if not bbox:
+                continue
+            cx = (bbox[0][0] + bbox[2][0]) / 2
+            cy = (bbox[0][1] + bbox[2][1]) / 2
+            if (cx < BattleMessageParser.MSG_X_MAX
+                    and BattleMessageParser.MSG_Y_MIN < cy < BattleMessageParser.MSG_Y_MAX):
+                msg_items.append((cy, cx, r["text"].strip()))
+        if msg_items:
+            msg_items.sort(key=lambda t: (round(t[0] / 40), t[1]))
+
+        # ── スキャン1: メッセージROIトークンのペアスキャン「[X]の/は」→「技名」 ──────
         # 「の」エンディング: 直後トークンを技名候補として試みる
         #   例: 「バドレックスの」→「ブリザードランス」
         # 「は」エンディング: 後続 _HA_SCAN_WINDOW 個のトークンを技名候補として試みる
@@ -2386,13 +2631,18 @@ class Pipeline:
         #       → _MOVE_ALIAS_MAP で「てだすけ」に変換 → PokeClassifier が move と判定して登録
         #   例: 「バドレックスは」→「まもるを」→ 末尾助詞除去で「まもる」→ move 判定して登録
         # どちらも PokeClassifier (score >= 80, category == move) が誤登録を防ぐ。
+        # ※ ROI外のUI要素（HPバー・コマンド選択等）の誤読によるノイズをROI絞り込みで排除。
         _HA_SCAN_WINDOW = 4
-        texts = [r["text"].strip() for r in ocr_results if r["confidence"] >= 0.4]
+        texts = [t[2] for t in msg_items if t[2]]  # msg_items から confidence>=0.35 のトークン
         for i, text in enumerate(texts):
             is_opp = i > 0 and any(kw in texts[i - 1] for kw in {"相手", "あいて"})
             if text.endswith("の"):
                 pokemon_name = text[:-1]
-                if not _is_invalid_pokemon(pokemon_name) and i + 1 < len(texts):
+                if _is_invalid_pokemon(pokemon_name):
+                    # 「相手の」→ _try_register_opponent_attack で使い手特定+分割誤読修正
+                    if ("相手" in pokemon_name or "あいて" in pokemon_name) and i + 1 < len(texts):
+                        _try_register_opponent_attack(texts[i + 1])
+                elif i + 1 < len(texts):
                     _try_register(pokemon_name, texts[i + 1], is_opponent=is_opp)
             elif text.endswith("は"):
                 pokemon_name = text[:-1]
@@ -2409,25 +2659,62 @@ class Pipeline:
         # BattleMessageParser と同じ ROI からトークンを収集・結合し、
         # 「[ポケモン名]の[技名]」パターンを正規表現で抽出する。
         # スキャン1で拾えなかった「の」入り単一トークンや前後に文字が混じるケースを補完。
-        msg_items: list[tuple[float, float, str]] = []
-        for r in ocr_results:
-            if r["confidence"] < 0.35:
-                continue
-            bbox = r.get("bbox", [])
-            if not bbox:
-                continue
-            cx = (bbox[0][0] + bbox[2][0]) / 2
-            cy = (bbox[0][1] + bbox[2][1]) / 2
-            if (cx < BattleMessageParser.MSG_X_MAX
-                    and BattleMessageParser.MSG_Y_MIN < cy < BattleMessageParser.MSG_Y_MAX):
-                msg_items.append((cy, cx, r["text"].strip()))
         if msg_items:
-            msg_items.sort(key=lambda t: (round(t[0] / 40), t[1]))
             msg_text = "".join(t[2] for t in msg_items)
             if msg_text.strip():
                 log.info("[OCR/メッセージ] %s", msg_text[:120])
             for m in _MOVE_IN_MSG_RE.finditer(msg_text):
-                _try_register(m.group(1), m.group(2))
+                poke_name = m.group(1)
+                if _is_invalid_pokemon(poke_name):
+                    # 「相手の[技]」→ _try_register_opponent_attack で使い手特定+分割誤読修正
+                    if "相手" in poke_name or "あいて" in poke_name:
+                        _try_register_opponent_attack(m.group(2))
+                else:
+                    _try_register(poke_name, m.group(2))
+
+            # ── スキャン2フォールバック: 「の」欠落対応・技名直接検索 ──────────
+            # OCRが「ミライドンの」を「ミライドン」と読んだ場合に対応。
+            # メッセージROIのトークンを個別に技名判定し、直前トークンをポケモン名として登録する。
+            # メッセージROI内のトークンのみを対象とするため誤検出リスクが低く、
+            # dense scanの状態に依存しないため技出現タイミングを問わず動作する。
+            if self._classifier:
+                for i, (_cy, _cx, token) in enumerate(msg_items):
+                    cleaned = token.rstrip("！!」、")
+                    if len(cleaned) < 3:
+                        continue
+                    move_result = self._classifier.classify(_normalize_ocr_kana(cleaned))
+                    if not (move_result
+                            and move_result.category == "move"
+                            and move_result.score >= 80):
+                        continue
+                    if i == 0:
+                        continue
+                    orig_prev = msg_items[i - 1][2]
+                    if orig_prev.endswith("を"):
+                        # 「ザマゼンタを」= 技の対象（受け手）であり使い手ではない → スキップ
+                        # 例: 「イエッサンはザマゼンタをてだすけ」の「ザマゼンタを」は対象
+                        continue
+                    prev_text = orig_prev.rstrip("のは！!」、")
+                    if len(prev_text) < 2:
+                        continue
+                    p_result = self._classifier.classify(_normalize_ocr_kana(prev_text))
+                    if not (p_result
+                            and p_result.category == CATEGORY_POKEMON
+                            and p_result.score >= 80):
+                        # 「相手」等の無効トークン → _try_register_opponent_attack で使い手特定
+                        if "相手" in prev_text or "あいて" in prev_text:
+                            _try_register_opponent_attack(cleaned)
+                        continue
+                    if len(prev_text) < 3:
+                        # 2文字トークン（例: 「イエ」）は canonical_ja の先頭一致も必須。
+                        # 「ザー」→「リザード」のような後方一致の誤マッチを防ぐ。
+                        canonical = p_result.canonical_ja or ""
+                        if not canonical.startswith(prev_text):
+                            continue
+                    is_opp = i > 1 and any(
+                        kw in msg_items[i - 2][2] for kw in {"相手", "あいて"}
+                    )
+                    _try_register(prev_text, cleaned, is_opponent=is_opp)
 
 
 # ─── エントリポイント ──────────────────────────────────────────────────────────
