@@ -164,6 +164,7 @@ def run(
     end_model_path: str | None,
     conf: float,
     debug_balls: bool = False,
+    input_path: str | None = None,
 ) -> None:
     # 出力ファイル準備
     log_dir = Path("logs")
@@ -176,22 +177,32 @@ def run(
 
     log.info("=" * 70)
     log.info(f"OCR診断ロガー 開始: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    log.info(f"カメラ: {camera_index} / テキストログ: {txt_path} / JSONL: {jsonl_path}")
+    if input_path:
+        log.info(f"入力ファイル: {input_path} / テキストログ: {txt_path} / JSONL: {jsonl_path}")
+    else:
+        log.info(f"カメラ: {camera_index} / テキストログ: {txt_path} / JSONL: {jsonl_path}")
     log.info("注釈の追加方法: ログファイルに # BATTLE_START / # TURN_1 / # BATTLE_END 等を書き込む")
     log.info("=" * 70)
 
-    # カメラ初期化
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        log.error(f"カメラ {camera_index} を開けませんでした（OBS仮想カメラが起動中か確認してください）")
-        sys.exit(1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-    for _ in range(10):
-        cap.read()
+    # カメラ / 動画ファイル初期化
+    if input_path:
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            log.error(f"動画ファイルを開けませんでした: {input_path}")
+            sys.exit(1)
+    else:
+        cap = cv2.VideoCapture(camera_index)
+        if not cap.isOpened():
+            log.error(f"カメラ {camera_index} を開けませんでした（OBS仮想カメラが起動中か確認してください）")
+            sys.exit(1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        for _ in range(10):
+            cap.read()
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    log.info(f"カメラ {camera_index} オープン完了: {w}x{h}")
+    source_label = input_path or f"カメラ {camera_index}"
+    log.info(f"{source_label} オープン完了: {w}x{h}")
 
     # EasyOCR初期化
     reader = init_reader(gpu=True)
@@ -306,6 +317,8 @@ def main() -> None:
                         help="YOLO信頼度閾値（デフォルト: 0.3）")
     parser.add_argument("--debug-balls", action="store_true",
                         help="最初の30フレームのボールROI切り出し画像を debug/ball_rois/ に保存")
+    parser.add_argument("--input", metavar="PATH", default=None,
+                        help="動画ファイルのパス（省略時はカメラ入力）")
     args = parser.parse_args()
 
     run(
@@ -314,6 +327,7 @@ def main() -> None:
         end_model_path=args.end_model,
         conf=args.conf,
         debug_balls=args.debug_balls,
+        input_path=args.input,
     )
 
 

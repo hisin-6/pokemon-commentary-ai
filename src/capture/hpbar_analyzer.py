@@ -5,10 +5,17 @@ HPバーピクセル解析モジュール
 左端〜現在右端の幅を測定してHP%を推定する。
 
 スロット座標（1920x1080 固定）
-  player  slot0: x=106-386, y=948-974
-  player  slot1: x=432-712, y=948-974
-  opponent slot0: x=1270-1420, y=88-110
-  opponent slot1: x=1560-1815, y=88-110
+【SV（スカーレット・バイオレット）】
+  player  slot0: x=106-385,  y=948-974
+  player  slot1: x=432-711,  y=948-974
+  opponent slot0: x=1270-1461, y=88-110
+  opponent slot1: x=1532-1839, y=88-110
+
+【チャンピオンズ】
+  player  slot0: x=106-385,  y=948-974  ← SV と同じ（要再確認）
+  player  slot1: x=432-711,  y=948-974  ← SV と同じ（要再確認）
+  opponent slot0: x=1105-1450, y=110-130  ← 実測（2026-04-13）
+  opponent slot1: x=1498-1846, y=110-130  ← 実測（2026-04-13）
 """
 
 from __future__ import annotations
@@ -47,13 +54,13 @@ class SlotConfig:
 # ── デフォルト座標（1920x1080 基準） ──────────────────────────────
 # 実測値（debug/ocr_turn_*.png の複数フレームで満タン幅を計測）:
 #   player:   y=948-974, 満タン幅=279px（バドレックス100%フレームで確認）
-#   opp_0:    y=88-110,  x_left=1270, 満タン幅=191px（緑バーフレームのMAX値）
-#   opp_1:    y=88-110,  x_left=1532, 満タン幅=307px（x_right≈1839で安定）
+#   opp_0:    y=110-130（チャンピオンズ実測 2026-04-13）
+#   opp_1:    y=110-130（チャンピオンズ実測 2026-04-13）
 _DEFAULT_SLOTS: dict[str, SlotConfig] = {
     "player_0":   SlotConfig(x_left=106,  x_right=385,  y_top=948, y_bottom=974, label="player_0"),
     "player_1":   SlotConfig(x_left=432,  x_right=711,  y_top=948, y_bottom=974, label="player_1"),
-    "opponent_0": SlotConfig(x_left=1270, x_right=1461, y_top=88,  y_bottom=110, label="opp_0"),
-    "opponent_1": SlotConfig(x_left=1532, x_right=1839, y_top=88,  y_bottom=110, label="opp_1"),
+    "opponent_0": SlotConfig(x_left=1222, x_right=1450, y_top=110, y_bottom=130, label="opp_0"),
+    "opponent_1": SlotConfig(x_left=1618, x_right=1846, y_top=110, y_bottom=130, label="opp_1"),
 }
 
 

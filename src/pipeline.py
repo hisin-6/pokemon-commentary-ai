@@ -215,6 +215,8 @@ def _extract_structured_info(
     hp_pattern = re.compile(r'\b(\d{1,3})/(\d{1,3})\b')
     # PP 最大値は 40 以下なので分母 >= 50 のみ HP として採用（PP 値との混同を防ぐ）
     _HP_MIN_DENOM = 50
+    # チャンピオンズ: 相手HP%パターン（XX%形式）
+    hp_pct_pattern = re.compile(r'(\d{1,3})%')
 
     hp_values: list[str] = []
     hp_player_with_xy: list[tuple[str, float, float]] = []   # (hp_str, center_x, center_y) 自分側
@@ -257,6 +259,22 @@ def _extract_structured_info(
                 else:
                     hp_player_with_xy.append((hp_str, 960.0, 999.0))  # bbox なし → 自分側に追加
             continue
+
+        # チャンピオンズ: 相手HP%パターン（XX%形式）
+        # 状態確認パネル中は複数ポケモンのHP%が混在するためスキップ
+        if not is_status_panel:
+            m_pct = hp_pct_pattern.search(text)
+            if m_pct:
+                pct_val = int(m_pct.group(1))
+                if pct_val <= 100:
+                    hp_str = f"{pct_val}%"
+                    bbox_hp = r.get("bbox", [])
+                    if bbox_hp:
+                        cx = (bbox_hp[0][0] + bbox_hp[2][0]) / 2
+                        cy = (bbox_hp[0][1] + bbox_hp[2][1]) / 2
+                        if cy < _PLAYER_Y_THRESHOLD:
+                            hp_opponent_with_xy.append((hp_str, cx, cy))
+                    continue
 
         # 状態確認パネル中は名前候補収集しない（HP値は上で収集済み）
         if is_status_panel:
@@ -465,7 +483,7 @@ class BattlePhaseClassifier:
     # 選出画面キーワード（この画面中はバトルイベントを発火させない）
     _SELECTION_KW  = {"ポケモンを選んで", "選出", "きめる", "リーダー", "選出順"}
     # L50競技ポケモンの最低HPは約50以上なので、分母が50未満は除外
-    _HP_ZERO_RE    = re.compile(r'\b0/([5-9]\d|\d{3})\b')
+    _HP_ZERO_RE    = re.compile(r'(?:\b0/(?:[5-9]\d|\d{3})\b|\b0%\b)')
 
     # イベント別デバウンス秒数（_debounce はデフォルト値）
     _DEBOUNCE_OVERRIDES: dict[str, float] = {
@@ -660,7 +678,7 @@ class BattleMessageParser:
       switch_out ─ もどれ、○○ / ○○と こうたいした
     """
 
-    MSG_X_MAX  = 520
+    MSG_X_MAX  = 900   # チャンピオンズ対応: メッセージが画面中央まで広がるため 520→900 に拡張
     MSG_Y_MIN  = 740
     MSG_Y_MAX  = 930
     DEDUP_TTL  = 8.0   # 同一イベントの重複発火を防ぐ秒数
@@ -921,7 +939,7 @@ class BattleStateTracker:
         if not hp_by_slot:
             return
         effective = [
-            hp if (allow_zero_hp or not hp.startswith("0/")) else None
+            hp if (allow_zero_hp or (not hp.startswith("0/") and hp != "0%")) else None
             for hp in hp_by_slot
         ]
         on_field = [s for s in slots if s.on_field]
@@ -1095,7 +1113,7 @@ class BattleStateTracker:
             newly_fainted_opponent = 0
             for side in (self._player, self._opponent):
                 for slot in side:
-                    if slot.hp and slot.hp.startswith("0/") and not slot.fainted:
+                    if slot.hp and (slot.hp.startswith("0/") or slot.hp == "0%") and not slot.fainted:
                         slot.fainted = True
                         slot.on_field = False
                         log.info(f"[戦況] {slot.name} が気絶（faintイベント）")
@@ -1271,6 +1289,8 @@ class BattleStateTracker:
             slot.on_field = False
             if slot.hp and "/" in slot.hp:
                 slot.hp = f"0/{slot.hp.split('/')[1]}"
+            elif slot.hp and slot.hp.endswith("%"):
+                slot.hp = "0%"
             log.info(f"[戦況] {slot.name} 気絶確認（メッセージ由来）")
             return True
         return slot is not None
@@ -1321,6 +1341,12 @@ class BattleStateTracker:
                 pct = int(m.group(1)) / int(m.group(2)) * 100
                 if pct <= 25:
                     s += "★ピンチ"
+            elif p.hp.endswith("%"):
+                try:
+                    if int(p.hp[:-1]) <= 25:
+                        s += "★ピンチ"
+                except ValueError:
+                    pass
         elif p.hp_pct_pixel is not None:
             # OCR HP なし（相手側など）: ピクセル解析値を使用
             pct_px = p.hp_pct_pixel * 100
