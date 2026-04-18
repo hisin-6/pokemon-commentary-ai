@@ -403,6 +403,7 @@ def _build_game_state(
     event_type: str,
     prev_yolo: BattleState | None,
     classifier: PokeClassifier | None = None,
+    ability_msg: dict[str, str] | None = None,
 ) -> dict:
     """
     OCR + YOLO 結果から Phi-3 に渡す game_state を組み立てる。
@@ -411,9 +412,11 @@ def _build_game_state(
     """
     # YOLO から状態異常・ボール数を取得
     # 状態異常は現在フレームから、ボール数はボールが見えていた最新フレーム（prev_yolo）から補完
-    status_text = yolo_state.player_status or "なし"
-    if yolo_state.opponent_status:
-        status_text += f" / 相手: {yolo_state.opponent_status}"
+    p_s = [s for s in [yolo_state.player_status_0, yolo_state.player_status_1] if s]
+    o_s = [s for s in [yolo_state.opponent_status_0, yolo_state.opponent_status_1] if s]
+    status_text = "/".join(p_s) if p_s else "なし"
+    if o_s:
+        status_text += f" / 相手: {'/'.join(o_s)}"
 
     ball_src = prev_yolo if prev_yolo else yolo_state
     p_balls = ball_src.player_balls.alive
@@ -442,6 +445,8 @@ def _build_game_state(
         "hp_opponent_by_slot":      structured["hp_opponent_by_slot"],
         "name_player_with_cx":      structured["name_player_with_cx"],
         "name_opponent_with_cx":    structured["name_opponent_with_cx"],
+        "ability_msg_player":       (ability_msg or {}).get("player", ""),
+        "ability_msg_opp":          (ability_msg or {}).get("opp", ""),
     }
 
 
@@ -678,6 +683,7 @@ class BattleMessageParser:
       switch_out ─ もどれ、○○ / ○○と こうたいした
     """
 
+    MSG_X_MIN  = 120   # メッセージボックス左端マージン
     MSG_X_MAX  = 900   # チャンピオンズ対応: メッセージが画面中央まで広がるため 520→900 に拡張
     MSG_Y_MIN  = 740
     MSG_Y_MAX  = 930
@@ -720,7 +726,7 @@ class BattleMessageParser:
                 continue
             cx = (bbox[0][0] + bbox[2][0]) / 2
             cy = (bbox[0][1] + bbox[2][1]) / 2
-            if cx < self.MSG_X_MAX and self.MSG_Y_MIN < cy < self.MSG_Y_MAX:
+            if self.MSG_X_MIN <= cx < self.MSG_X_MAX and self.MSG_Y_MIN < cy < self.MSG_Y_MAX:
                 items.append((cy, cx, r["text"]))
         items.sort(key=lambda t: (round(t[0] / 40), t[1]))
         return " ".join(t[2] for t in items)
@@ -1685,6 +1691,7 @@ class Pipeline:
         self._MIN_BATTLE_DURATION = 25.0  # バトル開始からこの秒数は終了画面チェックをスキップ
         self._prev_yolo: BattleState | None = None
         self._last_ball_yolo: BattleState | None = None  # ボールが見えたフレームの最新 YOLO 結果
+        self._last_ability_msg: dict[str, str] = {}     # 最後に検出した特性・道具発動メッセージ
         self._pre_battle_opponent: list[str] = []  # battle_start前に検出した相手ポケモン名キャッシュ
         self._commentary_history: list[str] = []
         self._dense_scan_remaining: int = 0  # move_used後の高密度メッセージROIスキャン残りフレーム数
@@ -1769,16 +1776,14 @@ class Pipeline:
                 yolo_state = self._yolo.detect(frame)
                 if yolo_state.detections:
                     log.debug(f"[YOLO] {yolo_state.summary()}")
-                # YOLOアイコン → BattleStateTracker に状態異常を同期
+                # YOLOアイコン → BattleStateTracker に状態異常を同期（per-slot）
                 if self._battle_active:
-                    if yolo_state.opponent_status:
-                        self._battle_tracker.update_status_from_yolo(
-                            "opponent", yolo_state.opponent_status, yolo_state.opponent_status_slot
-                        )
-                    if yolo_state.player_status:
-                        self._battle_tracker.update_status_from_yolo(
-                            "player", yolo_state.player_status, yolo_state.player_status_slot
-                        )
+                    for slot, status in enumerate([yolo_state.opponent_status_0, yolo_state.opponent_status_1]):
+                        if status:
+                            self._battle_tracker.update_status_from_yolo("opponent", status, slot)
+                    for slot, status in enumerate([yolo_state.player_status_0, yolo_state.player_status_1]):
+                        if status:
+                            self._battle_tracker.update_status_from_yolo("player", status, slot)
                 # ボールが見えているフレームを記憶（イベント時は animation 中でボールが映らないため）
                 if yolo_state.player_balls.total > 0 or yolo_state.opponent_balls.total > 0:
                     self._last_ball_yolo = yolo_state
@@ -1854,6 +1859,11 @@ class Pipeline:
                         # OCR bbox 位置から状態異常アイコンを検出してトラッカーに反映
                         fh, fw = frame.shape[:2]
                         self._sync_status_from_ocr_bbox(ocr_results, fh, fw)
+                        # 特性・道具発動メッセージを収集
+                        ability = self._scan_ability_msg(ocr_results, fh, fw)
+                        if ability:
+                            self._last_ability_msg = ability
+                            log.info(f"[特性/道具] {ability}")
                         # メッセージボックス解析（左下ROI・気絶/交代の補完）
                         for ev in self._msg_parser.parse(ocr_results):
                             log.info(
@@ -2097,7 +2107,8 @@ class Pipeline:
         # ボール数は最新の確認済み値で yolo_state を上書き（ログと実況に反映）
         yolo_state.player_balls   = ball_yolo.player_balls
         yolo_state.opponent_balls = ball_yolo.opponent_balls
-        game_state = _build_game_state(ocr_results, yolo_state, event_type, ball_yolo, self._classifier)
+        game_state = _build_game_state(ocr_results, yolo_state, event_type, ball_yolo, self._classifier,
+                                       ability_msg=self._last_ability_msg)
         log.info(f"[状態] {yolo_state.summary()} | OCR: {game_state['ocr_text']}")
         log.info(f"[構造化] HP={game_state['hp_values']} | 自分={game_state['name_candidates_player']} | 相手={game_state['name_candidates_opponent']}")
         _save_ocr_debug_image(frame, ocr_results, turn)
@@ -2111,7 +2122,8 @@ class Pipeline:
             self._end_screen_count = 0
             self._commentary_history = []
             self._move_log = []
-            self._last_ball_yolo = None  # バトル開始時にボール情報をリセット
+            self._last_ball_yolo = None   # バトル開始時にボール情報をリセット
+            self._last_ability_msg = {}   # バトル開始時に特性・道具メッセージをリセット
             log.info("[戦況] バトル開始 → トラッカーリセット")
             # バトル開始前にキャッシュした相手ポケモンを登録
             for name in self._pre_battle_opponent:
@@ -2304,19 +2316,26 @@ class Pipeline:
 
     # 状態異常アイコンとして画面に表示される単語（OCRで単体トークンとして検出される）
     _STATUS_ICON_WORDS: frozenset[str] = frozenset({"まひ", "やけど", "どく", "もうどく", "ねむり", "こおり", "こんらん"})
-    # HPバーROI境界（フレーム幅/高さに対する比率）
-    _OPP_STATUS_X_MIN  = 0.57   # 相手エリア左端
-    _OPP_STATUS_Y_MAX  = 0.28   # 相手エリア下端
-    _PLR_STATUS_X_MAX  = 0.43   # 自分エリア右端
-    _PLR_STATUS_Y_MIN  = 0.69   # 自分エリア上端
-    _OPP_SLOT_SPLIT    = 1496 / 1920  # 相手スロット0/1境界（hpbar_analyzer実測値）
-    _PLR_SLOT_SPLIT    = 408  / 1920  # 自分スロット0/1境界
+    # per-pokemon 状態異常アイコンエリア（絶対座標 1920x1080 基準 / visualize_coords.py と同値）
+    _STATUS_ICON_AREAS: dict[tuple[str, int], dict] = {
+        ("opponent", 0): dict(x1=1135, x2=1215, y1=20,  y2=80),
+        ("opponent", 1): dict(x1=1535, x2=1615, y1=20,  y2=80),
+        ("player",   0): dict(x1=105,  x2=170,  y1=900, y2=960),
+        ("player",   1): dict(x1=505,  x2=570,  y1=900, y2=960),
+    }
+    # 特性・道具発動メッセージエリア（絶対座標 1920x1080 基準 / visualize_coords.py と同値）
+    _ABILITY_MSG_AREAS: dict[str, dict] = {
+        "player": dict(x1=0,    x2=555,  y1=450, y2=570),
+        "opp":    dict(x1=1365, x2=1920, y1=450, y2=570),
+    }
 
     def _sync_status_from_ocr_bbox(self, ocr_results: list[dict], frame_h: int, frame_w: int) -> None:
         """OCRテキストの bbox 位置から状態異常アイコンを検出してトラッカーに反映する。
         YOLOモデルが状態異常アイコンを取りこぼした場合の補完として機能する。
-        HP バー表示エリア（相手: 右上 / 自分: 左下）に現れる「まひ」等の単体トークンを対象とする。
+        per-pokemon エリア（visualize_coords.py の STATUS_ICON_CHAMP と同値）でスロットを判定する。
         """
+        scale_x = 1920 / frame_w
+        scale_y = 1080 / frame_h
         for r in ocr_results:
             text = r["text"].strip()
             if text not in self._STATUS_ICON_WORDS:
@@ -2324,15 +2343,36 @@ class Pipeline:
             bbox = r.get("bbox")
             if not bbox:
                 continue
-            # bbox は [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] 形式
-            cx = sum(p[0] for p in bbox) / 4 / frame_w  # 相対x（0.0-1.0）
-            cy = sum(p[1] for p in bbox) / 4 / frame_h  # 相対y
-            if cx >= self._OPP_STATUS_X_MIN and cy <= self._OPP_STATUS_Y_MAX:
-                slot = 0 if cx < self._OPP_SLOT_SPLIT else 1
-                self._battle_tracker.update_status_from_yolo("opponent", text, slot)
-            elif cx <= self._PLR_STATUS_X_MAX and cy >= self._PLR_STATUS_Y_MIN:
-                slot = 0 if cx < self._PLR_SLOT_SPLIT else 1
-                self._battle_tracker.update_status_from_yolo("player", text, slot)
+            # bbox は [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] 形式 → 1920x1080 スケールに正規化
+            cx = sum(p[0] for p in bbox) / 4 * scale_x
+            cy = sum(p[1] for p in bbox) / 4 * scale_y
+            for (side, slot), area in self._STATUS_ICON_AREAS.items():
+                if area["x1"] <= cx <= area["x2"] and area["y1"] <= cy <= area["y2"]:
+                    log.debug(f"[状態異常OCR] {text} → {side} slot{slot} (cx={cx:.0f}, cy={cy:.0f})")
+                    self._battle_tracker.update_status_from_yolo(side, text, slot)
+                    break
+
+    def _scan_ability_msg(self, ocr_results: list[dict], frame_h: int, frame_w: int) -> dict[str, str]:
+        """特性・道具発動メッセージエリアのOCRテキストを収集して返す。
+        Returns:
+            {"player": "テキスト", "opp": "テキスト"}  存在するsideのみ含む
+        """
+        scale_x = 1920 / frame_w
+        scale_y = 1080 / frame_h
+        buckets: dict[str, list[str]] = {"player": [], "opp": []}
+        for r in ocr_results:
+            if r.get("confidence", 0) < 0.3:
+                continue
+            bbox = r.get("bbox")
+            if not bbox:
+                continue
+            cx = sum(p[0] for p in bbox) / 4 * scale_x
+            cy = sum(p[1] for p in bbox) / 4 * scale_y
+            for side, area in self._ABILITY_MSG_AREAS.items():
+                if area["x1"] <= cx <= area["x2"] and area["y1"] <= cy <= area["y2"]:
+                    buckets[side].append(r["text"].strip())
+                    break
+        return {side: " ".join(tokens) for side, tokens in buckets.items() if tokens}
 
     def _update_switch_out(self, ocr_results: list[dict]) -> None:
         """「〜は戻っていく」テキストを検出してポケモンを場から降ろす。

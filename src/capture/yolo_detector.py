@@ -15,8 +15,8 @@ Sprint 4: YOLOv8 アイコン検出
 
   frame = cv2.imread("debug/turn_001.png")
   state = detector.detect(frame)
-  print(state.player_status)    # "やけど" など
-  print(state.player_balls)     # BallCount(alive=3, faint=2)
+  print(state.player_status_0)   # "やけど" など（スロット0）
+  print(state.player_balls)      # BallCount(alive=3, faint=2)
 """
 
 from __future__ import annotations
@@ -70,24 +70,20 @@ STATUS_JP: dict[str, str] = {
 }
 
 # バトル画面の関心領域（画面サイズに対する比率: x1, y1, x2, y2）
-# ポケモン SV / 剣盾 の 16:9 固定 UI を想定
+# チャンピオンズ 1920x1080 UI 向け（visualize_coords.py の実測値から算出）
 # レイアウト:
-#   上部: [opponent HP bars] [opponent_balls ←ここ]
-#   下部: [player_balls ここ→] [player HP bars]
+#   右上: [opponent_status_0] [opponent_status_1] [opponent_balls]
+#   左下: [player_balls] [player_status_0] [player_status_1]
 ROIS: dict[str, tuple[float, float, float, float]] = {
-    "opponent_status": (0.57, 0.00, 1.00, 0.28),  # 右上: 相手のHP・状態
-    "player_status":   (0.00, 0.69, 0.43, 1.00),  # 左下: 自分のHP・状態
-    "opponent_balls":  (0.83, 0.01, 1.00, 0.20),  # 右上端: 相手のボール数（opponent_statusの右）
-    "player_balls":    (0.00, 0.72, 0.10, 0.97),  # 左下端: 自分のボール数（player_statusの左）
+    "opponent_status_0": (1135/1920, 20/1080,  1215/1920, 80/1080),   # 相手スロット0 状態異常
+    "opponent_status_1": (1535/1920, 20/1080,  1615/1920, 80/1080),   # 相手スロット1 状態異常
+    "player_status_0":   (105/1920,  900/1080, 170/1920,  960/1080),  # 自分スロット0 状態異常
+    "player_status_1":   (505/1920,  900/1080, 570/1920,  960/1080),  # 自分スロット1 状態異常
+    "opponent_balls":    (0.86, 0.15, 0.93, 0.19),                    # 右上端: 相手ボール数
+    "player_balls":      (0.04, 0.80, 0.11, 0.84),                    # 左下端: 自分ボール数
 }
 
 CONFIDENCE_THRESHOLD = 0.5
-
-# ダブルバトルでのスロット境界（1920x1080 絶対座標・hpbar_analyzer.py の実測値より）
-# opponent slot0: x=1270-1461 / slot1: x=1532-1839 → 境界: (1461+1532)//2 = 1496
-# player  slot0: x=106-385   / slot1: x=432-711    → 境界: (385+432)//2   = 408
-_OPP_SLOT_SPLIT_X = 1496
-_PLR_SLOT_SPLIT_X = 408
 
 
 # ─── データクラス ────────────────────────────────────────────────────────────
@@ -116,18 +112,20 @@ class BallCount:
 @dataclass
 class BattleState:
     """1フレームのバトル状態"""
-    player_status: str | None = None
-    opponent_status: str | None = None
-    player_status_slot: int | None = None    # 状態異常アイコンのスロット番号（0 or 1、None=不明）
-    opponent_status_slot: int | None = None  # 状態異常アイコンのスロット番号（0 or 1、None=不明）
+    opponent_status_0: str | None = None   # 相手スロット0 状態異常
+    opponent_status_1: str | None = None   # 相手スロット1 状態異常
+    player_status_0: str | None = None     # 自分スロット0 状態異常
+    player_status_1: str | None = None     # 自分スロット1 状態異常
     player_balls: BallCount = field(default_factory=BallCount)
     opponent_balls: BallCount = field(default_factory=BallCount)
     detections: list[Detection] = field(default_factory=list)
     mode: str = "pretrained_only"
 
     def summary(self) -> str:
-        p_status = self.player_status or "正常"
-        o_status = self.opponent_status or "正常"
+        p_s = [s for s in [self.player_status_0, self.player_status_1] if s]
+        o_s = [s for s in [self.opponent_status_0, self.opponent_status_1] if s]
+        p_status = "/".join(p_s) if p_s else "正常"
+        o_status = "/".join(o_s) if o_s else "正常"
         return (
             f"自分: {p_status} / ボール {self.player_balls.alive}匹生存 | "
             f"相手: {o_status} / ボール {self.opponent_balls.alive}匹生存"
@@ -259,8 +257,10 @@ class YoloDetector:
         """
         h, w = frame.shape[:2]
         detections: list[Detection] = []
-        roi_order_balls  = ["opponent_balls", "player_balls", "opponent_status", "player_status"]
-        roi_order_status = ["opponent_status", "player_status", "opponent_balls", "player_balls"]
+        roi_order_balls  = ["opponent_balls", "player_balls",
+                             "opponent_status_0", "opponent_status_1", "player_status_0", "player_status_1"]
+        roi_order_status = ["opponent_status_0", "opponent_status_1", "player_status_0", "player_status_1",
+                             "opponent_balls", "player_balls"]
         for cls_id, label, conf, x1, y1, x2, y2 in raw:
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
@@ -402,8 +402,10 @@ class YoloDetector:
         state.detections = all_detections
 
         if self._custom_model:
-            state.player_status,   state.player_status_slot   = self._extract_status(all_detections, "player_status")
-            state.opponent_status, state.opponent_status_slot = self._extract_status(all_detections, "opponent_status")
+            state.opponent_status_0 = self._extract_status_slot(all_detections, "opponent_status_0")
+            state.opponent_status_1 = self._extract_status_slot(all_detections, "opponent_status_1")
+            state.player_status_0   = self._extract_status_slot(all_detections, "player_status_0")
+            state.player_status_1   = self._extract_status_slot(all_detections, "player_status_1")
 
         if self._custom_model or self._ball_model:
             state.player_balls    = self._count_balls(all_detections, "player_balls")
@@ -412,29 +414,18 @@ class YoloDetector:
         return state
 
     @staticmethod
-    def _extract_status(detections: list[Detection], roi_name: str) -> tuple[str | None, int | None]:
-        """指定 ROI から状態異常ラベルとスロット番号を抽出（最高信頼度のもの）。
-        Returns:
-            (status_jp, slot): status_jp は日本語状態名（なければ None）、
-                               slot はダブルバトルでのスロット番号 0/1（シングルや不明は None）。
+    def _extract_status_slot(detections: list[Detection], roi_name: str) -> str | None:
+        """指定 ROI から状態異常ラベルを抽出（最高信頼度のもの）。
+        スロット番号は ROI 名（_0/_1 サフィックス）から直接判定されるため不要。
         """
         candidates = [
             d for d in detections
             if d.roi_name == roi_name and d.label in STATUS_JP
         ]
         if not candidates:
-            return None, None
+            return None
         best = max(candidates, key=lambda d: d.confidence)
-        status = STATUS_JP.get(best.label)
-        # アイコンの x 中心座標でスロット判定
-        cx = (best.bbox[0] + best.bbox[2]) / 2
-        if roi_name == "opponent_status":
-            slot = 0 if cx < _OPP_SLOT_SPLIT_X else 1
-        elif roi_name == "player_status":
-            slot = 0 if cx < _PLR_SLOT_SPLIT_X else 1
-        else:
-            slot = None
-        return status, slot
+        return STATUS_JP.get(best.label)
 
     @staticmethod
     def _count_balls(detections: list[Detection], roi_name: str) -> BallCount:
