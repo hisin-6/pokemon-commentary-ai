@@ -217,6 +217,18 @@ def _extract_structured_info(
     _HP_MIN_DENOM = 50
     # チャンピオンズ: 相手HP%パターン（XX%形式）
     hp_pct_pattern = re.compile(r'(\d{1,3})%')
+    # "/" を "1" または "7" と誤読するケース補正: "1551155"→"155/155", "1557155"→"155/155"
+    _hp_slash_re = re.compile(r'^(\d{1,3})[17](\d{2,3})$')
+
+    def _normalize_hp_text(t: str) -> str:
+        """HP文字列のOCR誤読を補正する。O→0、{→8、スラッシュ誤読(1/7)→/"""
+        t = t.replace('O', '0').replace('o', '0').replace('{', '8')
+        m = _hp_slash_re.match(t)
+        if m:
+            cur, mx = int(m.group(1)), int(m.group(2))
+            if cur <= mx:  # 分子 > 分母は誤補正として弾く
+                t = f"{cur}/{mx}"
+        return t
 
     hp_values: list[str] = []
     hp_player_with_xy: list[tuple[str, float, float]] = []   # (hp_str, center_x, center_y) 自分側
@@ -239,9 +251,10 @@ def _extract_structured_info(
         if r["confidence"] < 0.4:
             continue
         text = r["text"].strip()
+        text_norm = _normalize_hp_text(text)
 
         # HP 値を抽出（分母 < 50 は PP 値のため除外し continue で名前候補にも入れない）
-        m = hp_pattern.search(text)
+        m = hp_pattern.search(text_norm)
         if m:
             denom = int(m.group(2))
             if denom >= _HP_MIN_DENOM:
@@ -254,7 +267,7 @@ def _extract_structured_info(
                     cy = (bbox_hp[0][1] + bbox_hp[2][1]) / 2
                     if cy < _PLAYER_Y_THRESHOLD:
                         hp_opponent_with_xy.append((hp_str, cx, cy))
-                    elif cy < _COMMAND_Y_MIN:
+                    else:
                         hp_player_with_xy.append((hp_str, cx, cy))
                 else:
                     hp_player_with_xy.append((hp_str, 960.0, 999.0))  # bbox なし → 自分側に追加
@@ -263,7 +276,7 @@ def _extract_structured_info(
         # チャンピオンズ: 相手HP%パターン（XX%形式）
         # 状態確認パネル中は複数ポケモンのHP%が混在するためスキップ
         if not is_status_panel:
-            m_pct = hp_pct_pattern.search(text)
+            m_pct = hp_pct_pattern.search(text_norm)
             if m_pct:
                 pct_val = int(m_pct.group(1))
                 if pct_val <= 100:

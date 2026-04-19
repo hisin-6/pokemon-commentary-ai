@@ -48,22 +48,81 @@ def init_reader_ko(gpu: bool = True) -> easyocr.Reader:
 
 # ─── OCR処理 ────────────────────────────────────────────────────────────────
 
-def run_ocr(reader: easyocr.Reader, image: np.ndarray) -> list[dict]:
+# ─── HPテキストROI前処理（チャンピオンズ用） ────────────────────────────────
+# hp_opp: HPバー（黄緑グラデーション）がROI上部に混入してOCR誤読する。
+#   → フルフレームOCRから除外し、個別前処理OCRで差し替える。
+# hp_plr: フルフレームOCRで正しく読めるため、マスクせず通常フローに流す。
+_HP_OPP_ROIS_1920 = [
+    (1330, 120,  1450, 170),    # hp_opp0
+    (1720, 120,  1840, 170),    # hp_opp1
+]
+_HP_THRESH = 160  # この輝度以上のピクセル（白テキスト）を保持
+
+
+def _scale_roi(x1, y1, x2, y2, w, h):
+    sx, sy = w / 1920, h / 1080
+    return int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
+
+
+def _ocr_hp_opp_rois(reader: easyocr.Reader, frame: np.ndarray):
+    """
+    hp_opp ROIを個別前処理してOCRし、フレーム座標系のbboxつき結果リストを返す。
+    HPバー混入によるノイズをthreshold除去してから認識する。
+    """
+    h, w = frame.shape[:2]
+    results = []
+    for (x1, y1, x2, y2) in _HP_OPP_ROIS_1920:
+        rx1, ry1, rx2, ry2 = _scale_roi(x1, y1, x2, y2, w, h)
+        roi = frame[ry1:ry2, rx1:rx2].copy()
+        if roi.size == 0:
+            continue
+
+        # 白テキスト抽出: 閾値超えのピクセルのみ白、他は黒
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, _HP_THRESH, 255, cv2.THRESH_BINARY)
+        ocr_img = np.zeros_like(roi)
+        ocr_img[binary == 255] = [255, 255, 255]
+
+        for (bbox, text, conf) in reader.readtext(ocr_img):
+            # bbox座標をフレーム全体の座標系に変換
+            adjusted = [[pt[0] + rx1, pt[1] + ry1] for pt in bbox]
+            results.append({
+                "text": text,
+                "confidence": round(conf, 3),
+                "bbox": adjusted,
+            })
+    return results
+
+
+def run_ocr(reader: easyocr.Reader, image: np.ndarray,
+            preprocess_hp: bool = False):
     """
     画像に対してOCRを実行し、認識結果のリストを返す。
 
+    Args:
+        preprocess_hp: Trueのとき hp_opp ROIをフルフレームOCRから除外し、
+                       個別前処理OCRで差し替える（チャンピオンズ対応）。
+                       hp_plr はフルフレームOCRで正しく読めるためマスクしない。
     Returns:
         [{"text": str, "confidence": float, "bbox": list}, ...]
     """
+    if preprocess_hp:
+        h, w = image.shape[:2]
+        # フルフレームOCRでhp_opp ROI部分のみ黒塗り（HPバーノイズ抑制）
+        masked = image.copy()
+        for (x1, y1, x2, y2) in _HP_OPP_ROIS_1920:
+            rx1, ry1, rx2, ry2 = _scale_roi(x1, y1, x2, y2, w, h)
+            masked[ry1:ry2, rx1:rx2] = 0
+        main_results = reader.readtext(masked)
+        parsed = [{"text": t, "confidence": round(c, 3), "bbox": b}
+                  for (b, t, c) in main_results]
+        # hp_opp ROIを個別前処理OCRで補完
+        parsed.extend(_ocr_hp_opp_rois(reader, image))
+        return parsed
+
     results = reader.readtext(image)
-    parsed = []
-    for (bbox, text, confidence) in results:
-        parsed.append({
-            "text": text,
-            "confidence": round(confidence, 3),
-            "bbox": bbox,
-        })
-    return parsed
+    return [{"text": t, "confidence": round(c, 3), "bbox": b}
+            for (b, t, c) in results]
 
 
 def print_ocr_results(results: list[dict]) -> None:

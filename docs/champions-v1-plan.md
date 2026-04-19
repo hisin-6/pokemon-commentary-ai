@@ -2,7 +2,7 @@
 
 **ブランチ**: `dev/champions-v1`  
 **作成日**: 2026-04-08  
-**更新日**: 2026-04-13  
+**更新日**: 2026-04-18  
 
 ---
 
@@ -24,18 +24,19 @@
 
 | # | タスク | ファイル | 状態 |
 |---|--------|----------|------|
-| 1 | ROI 座標の確認・再キャリブレーション（スクショ必要） | `src/pipeline.py`（ROI 定数）、`src/capture/yolo_detector.py`（`ROIS`） | 未着手 |
-| 2 | HP バーピクセル解析の確認（相手 HP バーが残存するか確認） | `src/capture/hpbar_analyzer.py` | 未着手 |
+| 1 | ROI 座標の確認・再キャリブレーション | `yolo_detector.py` ROIS、`pipeline.py` 定数 | ✅ 2026-04-18 |
+| 2 | HP バーピクセル解析の確認 | `hpbar_analyzer.py` | ✅ 2026-04-13 |
 | 3 | OBS カメラ接続・フレーム取得確認 | `src/pipeline.py` | 未着手 |
 
 ### 高優先（OCR・テキスト系）
 
 | # | タスク | ファイル | 状態 |
 |---|--------|----------|------|
-| 4 | **相手 HP% の OCR パース追加**（`XX%` 形式を `hp_opponent_by_slot` に格納） | `src/pipeline.py`（`parse_ocr_results`） | 未着手 |
-| 5 | メッセージボックスの OCR 確認 | `src/pipeline.py` | 未着手 |
-| 6 | switch-in 検出 regex の確認 | `src/pipeline.py`（`_OPPONENT_SWITCH_IN_RE`） | 未着手 |
-| 7 | 技名・ポケモン名 OCR 精度確認 | `src/pipeline.py` | 未着手 |
+| 4 | **相手 HP% の OCR パース追加** | `src/pipeline.py` | ✅ 2026-04-13 |
+| 5 | メッセージボックスの OCR 確認 | `src/pipeline.py` | ✅ 2026-04-18（動画01:09確認） |
+| 6 | switch-in 検出 regex の確認 | `src/pipeline.py` | 未着手 |
+| 7 | 技名・ポケモン名 OCR 精度確認 | `src/pipeline.py` | 🔧 2026-04-18（HP `/`→`1` 誤読あり） |
+| 8 | **特性・道具発動メッセージ OCR 追加** | `src/pipeline.py` `_scan_ability_msg` | ✅ 2026-04-18 |
 
 ### 高優先（PokeDB 系）
 
@@ -124,6 +125,51 @@ clf = PokeClassifier(game_mode="champions")
 # → fuzzy マッチを champions_pokemon に絞り込む
 # → SV 対応モードではこれまで通り全 1025 匹から検索
 ```
+
+---
+
+## 2026-04-18 実装記録
+
+### visualize_coords.py 整理・拡充
+- `MSG_X_MIN = 120` 追加（右端と左右対称のマージン）
+- ボールアイコン YOLO ROI を追加:
+  - `BALL_ROI_OPP = (0.86, 0.15, 0.93, 0.19)` / `BALL_ROI_PLR = (0.04, 0.80, 0.11, 0.84)`
+- 状態異常エリアを **per-pokemon** 4 ROI に変更（旧: 広域 2 ROI）:
+  - `opp_status_0/1`（右上エリア）・`player_status_0/1`（左下エリア）
+- 特性・道具発動メッセージエリアを追加:
+  - `ability_msg_player`（x=0-555, y=450-570）/ `ability_msg_opp`（x=1365-1920, y=450-570）
+- SV 時代の不要定数を削除: `PLAYER_Y_THRESHOLD`, `COMMAND_Y_MIN`, 旧広域 STATUS_ROI, `draw_hline`
+
+### yolo_detector.py ROI 更新
+- `ROIS` を per-pokemon 4 スロットに変更（`_0`/`_1` サフィックスでスロット判定）
+- `_OPP_SLOT_SPLIT_X` / `_PLR_SLOT_SPLIT_X` 定数を削除（ROI 名サフィックスで代替）
+- `BattleState`: `opponent_status_0/1`, `player_status_0/1` フィールドに変更
+- `_extract_status_slot(detections, roi_name)` メソッド追加
+
+### pipeline.py 更新
+- `BattleMessageParser.MSG_X_MIN = 120` 追加・フィルター条件を左端チェックに更新
+- `_STATUS_ICON_AREAS` / `_ABILITY_MSG_AREAS` 定数を `PipelineRunner` に追加
+- `_scan_ability_msg()`: per-frame で ability/item メッセージエリアをスキャンして `dict[str, str]` を返す新メソッド
+- `_sync_status_from_ocr_bbox()`: スケール正規化 + per-slot エリアマッチングに更新
+- `_build_game_state()`: `ability_msg_player`/`ability_msg_opp` キーを追加
+
+### scripts/test_ocr_areas.py 新規作成
+- 動画に対して OCR のみを実行し、定義済みエリアごとにテキストを表示する軽量確認ツール
+- 時刻ベース処理: `--step`, `--start`, `--end` オプション（秒指定）
+- 15 エリア定義（MSG ROI・ability・status・name・HP）
+- HP エリアの `/` → `1` 誤読補正: `_HP_SLASH_RE = re.compile(r'^(\d{1,3})1(\d{2,3})$')`
+- コマンドメニュー文字列フィルター（`--no-filter` で無効化可）
+- ログ自動保存: `logs/ocr_areas_YYYYMMDD_HHMMSS.txt`
+- 手書き注釈テンプレートをログに出力（画面種別・検出テキスト記入欄）
+
+### OCR 動作確認（動画 00:00〜01:09）
+| エリア | 結果 |
+|--------|------|
+| MSG ROI | おおむね読み取れる（誤字あり） |
+| ability_player / ability_opp | かなり読み取れる |
+| ポケモン名・HP | フォントの違いで読み取り率低め |
+| HP `/` → `1` 誤読 | `_HP_SLASH_RE` で補正済み（例: `01205` → `0/205`） |
+| コマンドメニュー文字 | `_UI_FILTER` で除去 |
 
 ---
 
