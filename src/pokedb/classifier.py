@@ -28,6 +28,15 @@ from rapidfuzz import fuzz, process
 
 log = logging.getLogger(__name__)
 
+# OCR誤読: 大カナ→小カナ（ユ→ュ, ヨ→ョ等）と濁点混同（ブ→プ等）の正規化テーブル
+# ア行は変換しない（独立した母音として正常に使われるため）
+_OCR_LARGE_TO_SMALL = str.maketrans("ヤユヨワツ", "ャュョヮッ")
+# 濁点除去（ブ→プ, ズ→ス等）- 短い名前でスコアが閾値を下回る場合の補助バリアント
+_DAKUTEN_REMOVE = str.maketrans(
+    "ガギグゲゴザジズゼゾダヂヅデドバビブベボヴ",
+    "カキクケコサシスセソタチツテトパピプペポウ",
+)
+
 # ─── 閾値 ────────────────────────────────────────────────────────────────────
 
 CONFIDENT_THRESHOLD = 90   # これ以上: 確定採用
@@ -211,10 +220,25 @@ class PokeClassifier:
         ja_names = [e[0] for e in entries]
         en_names = [e[1] for e in entries]
 
+        # OCR正規化バリアント: 大カナ→小カナ / 濁点除去 を試して最高スコアを採用
+        variants = {text}
+        normalized = text.translate(_OCR_LARGE_TO_SMALL)
+        if normalized != text:
+            variants.add(normalized)
+        dakuten_removed = text.translate(_DAKUTEN_REMOVE)
+        if dakuten_removed != text:
+            variants.add(dakuten_removed)
+
         # WRatio: partial_ratio と token_sort_ratio を組み合わせた汎用スコアラー
         # 日本語の短い名前には ratio も有効だが、OCR 短縮（エルフー→エルフーン）に WRatio が有効
-        ja_match = process.extractOne(text, ja_names, scorer=fuzz.WRatio)
-        en_match = process.extractOne(text, en_names, scorer=fuzz.WRatio) if any(en_names) else None
+        ja_match = max(
+            (process.extractOne(v, ja_names, scorer=fuzz.WRatio) for v in variants),
+            key=lambda m: m[1] if m else 0,
+        )
+        en_match = max(
+            (process.extractOne(v, en_names, scorer=fuzz.WRatio) for v in variants),
+            key=lambda m: m[1] if m else 0,
+        ) if any(en_names) else None
 
         # 日本語・英語のうちスコアが高い方を採用
         best_match = None

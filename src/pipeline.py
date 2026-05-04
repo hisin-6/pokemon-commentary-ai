@@ -256,8 +256,9 @@ def _extract_structured_info(
         # HP 値を抽出（分母 < 50 は PP 値のため除外し continue で名前候補にも入れない）
         m = hp_pattern.search(text_norm)
         if m:
+            cur_val = int(m.group(1))
             denom = int(m.group(2))
-            if denom >= _HP_MIN_DENOM:
+            if denom >= _HP_MIN_DENOM and cur_val <= denom:  # 現在値 > 最大値は誤読として弾く
                 hp_str = f"{m.group(1)}/{m.group(2)}"
                 hp_values.append(hp_str)
                 # y座標で自分/相手側に分類（HP値を場のポケモンに紐付けるため）
@@ -380,6 +381,18 @@ def _extract_structured_info(
     hp_player_by_slot   = [hp for hp, _, _ in sorted(hp_player_with_xy,   key=lambda t: t[1])[:2]]
     hp_opponent_by_slot = [hp for hp, _, _ in sorted(hp_opponent_with_xy, key=lambda t: t[1])[:2]]
 
+    # COMMAND テキストの cy を検出（画面種別の判定に使用）
+    # cy ≈ 377: 行動選択・技選択画面（HP表示あり） → HP セット対象
+    # cy ≈ 129: 対象選択・交換選択画面（HP混在）   → HP セット除外
+    _command_re = re.compile(r'[Cc][O0oQ][Mm][Mm][Aa@][Nn][Dd]')
+    command_cy: float | None = None
+    for r in ocr_results:
+        if r["confidence"] >= 0.4 and _command_re.search(r["text"]):
+            bbox = r.get("bbox", [])
+            if bbox:
+                command_cy = (bbox[0][1] + bbox[2][1]) / 2
+                break
+
     return {
         "hp_values":              hp_values,
         "hp_values_player":       hp_values_player,
@@ -392,6 +405,7 @@ def _extract_structured_info(
         "hp_opponent_by_slot":  hp_opponent_by_slot,
         "name_player_with_cx":   [(n, cx) for n, cx, _ in name_player_with_xy[:5]],
         "name_opponent_with_cx": [(n, cx) for n, cx, _ in name_opponent_with_xy[:5]],
+        "command_cy":           command_cy,           # COMMAND テキストの y 座標（None=未検出）
     }
 
 
@@ -460,6 +474,7 @@ def _build_game_state(
         "name_opponent_with_cx":    structured["name_opponent_with_cx"],
         "ability_msg_player":       (ability_msg or {}).get("player", ""),
         "ability_msg_opp":          (ability_msg or {}).get("opp", ""),
+        "command_cy":               structured["command_cy"],
     }
 
 
@@ -716,8 +731,9 @@ class BattleMessageParser:
     # OCR誤読バリアント: くりだした → くゆだした（り→ゆ誤読）等に対応
     # トークン間スペース対応: 「ウルガモスを くゆだした」のようにスペース区切りでも捕捉
     # プレイヤー名の「は」を読み飛ばし: 「たかひとはウルガモスを」→ ウルガモスのみ捕捉
+    # Champions対応: 漢字形式「繰り出した」/「繰ゆ出した」（り→ゆ誤読）も捕捉
     _OPPONENT_SWITCH_IN_RE = re.compile(
-        r'(?:[^\s]{2,12}と\s*)?(?:[^\s]*は\s*)?([^\s]{2,12}?)を\s*く[りゆ]だした'
+        r'(?:[^\s]{2,12}と\s*)?(?:[^\s]*は\s*)?([^\s]{2,12}?)を\s*(?:く[りゆ]だした|繰[りゆ]出した)'
     )
     _SWITCH_OUT_RE = re.compile(r'もどれ[、,]\s*(.{2,12})|(.{2,12})と\s*こうたいした')
     # 状態異常メッセージ: 「〇〇は まひじょうたいになった」等
@@ -939,9 +955,19 @@ class BattleStateTracker:
 
         # cx 昇順（画面左→右）でソートし、小さい方をスロット0、大きい方をスロット1
         candidates.sort(key=lambda t: t[1])
-        for i, (slot, cx) in enumerate(candidates[:2]):
-            slot.slot_index = i
-            log.info(f"[スロット] {slot.name} → スロット{slot.slot_index} (cx={cx:.0f})")
+
+        # 既に割り当て済みのスロット番号を把握し、残り候補に空きスロットを割り当てる
+        # （例: slot_0 が早期割済みで candidates に1匹だけ残った場合、slot_1 を割り当てる）
+        used = {s.slot_index for s in slots if s.on_field and s.slot_index is not None}
+        available = [i for i in range(2) if i not in used]
+
+        if len(candidates) == 1 and len(available) == 1:
+            candidates[0][0].slot_index = available[0]
+            log.info(f"[スロット] {candidates[0][0].name} → スロット{available[0]} (cx={candidates[0][1]:.0f}, 空きスロット割当)")
+        else:
+            for i, (slot, cx) in enumerate(candidates[:2]):
+                slot.slot_index = i
+                log.info(f"[スロット] {slot.name} → スロット{slot.slot_index} (cx={cx:.0f})")
 
     def _assign_hp_by_slot(
         self,
@@ -993,9 +1019,11 @@ class BattleStateTracker:
         for name in current_player_names:
             # 相手側に登録済みかつ今フレームの相手エリアにも見えている場合 → 同名ポケモンの可能性あり → 両側に登録
             # 相手側に登録済みだが今フレームで自分エリアにしか見えない場合 → y座標誤分類の可能性 → スキップ
+            # ただし自分側にも既に登録済みなら同名ポケモン確定 → スキップしない
             already_in_opponent = any(s.name == name for s in self._opponent)
-            if already_in_opponent and name not in current_opponent_names:
-                continue  # 相手側に登録済みで相手エリアにも見えていない → 誤分類として除外
+            already_in_player_slots = any(s.name == name for s in self._player)
+            if already_in_opponent and not already_in_player_slots and name not in current_opponent_names:
+                continue  # 相手側にのみ登録済みで相手エリアにも見えていない → 誤分類として除外
             slot = self._get_or_create(self._player, name)
             if slot:
                 slot.confidence += 1
@@ -1058,19 +1086,24 @@ class BattleStateTracker:
             self._assign_slot_indices(self._player,   player_name_cx)
             self._assign_slot_indices(self._opponent, opponent_name_cx)
 
-        # ── HP値をスロット番号（x座標）で割り当て ───────────────────────────
-        # 近傍マッチングに依存せず左/右スロットの固定x座標位置でHPを割り当てることで
-        # 交代直後フレームでの名前-HP誤ペアリングを防ぐ
-        hp_player_by_slot   = game_state.get("hp_player_by_slot", [])
-        hp_opponent_by_slot = game_state.get("hp_opponent_by_slot", [])
-        # フォールバック: y座標分類が完全に失敗して両方空の場合、hp_values を均等分配
-        if not hp_player_by_slot and not hp_opponent_by_slot:
-            all_hp = game_state.get("hp_values", [])
-            hp_player_by_slot   = all_hp[:2]
-            hp_opponent_by_slot = all_hp[2:4]
-        allow_zero = (event_type == "faint")
-        self._assign_hp_by_slot(self._player,   hp_player_by_slot,   allow_zero)
-        self._assign_hp_by_slot(self._opponent, hp_opponent_by_slot, allow_zero)
+        # ── OCR HP値をスロット番号（x座標）で割り当て ──────────────────────
+        # COMMAND が行動選択・技選択画面（cy 300〜450）にある時のみセット。
+        # 対象選択・交換選択画面（cy ≈ 129）やアニメーション中（COMMAND なし）は
+        # OCR HP をセットせず HPpx（ピクセル解析）に任せる。
+        _CMD_CY_MIN, _CMD_CY_MAX = 300, 450
+        command_cy = game_state.get("command_cy")
+        ocr_hp_valid = (command_cy is not None and _CMD_CY_MIN <= command_cy <= _CMD_CY_MAX)
+        if ocr_hp_valid:
+            hp_player_by_slot   = game_state.get("hp_player_by_slot", [])
+            hp_opponent_by_slot = game_state.get("hp_opponent_by_slot", [])
+            # フォールバック: y座標分類が完全に失敗して両方空の場合、hp_values を均等分配
+            if not hp_player_by_slot and not hp_opponent_by_slot:
+                all_hp = game_state.get("hp_values", [])
+                hp_player_by_slot   = all_hp[:2]
+                hp_opponent_by_slot = all_hp[2:4]
+            allow_zero = (event_type == "faint")
+            self._assign_hp_by_slot(self._player,   hp_player_by_slot,   allow_zero)
+            self._assign_hp_by_slot(self._opponent, hp_opponent_by_slot, allow_zero)
 
         # ── ボール数トラッキング＆相手気絶推定 ──────────────────────────────
         balls = game_state.get("balls_remaining", [])
@@ -1315,8 +1348,17 @@ class BattleStateTracker:
         return slot is not None
 
     def mark_on_field_by_name(self, name: str) -> bool:
-        """メッセージ由来の繰り出し確認: 名前でスロットを検索してon_field=Trueにする。"""
-        slot = self._find_slot(name)
+        """メッセージ由来の繰り出し確認: プレイヤースロットを検索してon_field=Trueにする。
+        相手に同名ポケモンがいる場合でも正しく自分側に登録するため、プレイヤー側のみ検索する。
+        スロット未登録なら新規作成する。
+        """
+        slot = None
+        for s in self._player:
+            if s.name == name or name in s.name or s.name in name:
+                slot = s
+                break
+        if slot is None:
+            slot = self._get_or_create(self._player, name)
         if slot and not slot.fainted:
             slot.on_field = True
             slot.last_seen_turn = self.turn
@@ -1353,7 +1395,14 @@ class BattleStateTracker:
         s = p.name
         if p.status:
             s += f"({p.status})"
-        if p.hp:
+        if p.hp_pct_pixel is not None:
+            # HPpx優先（座標固定で2匹を独立計測）
+            pct_px = p.hp_pct_pixel * 100
+            s += f" HP:{pct_px:.0f}%(px)"
+            if pct_px <= 25:
+                s += "★ピンチ"
+        elif p.hp:
+            # HPpx未取得時はOCRで補強
             s += f" HP:{p.hp}"
             m = self._HP_RE.match(p.hp)
             if m and int(m.group(2)) > 0:
@@ -1366,12 +1415,6 @@ class BattleStateTracker:
                         s += "★ピンチ"
                 except ValueError:
                     pass
-        elif p.hp_pct_pixel is not None:
-            # OCR HP なし（相手側など）: ピクセル解析値を使用
-            pct_px = p.hp_pct_pixel * 100
-            s += f" HP:{pct_px:.0f}%(px)"
-            if pct_px <= 25:
-                s += "★ピンチ"
         if p.moves_used:
             s += f" 技=[{', '.join(p.moves_used[-4:])}]"
         return s
@@ -2417,7 +2460,12 @@ class Pipeline:
         if event_type == "faint":
             self._battle_tracker.confirm_faint_by_name(pokemon)
         elif event_type == "switch_in":
-            self._battle_tracker.mark_on_field_by_name(pokemon)
+            canonical = pokemon
+            if self._classifier:
+                result = self._classifier.classify(pokemon)
+                if result and result.canonical_ja:
+                    canonical = result.canonical_ja
+            self._battle_tracker.mark_on_field_by_name(canonical)
         elif event_type == "opponent_switch_in":
             # PokeClassifierで正規化してから相手スロットに登録
             canonical = pokemon
