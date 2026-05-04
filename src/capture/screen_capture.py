@@ -35,15 +35,6 @@ def init_reader(gpu: bool = True) -> easyocr.Reader:
     return reader
 
 
-def init_reader_ko(gpu: bool = True) -> easyocr.Reader:
-    """韓国語専用 EasyOCR リーダーを初期化する。
-    EasyOCR の制約で Japanese モデルと Korean モデルは共存できないため別インスタンス。
-    イベント処理時のみ使用し、毎フレームの OCR は init_reader の ja+en を使う。
-    """
-    log.info("EasyOCRリーダー（韓国語）を初期化中...")
-    reader = easyocr.Reader(["ko", "en"], gpu=gpu)
-    log.info("EasyOCRリーダー（韓国語）初期化完了")
-    return reader
 
 
 # ─── OCR処理 ────────────────────────────────────────────────────────────────

@@ -44,7 +44,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from src.capture.hpbar_analyzer import HpBarAnalyzer
-from src.capture.screen_capture import DiffDetector, init_reader, init_reader_ko, run_ocr
+from src.capture.screen_capture import DiffDetector, init_reader, run_ocr
 from src.capture.yolo_detector import BattleState, YoloDetector
 from src.commentary.phi3_client import Phi3Client
 from src.output.audio_player import AudioPlayer
@@ -137,7 +137,10 @@ _MOVE_ABILITY_WORDS = {
 _UI_OVERLAY_WORDS = {
     "状態", "戦闘中", "タイプ", "テラスタイプ", "オンライン", "通信中",
     "ロノマル", "待機中", "ヒシン", "日", "ガラル", "アローラ",
+    "通信待機中",  # Champions: 対戦相手との接続状態テキスト
 }
+# 部分一致で弾くシステムテキストのキーワード（ポケモン名に含まれないもの）
+_UI_OVERLAY_SUBSTRINGS = {"通信待機", "待機中", "通信中"}
 
 
 def _ocr_results_to_text(
@@ -305,6 +308,7 @@ def _extract_structured_info(
         # _UI_OVERLAY_WORDS は PokeClassifier 使用時も必ず適用（通信中・待機中等のシステムテキスト除外）
         if (text.startswith("Lv") or re.match(r'^[\d\s/]+$', text)
                 or text in _UI_WORDS or text in _UI_OVERLAY_WORDS
+                or any(kw in text for kw in _UI_OVERLAY_SUBSTRINGS)
                 or text in _BATTLE_RESULT_WORDS
                 or any(kw in text for kw in _BATTLE_RESULT_WORDS)
                 or (re.match(r'^[A-Za-z0-9\s]+$', text) and len(text) < 4)
@@ -501,9 +505,12 @@ class BattlePhaseClassifier:
       battle_end    ─ battle_end フェーズ出現
     """
 
-    # "ゆけつ" = 行けっ！（ポケモン繰り出し）/ "いけつ" は OCR 誤読バリアント
-    # これらはバトル最初のコマンド選択画面より前に出るため battle_start の早期検知に使う
-    _COMMAND_KW    = {"たたかう", "どうする", "ゆけつ", "いけつ"}
+    # コマンド選択画面の判定キーワード
+    # 「ゆけつ」「いけつ」（ゆけっ！繰り出し演出）は除外する:
+    # これらがあると繰り出しアニメーション中にも command_select と誤判定され、
+    # 余分な move_used → turn_start サイクルが発生してターン数が多重カウントされる。
+    # battle_start は「たたかう」初回出現で確実に検知できるため早期検知は不要。
+    _COMMAND_KW    = {"たたかう", "どうする"}
     _SWITCH_KW     = {"こうたい", "ポケモンをえらんで"}
     # 技選択画面の型相性ラベル（これが見えている = 技選択UI が開いている = command_select 継続）
     # 「こうかあり」はバトルメッセージには出ず技選択UIにのみ出現するため安全な指標
@@ -717,7 +724,14 @@ class BattleMessageParser:
     MSG_Y_MAX  = 930
     DEDUP_TTL  = 8.0   # 同一イベントの重複発火を防ぐ秒数
 
-    _FAINT_RE      = re.compile(r'(.{2,12})(?:は|が)\s*たおれた')
+    # 「あいて」「あい」= 「相手の」のOCR誤読プレフィックス
+    # 「たおれたり/ゆ」= 「たおれた」のOCR誤読サフィックス
+    _FAINT_RE      = re.compile(
+        r'(?:あい(?:て)?\s*)?'           # 「あいて」「あい」OCRノイズを読み飛ばし
+        r'(?:相手の?\s*)?'               # 「相手の」「相手」プレフィックスを読み飛ばし
+        r'([^\s]{2,12})'                 # ポケモン名（スペースなし 2〜12文字）
+        r'(?:は|が)\s*たおれた[りゆ]?'  # 「たおれた」（OCR誤読サフィックスも許容）
+    )
     # 自分がポケモンを繰り出すメッセージのパターン:
     #   旧: 「〇〇、ゆけ！」（名前が前）
     #   新: 「ゆけつ！ (げんきいっぱいの) 〇〇！」（名前が後ろ・SVの実際の表示形式）
@@ -727,13 +741,16 @@ class BattleMessageParser:
         r'|(.{2,12})が\s*とびだした'                 # 「〇〇が とびだした」
     )
     # 相手がポケモンを繰り出すメッセージ: 「〇〇をくりだした！」
-    # ダブルバトルの「AとBをくりだした」は B のみ捕捉（A は名前に "と" が混入するため無視）
     # OCR誤読バリアント: くりだした → くゆだした（り→ゆ誤読）等に対応
     # トークン間スペース対応: 「ウルガモスを くゆだした」のようにスペース区切りでも捕捉
     # プレイヤー名の「は」を読み飛ばし: 「たかひとはウルガモスを」→ ウルガモスのみ捕捉
     # Champions対応: 漢字形式「繰り出した」/「繰ゆ出した」（り→ゆ誤読）も捕捉
     _OPPONENT_SWITCH_IN_RE = re.compile(
         r'(?:[^\s]{2,12}と\s*)?(?:[^\s]*は\s*)?([^\s]{2,12}?)を\s*(?:く[りゆ]だした|繰[りゆ]出した)'
+    )
+    # ダブルバトル「AとBをくりだした」形式でAとBを両方捕捉する専用RE
+    _DUAL_OPPONENT_SWITCH_IN_RE = re.compile(
+        r'([^\s]{2,12}?)と\s*([^\s]{2,12}?)を\s*(?:く[りゆ]だした|繰[りゆ]出した)'
     )
     _SWITCH_OUT_RE = re.compile(r'もどれ[、,]\s*(.{2,12})|(.{2,12})と\s*こうたいした')
     # 状態異常メッセージ: 「〇〇は まひじょうたいになった」等
@@ -786,9 +803,15 @@ class BattleMessageParser:
             if m:
                 _emit("switch_in", (m.group(1) or m.group(2) or m.group(3) or ""))
 
-            m = self._OPPONENT_SWITCH_IN_RE.search(text)
-            if m:
-                _emit("opponent_switch_in", m.group(1))
+            # 「AとBをくりだした」: 先にDual REで1匹目・2匹目の両方を emit
+            m2 = self._DUAL_OPPONENT_SWITCH_IN_RE.search(text)
+            if m2:
+                _emit("opponent_switch_in", m2.group(1))
+                _emit("opponent_switch_in", m2.group(2))
+            else:
+                m = self._OPPONENT_SWITCH_IN_RE.search(text)
+                if m:
+                    _emit("opponent_switch_in", m.group(1))
 
             m = self._SWITCH_OUT_RE.search(text)
             if m:
@@ -1642,7 +1665,7 @@ def _call_bedrock_vision(
                     abilities_str = " / ".join(info["abilities"]) if info["abilities"] else "不明"
                     # 代表技は渡さない（Bedrockが「使った技」として創作するのを防ぐため）
                     rag_info.append(
-                        f"{info['name_ja']}({info['name_en']}): タイプ={info['type']} / 特性={abilities_str}"
+                        f"{info['name_ja']}: タイプ={info['type']} / 特性={abilities_str}"
                     )
 
         payload = {
@@ -1709,9 +1732,6 @@ class Pipeline:
 
         log.info("EasyOCR 初期化中...")
         self._reader = init_reader(gpu=gpu)
-
-        log.info("EasyOCR 韓国語リーダー初期化中（韓国語起源ポケモン名の検出用）...")
-        self._reader_ko = init_reader_ko(gpu=gpu)
 
         log.info("YoloDetector 初期化中...")
         self._yolo = YoloDetector(model_path=model_path, ball_model_path=ball_model_path, end_model_path=end_model_path, conf=conf)
@@ -1932,10 +1952,27 @@ class Pipeline:
                         # ROIフィルタなし（開始演出では通常のメッセージボックス外に表示される可能性あり）
                         pre_ocr_texts = [r["text"] for r in ocr_results if r["confidence"] >= 0.35]
                         log.debug("[事前OCR] %s", " / ".join(pre_ocr_texts[:15]))
-                        # OCR誤読（くり→くゆ等）に対応した緩いパターン
-                        _KURI_RE = re.compile(r'く[りゆ]だした')
-                        if any(_KURI_RE.search(t) for t in pre_ocr_texts) and self._classifier:
-                            # 「くりだした」が見つかったフレームで全トークンをPokeClassifierでスキャン
+                        # OCR誤読（くり→くゆ等）・漢字形式（Champions）に対応
+                        _KURI_RE = re.compile(r'く[りゆ]だした|繰[りゆ]出した')
+                        # 「AとBを繰り出した」の1匹目（A）も捕捉する専用RE
+                        _DUAL_KURI_RE = re.compile(
+                            r'([^\s]{2,12}?)と\s*([^\s]{2,12}?)を\s*(?:く[りゆ]だした|繰[りゆ]出した)'
+                        )
+                        full_pre_text = " ".join(pre_ocr_texts)
+                        if _KURI_RE.search(full_pre_text) and self._classifier:
+                            # Dual RE で「AとBを繰り出した」の1匹目・2匹目を直接捕捉
+                            dm = _DUAL_KURI_RE.search(full_pre_text)
+                            if dm:
+                                for cand in [dm.group(1).rstrip('とをは！!」、'),
+                                             dm.group(2).rstrip('とをは！!」、')]:
+                                    if len(cand) < 2:
+                                        continue
+                                    r2 = self._classifier.classify(cand)
+                                    if r2 and r2.category == CATEGORY_POKEMON and r2.score >= 80:
+                                        if r2.canonical_ja not in self._pre_battle_opponent:
+                                            self._pre_battle_opponent.append(r2.canonical_ja)
+                                            log.info("[事前検出] 相手 %s（dual RE）", r2.canonical_ja)
+                            # 全トークンもPokeClassifierでスキャン（単体繰り出し・OCR分割ケース対応）
                             for token in pre_ocr_texts:
                                 clean = token.strip().rstrip('とをは！!」、')
                                 if len(clean) < 2:
@@ -2078,27 +2115,27 @@ class Pipeline:
             log.info(f"終了します（総ターン数: {turn}）")
         finally:
             cap.release()
-            self._generate_battle_template()
+            # self._generate_battle_template()  # 手動で scripts/generate_battle_template.py を使うため無効化
 
-    def _generate_battle_template(self) -> None:
-        """終了時にログから対戦記録ひな型を自動生成する。"""
-        try:
-            import sys as _sys
-            scripts_dir = Path(__file__).parent.parent / "scripts"
-            if str(scripts_dir) not in _sys.path:
-                _sys.path.insert(0, str(scripts_dir))
-            from generate_battle_template import parse_log, format_template  # type: ignore
-
-            result = parse_log(log_file_path)
-            output = format_template(result)
-
-            records_dir = Path("records")
-            records_dir.mkdir(exist_ok=True)
-            out_path = records_dir / f"{log_file_path.stem}.txt"
-            out_path.write_text(output, encoding="utf-8")
-            log.info(f"対戦記録ひな型を出力しました: {out_path}")
-        except Exception as e:
-            log.warning(f"対戦記録ひな型の生成に失敗しました: {e}")
+    # def _generate_battle_template(self) -> None:
+    #     """終了時にログから対戦記録ひな型を自動生成する。"""
+    #     try:
+    #         import sys as _sys
+    #         scripts_dir = Path(__file__).parent.parent / "scripts"
+    #         if str(scripts_dir) not in _sys.path:
+    #             _sys.path.insert(0, str(scripts_dir))
+    #         from generate_battle_template import parse_log, format_template  # type: ignore
+    #
+    #         result = parse_log(log_file_path)
+    #         output = format_template(result)
+    #
+    #         records_dir = Path("records")
+    #         records_dir.mkdir(exist_ok=True)
+    #         out_path = records_dir / f"{log_file_path.stem}.txt"
+    #         out_path.write_text(output, encoding="utf-8")
+    #         log.info(f"対戦記録ひな型を出力しました: {out_path}")
+    #     except Exception as e:
+    #         log.warning(f"対戦記録ひな型の生成に失敗しました: {e}")
 
     def _process_event(
         self,
@@ -2138,22 +2175,6 @@ class Pipeline:
             log.info(f"OCR 件数が少なすぎる（{len(ocr_results)} 件）→ スキップ")
             return
 
-        # ── 韓国語OCR（イベント時のみ追加実行してハングル結果をマージ）──────────
-        # 毎フレームではなくイベント処理時だけ実行し、遅延増加を最小限に抑える
-        if frame is None:
-            ko_results = []
-        else:
-            ko_results = run_ocr(self._reader_ko, frame)
-        # 「全文字ハングル」かつ「信頼度0.5以上」のみ採用
-        # 数字・記号・英字が混じるOCRノイズ（'7--가지' 等）を除外する
-        hangul_hits = [
-            r for r in ko_results
-            if PokeClassifier._is_pure_hangul(r["text"]) and r["confidence"] >= 0.5
-        ]
-        if hangul_hits:
-            log.debug(f"韓国語OCR: ハングル {len(hangul_hits)} 件 → {[r['text'] for r in hangul_hits]}")
-            ocr_results = ocr_results + hangul_hits
-
         # ── game_state 構築 ───────────────────────────────────────────────────
         # イベント時は animation 中でボールが映らないため、最後にボールが見えたフレームの結果を優先する
         # frame/yolo_state が None の場合（動画末尾フォールバック）は空の BattleState を使う
@@ -2192,6 +2213,12 @@ class Pipeline:
             log.warning("[戦況] battle_start 未検知 → バトルをアクティブ化（遅延起動）")
             self._battle_active = True
             self._battle_active_since = time.time()
+            # 事前キャッシュが残っていれば登録（battle_start スキップで未登録のケース）
+            if self._pre_battle_opponent:
+                for name in self._pre_battle_opponent:
+                    self._battle_tracker.register_opponent_on_field(name)
+                    log.info("[戦況] 遅延登録: 相手 %s（battle_start フォールバック）", name)
+                self._pre_battle_opponent.clear()
 
         if self._battle_active:
             self._battle_tracker.update(game_state, event_type)

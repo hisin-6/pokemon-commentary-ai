@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
 ログファイルから対戦記録ひな型を生成するスクリプト。
-from __future__ import annotations  # noqa: E402 (must be first in module after docstring)
 
-ログに記録されている情報（ターン数・ボール数・OCRテキスト・HP変化）を
-あらかじめ埋め込んだひな型を出力する。動画を見ながら修正・補完する用途。
+ログに記録されている情報（戦況・検出メッセージ・技ログ・特性）をターンごとに出力し、
+動画と照らし合わせて差異を記録できるひな型を作る。
 
 Usage:
-    python scripts/generate_battle_template.py logs/pipeline_20260328_172333.log
-    python scripts/generate_battle_template.py logs/pipeline_20260328_172333.log -o records/20260328_172333.txt
+    python scripts/generate_battle_template.py logs/pipeline_YYYYMMDD_HHMMSS.log
+    python scripts/generate_battle_template.py logs/pipeline_YYYYMMDD_HHMMSS.log -o records/my_record.md
 """
 
 from __future__ import annotations
@@ -18,28 +17,53 @@ import sys
 import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
 
 
 # ─── ログ行パターン ───────────────────────────────────────────────────────────
 
-_TIME_RE   = re.compile(r'^(\d{2}:\d{2}:\d{2})')
-_TURN_RE   = re.compile(r'\[ターン\] T(\d+) 開始')
-_STATE_RE  = re.compile(
+_TIME_RE      = re.compile(r'^(\d{2}:\d{2}:\d{2})')
+_TURN_RE      = re.compile(r'\[ターン\] T(\d+) 開始')
+_STATE_RE     = re.compile(
     r'\[状態\] 自分: (\S+) / ボール (\d+)匹生存 \| 相手: (\S+) / ボール (\d+)匹生存 \| OCR: (.+)$'
 )
-_PHASE_RE  = re.compile(r'\[フェーズ\] .+? \| イベント: (.+)$')
-# [戦況] T{N}(G{M}) 場(自)=... | 場(相)=... の行
-_JOKYO_RE  = re.compile(r'\[戦況\] T\d+\(G\d+\) 場\(自\)=(.+?) \| 場\(相\)=(.+?)(?:\s*\|.*)?$')
+_PHASE_RE     = re.compile(r'\[フェーズ\] .+? \| イベント: (.+)$')
+_JOKYO_RE     = re.compile(r'\[戦況\] T\d+\(G\d+\) 場\(自\)=(.+?) \| 場\(相\)=(.+?)(?:\s*\|.*)?$')
+_BENCH_RE     = re.compile(r'\[戦況\] 控え\(自\)=(.+?) \| 控え\(相\)=(.+?)$')
+# メッセージ系: switch_in / faint / opponent_switch_in / status 等
+_MSG_RE       = re.compile(r'\[メッセージ\] (\S+): (.+?) / 「(.+?)」')
+# 技ログ
+_MOVE_LOG_RE  = re.compile(r'\[技ログ\] 検出: (T\d+:\S+)')
+# 特性/道具
+_ABILITY_RE   = re.compile(r'\[特性/道具\] (.+)$')
 
-# UIノイズとして除去するキーワード（OCRで拾われやすいUI要素・ポケモン以外の単語）
 _UI_NOISE = {
     "たたかう", "にげる", "様子を見", "相手を見る", "もどる", "ヒシン", "B",
-    "通信中", "通信中‥", "patmos",
+    "通信中", "通信中‥", "通信待機中", "patmos",
     "タイプ", "テラスタイプ", "状態", "ひんし", "たたかえない", "いまひとつ",
     "こうかなし", "ばつぐん", "日", "あいて", "相手の",
 }
-_SKIP_RE  = re.compile(r'^(Lv\.?\d+|Lv50|\d+/\d+|\d+こうかあり|\d+/\d+/\d+|\d+)$')
+_SKIP_RE = re.compile(r'^(Lv\.?\d+|Lv50|\d+/\d+|\d+こうかあり|\d+/\d+/\d+|\d+)$')
+
+# 特性/道具エリアのノイズ判定（これに該当するものはひな型に出力しない）
+_ABILITY_NOISE_RE = re.compile(
+    r"^(\{.*'[^']{0,3}'\s*\}|"   # 値が3文字以下の dict（例: {'opp': '1'}, {'player': 'つ'}）
+    r"\{.*\'\d+\'\s*\}|"          # 値が数字のみの dict
+    r"\{'[^']+': '[一-龯ぁ-ん]{1,2}'\})"  # 値が漢字・かな1〜2文字
+)
+
+def _is_ability_noise(ab: str) -> bool:
+    """特性/道具欄に出力すべきでないノイズか判定する。"""
+    if _ABILITY_NOISE_RE.match(ab):
+        return True
+    # dict の全valueが3文字以下なら除外
+    try:
+        import ast
+        d = ast.literal_eval(ab)
+        if isinstance(d, dict):
+            return all(len(str(v)) <= 3 for v in d.values())
+    except Exception:
+        pass
+    return False
 
 
 # ─── データ構造 ───────────────────────────────────────────────────────────────
@@ -57,15 +81,26 @@ class StateSnapshot:
 class TurnInfo:
     turn_num: int
     time: str
-    states: list[StateSnapshot] = field(default_factory=list)  # ターン中に記録された状態
+    states: list[StateSnapshot]          = field(default_factory=list)
+    # 戦況（場・控え）: 最初に検出したもの
+    jokyo_player: str                    = ""
+    jokyo_opponent: str                  = ""
+    bench_player: str                    = ""
+    bench_opponent: str                  = ""
+    # 検出メッセージ（重複除去済み）
+    messages: list[tuple[str, str, str]] = field(default_factory=list)  # (type, name, raw)
+    # 技ログ
+    moves: list[str]                     = field(default_factory=list)
+    # 特性/道具
+    ability_msgs: list[str]              = field(default_factory=list)
 
 @dataclass
 class ParseResult:
     log_stem: str
     battle_start_state: StateSnapshot | None
     turns: list[TurnInfo]
-    battle_result: str  # "勝利（相手降参）" / "敗北（自分降参）" / "不明"
-    battle_fields: dict = field(default_factory=dict)  # game_turn → (player_names, opponent_names)
+    battle_result: str
+    battle_fields: dict = field(default_factory=dict)
 
 
 # ─── ログ解析 ─────────────────────────────────────────────────────────────────
@@ -78,8 +113,13 @@ def parse_log(log_path: Path) -> ParseResult:
     battle_start_state: StateSnapshot | None = None
     battle_result = "不明"
     in_battle = False
-    battle_fields: dict = {}   # game_turn → (player_names, opponent_names)
-    current_game_turn = 0      # [ターン] T{N} 開始 で更新
+    battle_fields: dict = {}
+    current_game_turn = 0
+
+    # 重複除去用セット（ターンをまたいで同一メッセージを何度も記録しない）
+    seen_messages: set[str] = set()
+    seen_moves: set[str] = set()
+    seen_ability: set[str] = set()
 
     for line in lines:
         time_m = _TIME_RE.match(line)
@@ -92,6 +132,9 @@ def parse_log(log_path: Path) -> ParseResult:
             if event == "battle_start":
                 in_battle = True
                 current_turn = None
+                seen_messages.clear()
+                seen_moves.clear()
+                seen_ability.clear()
             elif "battle_end" in event:
                 in_battle = False
 
@@ -103,13 +146,23 @@ def parse_log(log_path: Path) -> ParseResult:
             turns.append(current_turn)
             continue
 
-        # [戦況] 場の情報（ゲームターンごとの最初のスナップを使用）
+        # 戦況（場）
         jokyo_m = _JOKYO_RE.search(line)
-        if jokyo_m and current_game_turn not in battle_fields:
-            player_names = _extract_field_names(jokyo_m.group(1))
-            opponent_names = _extract_field_names(jokyo_m.group(2))
-            if player_names or opponent_names:
-                battle_fields[current_game_turn] = (player_names, opponent_names)
+        if jokyo_m:
+            if current_game_turn not in battle_fields:
+                p_names = _extract_field_names(jokyo_m.group(1))
+                o_names = _extract_field_names(jokyo_m.group(2))
+                if p_names or o_names:
+                    battle_fields[current_game_turn] = (p_names, o_names)
+            if current_turn and not current_turn.jokyo_player:
+                current_turn.jokyo_player = jokyo_m.group(1).strip()
+                current_turn.jokyo_opponent = jokyo_m.group(2).strip()
+
+        # 戦況（控え）
+        bench_m = _BENCH_RE.search(line)
+        if bench_m and current_turn and not current_turn.bench_player:
+            current_turn.bench_player = bench_m.group(1).strip()
+            current_turn.bench_opponent = bench_m.group(2).strip()
 
         # 状態ログ
         state_m = _STATE_RE.search(line)
@@ -124,12 +177,38 @@ def parse_log(log_path: Path) -> ParseResult:
                 ocr_raw=ocr_raw.strip(),
             )
             if current_turn is None and in_battle:
-                # battle_start 直後（T1前）の状態スナップ
                 battle_start_state = snap
             elif current_turn is not None:
                 current_turn.states.append(snap)
 
-        # 勝敗判定（OCR内テキストも含めて検索）
+        # 検出メッセージ（switch_in / faint / opponent_switch_in / status 等）
+        msg_m = _MSG_RE.search(line)
+        if msg_m and current_turn is not None:
+            msg_type = msg_m.group(1)
+            msg_name = msg_m.group(2).strip()
+            msg_raw  = msg_m.group(3).strip()
+            key = f"{msg_type}:{msg_name}"
+            if key not in seen_messages:
+                seen_messages.add(key)
+                current_turn.messages.append((msg_type, msg_name, msg_raw))
+
+        # 技ログ
+        move_m = _MOVE_LOG_RE.search(line)
+        if move_m and current_turn is not None:
+            move_str = move_m.group(1)
+            if move_str not in seen_moves:
+                seen_moves.add(move_str)
+                current_turn.moves.append(move_str)
+
+        # 特性/道具
+        ability_m = _ABILITY_RE.search(line)
+        if ability_m and current_turn is not None:
+            ab_str = ability_m.group(1).strip()
+            if ab_str not in seen_ability:
+                seen_ability.add(ab_str)
+                current_turn.ability_msgs.append(ab_str)
+
+        # 勝敗判定
         if ("降参が" in line and "選ばれました" in line) or "降参が / 選ばれました" in line:
             battle_result = "勝利（相手降参）"
         if "負け" in line or "まけ" in line:
@@ -144,30 +223,41 @@ def parse_log(log_path: Path) -> ParseResult:
     )
 
 
-# ─── OCR テキスト整形 ─────────────────────────────────────────────────────────
+# ─── ヘルパー ─────────────────────────────────────────────────────────────────
+
+_JOKYO_NOISE = {"通信待機中", "情報収集中"}
 
 def _extract_field_names(field_str: str) -> list[str]:
-    """「リキキリン HP:97/211 技=[...] / バドレックス HP:...」からポケモン名だけ取り出す。"""
     names = []
     for part in field_str.split(' / '):
         part = part.strip()
-        if not part or part == '情報収集中':
+        if not part or part in _JOKYO_NOISE:
             continue
-        # スペース・HP:・(状態) の前までが名前
         name = part.split(' ')[0].split('(')[0]
-        if name:
+        if name and name not in _JOKYO_NOISE:
             names.append(name)
     return names
 
 
+def _clean_jokyo(jokyo: str) -> str:
+    """戦況文字列から通信待機中等のノイズエントリを除去する。"""
+    parts = [p.strip() for p in jokyo.split(' / ')]
+    cleaned = [p for p in parts if p and p.split(' ')[0] not in _JOKYO_NOISE]
+    return ' / '.join(cleaned) if cleaned else '―'
+
+
+def _clean_bench(bench: str) -> str:
+    """控え文字列から通信待機中等のノイズエントリを除去する。"""
+    parts = [p.strip() for p in bench.split(' / ')]
+    cleaned = [p for p in parts if p and p.split('(')[0].strip() not in _JOKYO_NOISE]
+    return ' / '.join(cleaned) if cleaned else 'なし'
+
+
 def _clean_ocr(raw: str) -> str:
-    """OCRノイズを除去してポケモン名候補だけ残す。"""
     parts = [p.strip() for p in raw.split("/")]
     cleaned = []
     for p in parts:
-        if not p:
-            continue
-        if p in _UI_NOISE:
+        if not p or p in _UI_NOISE:
             continue
         if _SKIP_RE.match(p):
             continue
@@ -177,23 +267,13 @@ def _clean_ocr(raw: str) -> str:
     return " / ".join(cleaned)
 
 
-def _extract_hp_changes(states: list[StateSnapshot]) -> list[str]:
-    """状態スナップからHP変化を抽出する。
-    OCR raw 文字列を直接 regex スキャンし、「名前 / HP値」パターンを抽出する。
-    """
-    hp_re = re.compile(r'(\S{2,12})\s*/\s*(\d+/\d+)')
-    results = []
-    for snap in states:
-        for m in hp_re.finditer(snap.ocr_raw):
-            name = m.group(1).strip()
-            hp = m.group(2)
-            denom = int(hp.split("/")[1])
-            if denom < 50:
-                continue
-            if name in _UI_NOISE or _SKIP_RE.match(name) or not name:
-                continue
-            results.append(f"{name} {hp}")
-    return list(dict.fromkeys(results))  # 重複除去・順序保持
+_MSG_TYPE_LABEL = {
+    "switch_in":          "自:繰り出し",
+    "opponent_switch_in": "相:繰り出し",
+    "faint":              "気絶",
+    "switch_out":         "交代",
+    "status":             "状態異常",
+}
 
 
 # ─── ひな型生成 ───────────────────────────────────────────────────────────────
@@ -201,90 +281,101 @@ def _extract_hp_changes(states: list[StateSnapshot]) -> list[str]:
 def format_template(result: ParseResult) -> str:
     date_str = result.log_stem.replace("pipeline_", "")
 
-    lines: list[str] = [
+    out: list[str] = [
         f"対戦日時：{date_str}",
         f"結果：{result.battle_result}",
         "",
     ]
 
-    # 開始時の参考情報
     if result.battle_start_state:
         s = result.battle_start_state
         cleaned = _clean_ocr(s.ocr_raw)
         if cleaned:
-            lines += [
-                f"【開始時OCR】{cleaned}",
-                "",
-            ]
+            out += [f"【開始時OCR】{cleaned}", ""]
 
-    # ターンごとのひな型（ボール数は前ターンから引き継ぎ）
     prev_p_balls: int | str = result.battle_start_state.player_balls if result.battle_start_state else "?"
     prev_o_balls: int | str = result.battle_start_state.opponent_balls if result.battle_start_state else "?"
 
     for t in result.turns:
-        # ボール数: ターン中に最後に確認できた状態スナップを優先、なければ前ターン引き継ぎ
         if t.states:
-            # 最後のスナップが最も新しいボール数
             last = t.states[-1]
-            p_balls = last.player_balls
-            o_balls = last.opponent_balls
+            p_balls  = last.player_balls
+            o_balls  = last.opponent_balls
             p_status = t.states[0].player_status
             o_status = t.states[0].opponent_status
         else:
-            p_balls = prev_p_balls
-            o_balls = prev_o_balls
+            p_balls  = prev_p_balls
+            o_balls  = prev_o_balls
             p_status = "?"
             o_status = "?"
 
         prev_p_balls = p_balls
         prev_o_balls = o_balls
 
-        # HP変化リスト
-        hp_changes = _extract_hp_changes(t.states)
-
-        # OCR参考テキスト（最初のスナップだけ）
-        ocr_ref = ""
-        if t.states:
-            ocr_ref = _clean_ocr(t.states[0].ocr_raw)
-
-        # こちら・相手（[戦況]ログから取得。なければ前ターンの状態を引き継ぎ）
-        fields = result.battle_fields.get(t.turn_num) or result.battle_fields.get(t.turn_num - 1)
-        if fields:
-            player_str = "、".join(fields[0]) if fields[0] else "？"
-            opponent_str = "、".join(fields[1]) if fields[1] else "？"
-        else:
-            player_str = "？"
-            opponent_str = "？"
-
-        lines += [
-            "---",
-            "",
+        out += [
+            "=" * 60,
             f"T{t.turn_num}  [{t.time}]  自:{p_balls}匹({p_status})  相:{o_balls}匹({o_status})",
-            f"こちら：{player_str}",
-            f"相手：{opponent_str}",
             "",
         ]
 
-        if ocr_ref:
-            lines += [f"【OCR参考】{ocr_ref}", ""]
+        # ── 検出：戦況 ──────────────────────────────────────────
+        out.append("【戦況（検出）】")
+        if t.jokyo_player or t.jokyo_opponent:
+            out.append(f"  場(自): {_clean_jokyo(t.jokyo_player) if t.jokyo_player else '―'}")
+            out.append(f"  場(相): {_clean_jokyo(t.jokyo_opponent) if t.jokyo_opponent else '―'}")
+        else:
+            out.append("  場: 情報収集中")
+        if t.bench_player or t.bench_opponent:
+            out.append(f"  控(自): {_clean_bench(t.bench_player) if t.bench_player else '―'}")
+            out.append(f"  控(相): {_clean_bench(t.bench_opponent) if t.bench_opponent else '―'}")
+        out.append("")
 
-        if hp_changes:
-            lines += [f"【HP検出】{' | '.join(hp_changes)}", ""]
+        # ── 検出：メッセージ ────────────────────────────────────
+        out.append("【検出メッセージ】")
+        if t.messages:
+            for msg_type, name, raw in t.messages:
+                label = _MSG_TYPE_LABEL.get(msg_type, msg_type)
+                out.append(f"  [{label}] {name}  ←「{raw}」")
+        else:
+            out.append("  （なし）")
+        out.append("")
 
-        lines += [
-            "特性・アイテム発動：",
-            "",
-            "行動：",
+        # ── 検出：技ログ ────────────────────────────────────────
+        out.append("【技ログ（検出）】")
+        if t.moves:
+            for mv in t.moves:
+                out.append(f"  {mv}")
+        else:
+            out.append("  （なし）")
+        out.append("")
+
+        # ── 検出：特性/道具 ─────────────────────────────────────
+        valid_ab = [ab for ab in t.ability_msgs if not _is_ability_noise(ab)]
+        if valid_ab:
+            out.append("【特性/道具（検出）】")
+            for ab in valid_ab:
+                out.append(f"  {ab}")
+            out.append("")
+
+        # ── 実際の内容（手書き記入欄） ───────────────────────────
+        out += [
+            "【実際の内容（動画確認）】",
+            "  場(自): ",
+            "  場(相): ",
+            "  控(自): ",
+            "  控(相): ",
+            "  行動(自): ",
+            "  行動(相): ",
+            "  差異メモ: ",
             "",
         ]
 
-    lines += [
-        "---",
-        "",
+    out += [
+        "=" * 60,
         "（記録終わり）",
     ]
 
-    return "\n".join(lines)
+    return "\n".join(out)
 
 
 # ─── エントリポイント ─────────────────────────────────────────────────────────
@@ -292,7 +383,7 @@ def format_template(result: ParseResult) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="ログから対戦記録ひな型を生成")
     parser.add_argument("log_file", help="pipeline_YYYYMMDD_HHMMSS.log のパス")
-    parser.add_argument("-o", "--output", help="出力ファイルパス（省略時は標準出力）")
+    parser.add_argument("-o", "--output", help="出力ファイルパス（省略時は records/pipeline_STEM.md）")
     args = parser.parse_args()
 
     log_path = Path(args.log_file)
@@ -305,11 +396,14 @@ def main() -> None:
 
     if args.output:
         out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(output, encoding="utf-8")
-        print(f"出力: {out_path}", file=sys.stderr)
     else:
-        print(output)
+        records_dir = log_path.parent.parent / "records"
+        records_dir.mkdir(parents=True, exist_ok=True)
+        out_path = records_dir / f"{log_path.stem}.md"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(output, encoding="utf-8")
+    print(f"出力: {out_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
