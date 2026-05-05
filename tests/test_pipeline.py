@@ -397,8 +397,10 @@ class TestBattlePhaseClassifier:
         event = self.clf.detect(self._ocr_list("たたかう"))  # 同じフェーズ継続
         assert event is None
 
-    def test_detect_move_used_on_command_to_animation(self):
+    def test_detect_move_used_on_communication_to_animation(self):
+        """move_used は 通信待機中→バトルアニメーション の遷移で発火する（Champions方式）。"""
         self.clf.detect(self._ocr_list("たたかう"))   # battle_start
+        self.clf.detect(self._ocr_list("通信中"))     # communication
         event = self.clf.detect(self._ocr_list("バツグンだ"))  # move_used
         assert event == "move_used"
 
@@ -414,11 +416,9 @@ class TestBattlePhaseClassifier:
         assert event == "faint"
 
     def test_detect_battle_end(self):
-        """command_select → animation → battle_end で battle_end が発火する。
-        command_select → battle_end は move_used として扱われる（実装の仕様）。
-        """
+        """battle_start → animation → battle_end で battle_end が発火する。"""
         self.clf.detect(self._ocr_list("たたかう"))          # battle_start
-        self.clf.detect(self._ocr_list("バツグンだ"))         # animation (move_used)
+        self.clf.detect(self._ocr_list("バツグンだ"))         # animation (unknown)
         event = self.clf.detect(self._ocr_list("勝負に勝った"))
         assert event == "battle_end"
 
@@ -429,12 +429,14 @@ class TestBattlePhaseClassifier:
         event = self.clf.detect(self._ocr_list("たたかう"))
         assert event == "battle_start"
 
-    def test_debounce_suppresses_duplicate_events(self):
+    def test_debounce_suppresses_duplicate_move_used(self):
+        """move_used は5秒デバウンスが有効。同一ターンで通信終了が2回誤検知されても1回のみ発火する。"""
         clf = BattlePhaseClassifier(debounce_seconds=60.0)
         clf.detect(self._ocr_list("たたかう"))   # battle_start
+        clf.detect(self._ocr_list("通信中"))     # communication
         clf.detect(self._ocr_list("バツグンだ")) # move_used → 記録
-        clf.detect(self._ocr_list("たたかう"))   # command_select
-        event = clf.detect(self._ocr_list("バツグンだ"))  # 60秒以内 → デバウンス
+        clf.detect(self._ocr_list("通信中"))     # communication (再び)
+        event = clf.detect(self._ocr_list("バツグンだ"))  # 5秒デバウンス → 抑制
         assert event is None
 
     def test_processing_flag_suppresses_events(self):
