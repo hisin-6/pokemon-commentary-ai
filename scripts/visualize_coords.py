@@ -54,16 +54,16 @@ POKEMON_NAME_CHAMP = {
     "player_name_1 (Champ)": dict(x1=555,  x2=735,  y1=930,  y2=970,  color=(60,  220, 140)),
 }
 
-# ── hpbar_analyzer.py 由来の座標定数 ────────────────────────────────────
+# ── hpbar_analyzer.py 由来の座標定数（hpbar_analyzer.py と同期して更新すること）
 # 自分HPバー（SV・チャンピオンズ共通）
 HP_SLOTS_PLAYER = {
-    "player_0": dict(x1=240, x2=410, y1=1000, y2=1050, color=(0, 220, 0)),
-    "player_1": dict(x1=640, x2=810, y1=1000, y2=1050, color=(0, 180, 0)),
+    "player_0": dict(x1=178, x2=405, y1=1005, y2=1010, color=(0, 220, 0)),
+    "player_1": dict(x1=574, x2=801, y1=1005, y2=1010, color=(0, 180, 0)),
 }
 # 相手HPバー チャンピオンズ（実測 2026-04-13）
 HP_SLOTS_CHAMP = {
-    "opp_0 (Champ)": dict(x1=1330, x2=1450, y1=120, y2=170, color=(0, 120, 255)),
-    "opp_1 (Champ)": dict(x1=1720, x2=1840, y1=120, y2=170, color=(0, 80, 220)),
+    "opp_0 (Champ)": dict(x1=1222, x2=1450, y1=110, y2=130, color=(0, 120, 255)),
+    "opp_1 (Champ)": dict(x1=1618, x2=1846, y1=110, y2=130, color=(0, 80, 220)),
 }
 
 

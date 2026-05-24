@@ -14,6 +14,7 @@ import sys
 import logging
 from pathlib import Path
 
+import os
 import cv2
 import numpy as np
 import easyocr
@@ -47,7 +48,9 @@ _HP_OPP_ROIS_1920 = [
     (1330, 120,  1450, 170),    # hp_opp0
     (1720, 120,  1840, 170),    # hp_opp1
 ]
-_HP_THRESH = 160  # この輝度以上のピクセル（白テキスト）を保持
+_HP_THRESH = 160       # この輝度以上のピクセル（白テキスト）を保持
+_DENSE_SCALE = 2       # dense scan 前処理: スケールアップ倍率
+_DENSE_THRESH = 160    # dense scan 前処理: 白テキスト抽出閾値（メッセージボックスの白文字）
 
 
 def _scale_roi(x1, y1, x2, y2, w, h):
@@ -86,7 +89,8 @@ def _ocr_hp_opp_rois(reader: easyocr.Reader, frame: np.ndarray):
 
 
 def run_ocr(reader: easyocr.Reader, image: np.ndarray,
-            preprocess_hp: bool = False):
+            preprocess_hp: bool = False,
+            preprocess_dense: bool = False):
     """
     画像に対してOCRを実行し、認識結果のリストを返す。
 
@@ -94,9 +98,28 @@ def run_ocr(reader: easyocr.Reader, image: np.ndarray,
         preprocess_hp: Trueのとき hp_opp ROIをフルフレームOCRから除外し、
                        個別前処理OCRで差し替える（チャンピオンズ対応）。
                        hp_plr はフルフレームOCRで正しく読めるためマスクしない。
+        preprocess_dense: Trueのとき dense scan 用前処理を適用する。
+                          2×スケールアップ + 白テキスト抽出でOCR精度を向上。
+                          bboxはオリジナルスケールに変換して返す。
     Returns:
         [{"text": str, "confidence": float, "bbox": list}, ...]
     """
+    if preprocess_dense:
+        # 2× スケールアップ（CUBIC補間で文字エッジを保持）
+        # 白テキスト抽出は副作用（誤検出増加）があるためスケールアップのみ適用
+        scaled = cv2.resize(
+            image,
+            (image.shape[1] * _DENSE_SCALE, image.shape[0] * _DENSE_SCALE),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        raw = reader.readtext(scaled)
+        results = []
+        for (bbox, text, conf) in raw:
+            # bbox座標をオリジナルスケールに戻す
+            orig_bbox = [[pt[0] / _DENSE_SCALE, pt[1] / _DENSE_SCALE] for pt in bbox]
+            results.append({"text": text, "confidence": round(conf, 3), "bbox": orig_bbox})
+        return results
+
     if preprocess_hp:
         h, w = image.shape[:2]
         # フルフレームOCRでhp_opp ROI部分のみ黒塗り（HPバーノイズ抑制）

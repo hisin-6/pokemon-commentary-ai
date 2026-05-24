@@ -20,7 +20,6 @@ HPバーピクセル解析モジュール
 
 from __future__ import annotations
 import logging
-import time
 from dataclasses import dataclass, field
 
 import cv2
@@ -52,13 +51,14 @@ class SlotConfig:
 
 
 # ── デフォルト座標（1920x1080 基準） ──────────────────────────────
-# 実測値（debug/ocr_turn_*.png の複数フレームで満タン幅を計測）:
-#   player:   y=948-974, 満タン幅=279px（バドレックス100%フレームで確認）
+# 実測値（2026-05-06 ピクセルスキャンで確認）:
+#   player_0: x=178-405 y=1005-1010  バー実幅=227px（100%時 seg=227/227）
+#   player_1: x=574-801 y=1005-1010  バー実幅=227px（87.7%時 seg=199/227）
 #   opp_0:    y=110-130（チャンピオンズ実測 2026-04-13）
 #   opp_1:    y=110-130（チャンピオンズ実測 2026-04-13）
 _DEFAULT_SLOTS: dict[str, SlotConfig] = {
-    "player_0":   SlotConfig(x_left=106,  x_right=385,  y_top=948, y_bottom=974, label="player_0"),
-    "player_1":   SlotConfig(x_left=432,  x_right=711,  y_top=948, y_bottom=974, label="player_1"),
+    "player_0":   SlotConfig(x_left=178,  x_right=405,  y_top=1005, y_bottom=1010, label="player_0"),
+    "player_1":   SlotConfig(x_left=574,  x_right=801,  y_top=1005, y_bottom=1010, label="player_1"),
     "opponent_0": SlotConfig(x_left=1222, x_right=1450, y_top=110, y_bottom=130, label="opp_0"),
     "opponent_1": SlotConfig(x_left=1618, x_right=1846, y_top=110, y_bottom=130, label="opp_1"),
 }
@@ -82,12 +82,10 @@ class HpBarAnalyzer:
     _GAP_TOLERANCE: int = 8
     # バー幅の最小有効ピクセル数（ノイズフィルタ）
     _MIN_SEG_WIDTH: int = 15
-    # 安定化フィルタ: 確定値との差がこの値以内なら変化なし扱い
-    _STABLE_TOL: float = 0.03
-    # 安定化フィルタ: HP増加（アニメーションノイズ候補）を確定するのに必要な連続秒数
-    _BOUNCE_SECS: float = 2.5
-    # 安定化フィルタ: HP減少（ダメージ）を確定するのに必要な連続秒数
-    _DECREASE_SECS: float = 0.8
+    # 安定化フィルタ: ウィンドウフレーム数（skip=15・30fps ≒ 2fps で約3秒）
+    _STABILITY_WINDOW: int = 6
+    # 安定化フィルタ: ウィンドウ内の max-min がこの値以内なら「減少停止（安定）」とみなす
+    _STABILITY_DELTA: float = 0.02
 
     def __init__(self, slots: dict[str, SlotConfig] | None = None) -> None:
         self._slots = slots or dict(_DEFAULT_SLOTS)
@@ -96,9 +94,8 @@ class HpBarAnalyzer:
             key: cfg.full_width for key, cfg in self._slots.items()
         }
         # 安定化フィルタ用ステート
-        self._committed: dict[str, float | None] = {key: None for key in self._slots}
-        self._cand_value: dict[str, float | None] = {key: None for key in self._slots}
-        self._cand_start: dict[str, float | None] = {key: None for key in self._slots}
+        self._buf: dict[str, list[float]] = {key: [] for key in self._slots}
+        self._last_stable: dict[str, float | None] = {key: None for key in self._slots}
 
     def set_full_width(self, slot_key: str, width: int) -> None:
         """指定スロットの満タン幅を手動設定する。"""
@@ -122,55 +119,39 @@ class HpBarAnalyzer:
 
     def _apply_stabilizer(self, key: str, raw: float | None) -> float | None:
         """
-        非対称バウンスフィルタ（時間ベース）。
+        フレームウィンドウ安定化フィルタ。
 
-        - raw が None → 確定値をそのまま返す（一時的な検出失敗を無視）
-        - raw ≈ 確定値（±STABLE_TOL）→ 確定値を返す（微細ノイズ除去）
-        - raw < 確定値（HP減少）→ DECREASE_SECS 秒連続で安定したら確定
-        - raw > 確定値（HP増加）→ BOUNCE_SECS 秒連続で安定したら確定
-          （アニメーション中の一時的な増加はここで吸収される）
+        直近 _STABILITY_WINDOW フレームの読み取り値を保持し、
+        ウィンドウ内の max-min が _STABILITY_DELTA 以内になった時点
+        （= HPの減少/増加アニメーションが止まった瞬間）を確定タイミングとする。
+
+        - raw が None → バッファを更新せず最後の確定値を返す
+        - ウィンドウが埋まるまで → 最後の確定値を返す（未確定なら None）
+        - ウィンドウ内の spread ≤ _STABILITY_DELTA → 平均値を新しい確定値として採用
         """
-        committed = self._committed[key]
-
-        # 初回読み取り
-        if committed is None:
-            if raw is not None:
-                self._committed[key] = raw
-            return raw
-
-        # 検出失敗時は確定値を保持
         if raw is None:
-            return committed
+            return self._last_stable[key]
 
-        # 確定値と誤差範囲内なら変化なしとみなす
-        if abs(raw - committed) <= self._STABLE_TOL:
-            self._cand_value[key] = None
-            self._cand_start[key] = None
-            return committed
+        buf = self._buf[key]
+        buf.append(raw)
+        if len(buf) > self._STABILITY_WINDOW:
+            buf.pop(0)
 
-        now = time.monotonic()
-        # 候補が今回の raw と連続しているか確認
-        prev_cand = self._cand_value[key]
-        if prev_cand is not None and abs(raw - prev_cand) <= self._STABLE_TOL:
-            # 同じ候補が継続中 → タイマーはそのまま
-            pass
-        else:
-            # 新しい候補に切り替え → タイマーリセット
-            self._cand_value[key] = raw
-            self._cand_start[key] = now
+        if len(buf) < self._STABILITY_WINDOW:
+            return self._last_stable[key]
 
-        required_secs = self._DECREASE_SECS if raw < committed else self._BOUNCE_SECS
-        elapsed = now - (self._cand_start[key] or now)
-        if elapsed >= required_secs:
-            log.debug(
-                "[HpBar] %s 確定値更新: %.1f%% → %.1f%% (%.1f秒安定)",
-                key, committed * 100, raw * 100, elapsed,
-            )
-            self._committed[key] = raw
-            self._cand_value[key] = None
-            self._cand_start[key] = None
+        spread = max(buf) - min(buf)
+        if spread <= self._STABILITY_DELTA:
+            new_val = round(sum(buf) / len(buf), 3)
+            old_val = self._last_stable[key]
+            if old_val is None or abs(new_val - old_val) > self._STABILITY_DELTA:
+                log.debug(
+                    "[HpBar] %s 確定: %.1f%% → %.1f%% (spread=%.1f%%)",
+                    key, (old_val or 0) * 100, new_val * 100, spread * 100,
+                )
+                self._last_stable[key] = new_val
 
-        return self._committed[key]
+        return self._last_stable[key]
 
     def _measure_slot(self, frame: np.ndarray, key: str, cfg: SlotConfig) -> float | None:
         """1スロット分のHP%を計算する。"""

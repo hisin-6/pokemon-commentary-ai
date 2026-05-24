@@ -2175,8 +2175,9 @@ class Pipeline:
                     _D_Y2 = BattleMessageParser.MSG_Y_MAX   # 930
                     _D_X2 = BattleMessageParser.MSG_X_MAX   # 520
                     msg_roi = frame[_D_Y1:_D_Y2, 0:_D_X2]
-                    dense_raw = run_ocr(self._reader, msg_roi)
+                    dense_raw = run_ocr(self._reader, msg_roi, preprocess_dense=True)
                     # bbox y座標をオリジナルフレーム座標系にオフセット補正
+                    # （preprocess_dense=True 時のbboxはすでにオリジナルスケールに戻されている）
                     dense_results = [
                         {
                             "text": r["text"],
@@ -2726,13 +2727,13 @@ class Pipeline:
                 p_result = self._classifier.classify(_normalize_ocr_kana(pokemon_name))
                 if p_result and p_result.category == CATEGORY_POKEMON and p_result.score >= 80:
                     pokemon_name = p_result.canonical_ja or pokemon_name
-                # is_opponent=True の場合、相手チームにいないポケモンは登録しない
-                # 例: OCRが「オーロンゲ」→「オーダイル」と誤読しても、対戦に出ていなければ弾く
+                # is_opponent=True の場合、登録済みポケモン優先だが
+                # Champions ダブルバトルではスロット割当前のため known_opp に入っていないことがある。
+                # 未登録でも弾かず、debug ログだけ残して続行する。
                 if is_opponent:
                     known_opp = {s.name for s in self._battle_tracker._opponent}
                     if known_opp and pokemon_name not in known_opp:
-                        log.debug("[技ログ] is_opponent=True だが相手チームに未登録のためスキップ: %s", pokemon_name)
-                        return False
+                        log.debug("[技ログ] is_opponent=True 未登録ポケモン（スロット割当前の可能性）: %s", pokemon_name)
                 # OCR 大文字かな誤読を補正してから分類（例: チエ→チェ, きよじゆ→きょじゅ）
                 normalized = _normalize_ocr_kana(move_candidate)
                 result = self._classifier.classify(normalized)
@@ -2799,7 +2800,7 @@ class Pipeline:
             """全OCR結果（ROI外含む）から「Xの」形式の相手ポケモン名トークンを探す。
             「相手のザマゼンタのきょじゅうだん」のように相手名がROI外に出るケースに対応。
             dense scan 時は msg ROI のみのため、キャッシュしたメインOCR結果も検索する。
-            known_opponents に含まれるポケモン名のみ採用することで誤マッチを防ぐ。
+            known_opponents に一致すれば即採用。未一致でも有効なポケモン名なら投機的候補として返す。
             上部HPバー等の誤マッチを防ぐためメッセージボックス付近（cy > 600）のみ対象。
             """
             if not self._classifier:
@@ -2813,6 +2814,7 @@ class Pipeline:
             search_sources = ocr_results if ocr_results is not self._last_full_ocr_results else ocr_results
             if self._last_full_ocr_results and self._last_full_ocr_results is not ocr_results:
                 search_sources = list(ocr_results) + self._last_full_ocr_results
+            speculative: str | None = None  # known_opponents 未一致でも有効なポケモン名
             for r in search_sources:
                 if r["confidence"] < 0.25:
                     continue
@@ -2837,8 +2839,13 @@ class Pipeline:
                         and result.score >= 80):
                     canonical = result.canonical_ja or candidate
                     if canonical in known_opponents:
-                        return canonical
-            return None
+                        return canonical  # 確定: known_opponents に一致
+                    if speculative is None:
+                        speculative = canonical  # 投機的候補（スロット割当前の可能性）
+                        log.debug("[技ログ] _find_attacker 投機的候補: %s（未known）", canonical)
+            if speculative:
+                log.debug("[技ログ] _find_attacker 投機的候補を採用: %s", speculative)
+            return speculative
 
         def _try_register_opponent_attack(move_cand: str) -> bool:
             """「相手の[move_cand]」パターンの技登録。

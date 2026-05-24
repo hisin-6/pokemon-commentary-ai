@@ -63,6 +63,18 @@ data/end_screen_dataset/images/
 data/end_screen_dataset/labels/
 data/end_screen_dataset/raw/
 
+# EasyOCR ファインチューニング用データ（大容量・再生成可能）
+data/ocr_crop/
+data/ocr_crops/
+data/ocr_lmdb/
+
+# ファインチューニング用モデルウェイト
+pretrained/
+saved_models/
+
+# サードパーティ学習フレームワーク（deep-text-recognition-benchmark）
+tools/deep-text-recognition-benchmark/
+
 # 一時ファイル
 tmp/
 
