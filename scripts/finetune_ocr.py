@@ -15,15 +15,16 @@ CHARACTERS = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num_iter',   type=int, default=5000)
+    parser.add_argument('--num_iter',    type=int, default=5000)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--val_interval', type=int, default=500)
-    parser.add_argument('--exp_name',   default='pokemon_finetune')
+    parser.add_argument('--exp_name',    default='pokemon_finetune')
+    parser.add_argument('--saved_model', default=None, help='ベースモデルのパス（デフォルト: pretrained/japanese_g2.pth）')
     args = parser.parse_args()
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     train_py  = os.path.join(project_root, 'tools', 'deep-text-recognition-benchmark', 'train.py')
-    pretrained = os.path.join(project_root, 'pretrained', 'japanese_g2.pth')
+    pretrained = args.saved_model if args.saved_model else os.path.join(project_root, 'pretrained', 'japanese_g2.pth')
 
     if not os.path.exists(train_py):
         print("[ERROR] train.py が見つかりません。先に git clone を実行してください。")

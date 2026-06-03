@@ -13,17 +13,20 @@ import json
 import re
 from collections import Counter
 
+import os as _os
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+
 TRANSCRIPT_FILES = [
-    "/mnt/c/Users/rotat/AITuberProject/records/2026-04-12 16-14-39書き起こし.md",
-    "/mnt/c/Users/rotat/AITuberProject/records/2026-04-12 18-12-45書き起こし.md",
-    "/mnt/c/Users/rotat/AITuberProject/records/2026-04-13 06-25-46書き起こし.md",
-    "/mnt/c/Users/rotat/AITuberProject/records/2026-04-13 07-00-19書き起こし.md",
-    "/mnt/c/Users/rotat/AITuberProject/records/2026-04-14 08-15-22書き起こし.md",
-    "/mnt/c/Users/rotat/AITuberProject/records/2026-04-14 20-14-17書き起こし.md",
+    _os.path.join(_ROOT, "records", "2026-04-12 16-14-39書き起こし.md"),
+    _os.path.join(_ROOT, "records", "2026-04-12 18-12-45書き起こし.md"),
+    _os.path.join(_ROOT, "records", "2026-04-13 06-25-46書き起こし.md"),
+    _os.path.join(_ROOT, "records", "2026-04-13 07-00-19書き起こし.md"),
+    _os.path.join(_ROOT, "records", "2026-04-14 08-15-22書き起こし.md"),
+    _os.path.join(_ROOT, "records", "2026-04-14 20-14-17書き起こし.md"),
 ]
 
-INPUT_PATH  = "/mnt/c/Users/rotat/AITuberProject/data/ocr_crops/annotations.json"
-OUTPUT_PATH = "/mnt/c/Users/rotat/AITuberProject/data/ocr_crops/annotations_fixed.json"
+INPUT_PATH  = _os.path.join(_ROOT, "data", "ocr_crops", "annotations.json")
+OUTPUT_PATH = _os.path.join(_ROOT, "data", "ocr_crops", "annotations_fixed.json")
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +58,8 @@ KNOWN_OCR_ERRORS = {
     '決まらなかつた」': '決まらなかった！',
     '決まらなかつたし': '決まらなかった！',
     '守つている」': '守っている！',
+    '身を守つたり': '身を守った！',
+    '身を守つた!': '身を守った！',
     '食べられなくなつた」': '食べられなくなった！',
     '食べられなくなつた!': '食べられなくなった！',
     '入つた!': '入った！',
@@ -62,12 +67,40 @@ KNOWN_OCR_ERRORS = {
     '入つた!': '入った！',
     # バツグン誤読
     'バツグンた」': 'バツグンだ！',
+    # 繁 -> 緊 (繁張 -> 緊張)
+    '繁張して': '緊張して',
+    # と -> ど (はんとう -> はんどう)
+    'はんとう': 'はんどう',
+    # き -> げ (こうけき -> こうげき)
+    'こうけき': 'こうげき',
     # ゆけつ -> ゆけっ
     'ゆけつ!': 'ゆけっ！',
     # インファイト誤読
     'インフアイト」': 'インファイト！',
     # ダブルウィング誤読
     'ダブルウイング」': 'ダブルウィング！',
+    # つ -> っ (放つている)
+    '放つている': '放っている',
+    # マジカルシャイン誤読 (ヤ->ャ, ひ->ン)
+    'マジカルシヤイひ': 'マジカルシャイン',
+    # さ -> ざ (わさ -> わざ)
+    'わさ': 'わざ',
+    # つ -> っ（」→！変換のみ走って小文字化が抜けたケース）
+    '勝つた！': '勝った！',
+    '強くなつた！': '強くなった！',
+    '戻つていく！': '戻っていく！',
+    'なつた！': 'なった！',
+    'へつた！': 'へった！',
+    # ッ -> ツ（逆方向の誤読: バッグン -> バツグン）
+    'バッグンだ!': 'バツグンだ！',
+    'バッグンだ！': 'バツグンだ！',
+    # り -> ゆ (繰り出した)
+    '繰ゆ出した！': '繰り出した！',
+    '繰ゆ出した」': '繰り出した！',
+    '繰ゆだした！': '繰り出した！',
+    '繰ゆだした」': '繰り出した！',
+    '繰ゆ出した!': '繰り出した!',
+    '繰ゆ出した': '繰り出した',
 }
 
 
@@ -286,7 +319,35 @@ for entry in data:
         entry['ocr_text'] = correction
         entry['corrected'] = True
 
+    # 」→！ の汎用変換（書き起こし照合に関係なく適用）
+    if '」' in entry['ocr_text']:
+        entry = dict(entry)
+        entry['ocr_text'] = entry['ocr_text'].replace('」', '！')
+        entry['corrected'] = True
+
     fixed.append(entry)
+
+# 既存の annotations_fixed.json から reviewed/deleted/ocr_text を引き継ぐ
+if _os.path.exists(OUTPUT_PATH):
+    with open(OUTPUT_PATH, encoding='utf-8') as f:
+        prev = json.load(f)
+    prev_map = {d['file']: d for d in prev}
+    carried = 0
+    for entry in fixed:
+        prev_entry = prev_map.get(entry['file'])
+        if prev_entry is None:
+            continue
+        # reviewed=True のエントリはユーザーが確認・修正済み → ocr_text も引き継ぐ
+        if prev_entry.get('reviewed'):
+            entry['ocr_text'] = prev_entry['ocr_text']
+            entry['reviewed'] = True
+            if prev_entry.get('deleted'):
+                entry['deleted'] = True
+        elif prev_entry.get('deleted'):
+            entry['deleted'] = True
+            entry['reviewed'] = True
+        carried += 1
+    print(f"  フラグ引き継ぎ: {carried} 件")
 
 # 結果保存
 with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:

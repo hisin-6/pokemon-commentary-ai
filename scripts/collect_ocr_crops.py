@@ -15,6 +15,10 @@ import sys
 
 import cv2
 import easyocr
+import sys as _sys
+import os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src"))
+from capture.screen_capture import init_reader
 
 # パイプラインの BattleMessageParser と同じメッセージROI
 MSG_X1, MSG_Y1, MSG_X2, MSG_Y2 = 0, 740, 900, 930
@@ -108,7 +112,7 @@ def main():
     frame_paths = extract_frames(video_path, frames_dir, args.interval, prefix)
 
     print("\n=== Step 2: EasyOCR 初期化 ===")
-    reader = easyocr.Reader(["ja"], gpu=True)
+    reader = init_reader(gpu=True)
 
     print("\n=== Step 3: テキストクロップ生成 ===")
     new_annotations = collect_crops(frame_paths, crops_dir, reader)

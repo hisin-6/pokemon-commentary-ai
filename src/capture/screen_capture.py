@@ -31,7 +31,19 @@ log = logging.getLogger(__name__)
 
 def init_reader(gpu: bool = True) -> easyocr.Reader:
     log.info("EasyOCRリーダーを初期化中（初回はモデルDLで1〜2分かかります）...")
-    reader = easyocr.Reader(["ja", "en"], gpu=gpu)
+    user_network_dir = os.path.join(os.path.expanduser("~"), ".EasyOCR", "user_network")
+    pokemon_model = os.path.join(os.path.expanduser("~"), ".EasyOCR", "model", "pokemon_g2.pth")
+    if os.path.exists(pokemon_model):
+        log.info("pokemon_g2 ファインチューニングモデルを使用します")
+        reader = easyocr.Reader(
+            ["ja"],
+            gpu=gpu,
+            recog_network="pokemon_g2",
+            user_network_directory=user_network_dir,
+        )
+    else:
+        log.warning("pokemon_g2 が見つからないため japanese_g2 にフォールバックします")
+        reader = easyocr.Reader(["ja", "en"], gpu=gpu)
     log.info("EasyOCRリーダー初期化完了")
     return reader
 

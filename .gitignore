@@ -78,6 +78,12 @@ tools/deep-text-recognition-benchmark/
 # 一時ファイル
 tmp/
 
+# Claude Code 設定・メモリ
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code 設定・メモリ
+.claude/
