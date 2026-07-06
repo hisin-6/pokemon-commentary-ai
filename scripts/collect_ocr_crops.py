@@ -20,8 +20,17 @@ import os as _os
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src"))
 from capture.screen_capture import init_reader
 
-# パイプラインの BattleMessageParser と同じメッセージROI
-MSG_X1, MSG_Y1, MSG_X2, MSG_Y2 = 0, 740, 900, 930
+# 収集対象ROI定義: (x1, y1, x2, y2, upscale倍率)
+# name系は高さ40pxと小さいため2倍スケールアップしてOCR精度を確保
+ROIS = {
+    "msg":            (0,    740, 900,  930, 1),  # メッセージボックス（既存）
+    "ability_player": (0,    450, 555,  570, 1),  # 自分側特性・道具表示
+    "ability_opp":    (1365, 450, 1920, 570, 1),  # 相手側特性・道具表示
+    "name_plr0":      (155,  930, 335,  970, 2),  # 自分ポケモン名スロット0
+    "name_plr1":      (555,  930, 735,  970, 2),  # 自分ポケモン名スロット1
+    "name_opp0":      (1200, 50,  1380, 90,  2),  # 相手ポケモン名スロット0
+    "name_opp1":      (1600, 50,  1780, 90,  2),  # 相手ポケモン名スロット1
+}
 
 
 def _video_id(video_path: str) -> str:
@@ -69,26 +78,38 @@ def collect_crops(frame_paths: list, crops_dir: str, reader: easyocr.Reader) -> 
         img = cv2.imread(img_path)
         if img is None:
             continue
-        roi = img[MSG_Y1:MSG_Y2, MSG_X1:MSG_X2]
-        results = reader.readtext(roi)
+        stem = os.path.basename(img_path)[:-4]
 
-        for j, (bbox, text, conf) in enumerate(results):
-            text = text.strip()
-            if len(text) < 2:
+        for roi_name, (x1, y1, x2, y2, scale) in ROIS.items():
+            roi = img[y1:y2, x1:x2]
+            if roi.size == 0:
                 continue
-            xs = [p[0] for p in bbox]
-            ys = [p[1] for p in bbox]
-            cx1 = max(0, int(min(xs)))
-            cy1 = max(0, int(min(ys)))
-            cx2 = min(roi.shape[1], int(max(xs)))
-            cy2 = min(roi.shape[0], int(max(ys)))
-            if cx2 <= cx1 or cy2 <= cy1:
-                continue
-            crop = roi[cy1:cy2, cx1:cx2]
-            stem = os.path.basename(img_path)[:-4]
-            name = f"{stem}_{j:03d}.png"
-            cv2.imwrite(os.path.join(crops_dir, name), crop)
-            annotations.append({"file": name, "ocr_text": text, "conf": round(conf, 3)})
+            if scale > 1:
+                roi = cv2.resize(roi, (roi.shape[1] * scale, roi.shape[0] * scale),
+                                 interpolation=cv2.INTER_CUBIC)
+            results = reader.readtext(roi)
+
+            for j, (bbox, text, conf) in enumerate(results):
+                text = text.strip()
+                if len(text) < 2:
+                    continue
+                xs = [p[0] for p in bbox]
+                ys = [p[1] for p in bbox]
+                cx1 = max(0, int(min(xs)))
+                cy1 = max(0, int(min(ys)))
+                cx2 = min(roi.shape[1], int(max(xs)))
+                cy2 = min(roi.shape[0], int(max(ys)))
+                if cx2 <= cx1 or cy2 <= cy1:
+                    continue
+                crop = roi[cy1:cy2, cx1:cx2]
+                name = f"{stem}_{roi_name}_{j:03d}.png"
+                cv2.imwrite(os.path.join(crops_dir, name), crop)
+                annotations.append({
+                    "file": name,
+                    "ocr_text": text,
+                    "conf": round(conf, 3),
+                    "roi": roi_name,
+                })
 
     return annotations
 

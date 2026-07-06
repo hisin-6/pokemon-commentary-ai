@@ -220,6 +220,7 @@ def run(
     diff_detector = DiffDetector()
     start_time = time.perf_counter()
     frame_no = 0
+    _is_video = input_path is not None
 
     log.info("キャプチャ開始（Ctrl+C で終了）")
     log.info("-" * 70)
@@ -230,6 +231,9 @@ def run(
         while True:
             ret, frame = cap.read()
             if not ret:
+                if _is_video:
+                    log.info("動画ファイルの末尾に達しました。終了します。")
+                    break
                 log.warning("フレーム取得失敗、再試行...")
                 time.sleep(0.1)
                 continue

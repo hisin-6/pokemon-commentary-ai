@@ -511,11 +511,23 @@ class BattlePhaseClassifier:
     # 余分な move_used → turn_start サイクルが発生してターン数が多重カウントされる。
     # battle_start は「たたかう」初回出現で確実に検知できるため早期検知は不要。
     _COMMAND_KW    = {"たたかう", "どうする"}
-    _SWITCH_KW     = {"こうたい", "ポケモンをえらんで"}
+    # 「こうたい」「ポケモンをえらんで」はSV版UIのラベル。Championsでは「交代する」
+    # （conf0.99〜1.00で安定検出・診断ログ実測）を使うため追加。
+    _SWITCH_KW     = {"こうたい", "ポケモンをえらんで", "交代する"}
     # 通信待機中: Champions特有の「全コマンド確定待ち」画面
     # ダブルバトルで双方の全コマンドが揃うまで表示される。
     # この画面の終了が「実際の行動開始（move_used）」の信頼できる唯一のシグナル。
-    _COMM_KW       = {"通信待機中", "通信中"}
+    # 完全一致だと「通信待様中」（機→様）等のOCR誤読と低confで95%以上のフレームを
+    # 取りこぼす（診断ログ6本で実測: 完全一致6〜52fに対し誤読・低confが数百〜数千f）。
+    # ファジー正規表現＋専用conf閾値で判定する。「マッチング待機中」は対象外。
+    _COMM_RE       = re.compile(r'通.?[待侍].中|^待機中$|通信中')
+    # conf0.2でも実際は8割超のフレームを取りこぼす（診断ログ6本実測: conf中央値0.117）。
+    # conf<0.05帯を確認しても中身はほぼ全て「通信待ば中」「通ル待機中」等の同一テキストの
+    # 誤読バリエーションでノイズ混入はごく僅か。_COMM_RE自体が十分specificなため
+    # conf閾値はほぼ無効化し、正規表現の一致自体を信頼する。
+    _COMM_CONF_MIN = 0.0
+    _COMM_ENTRY_FRAMES   = 2    # 通信フェーズ入場に必要な連続検出フレーム数（単発誤検出の排除）
+    _COMM_EXIT_GRACE_SEC = 3.0  # 通信フェーズ退出の猶予秒数（単発の取りこぼしを吸収）
     # 技選択画面の型相性ラベル（これが見えている = 技選択UI が開いている = command_select 継続）
     # 「こうかあり」はバトルメッセージには出ず技選択UIにのみ出現するため安全な指標
     # 「いまひとつ」「こうかなし」は技選択UIにも出るため _ANIM_KW から除外済み
@@ -532,10 +544,21 @@ class BattlePhaseClassifier:
     # イベント別デバウンス秒数（_debounce はデフォルト値）
     _DEBOUNCE_OVERRIDES: dict[str, float] = {
         "turn_start": 15.0,  # ダブルバトル2匹目コマンド選択での余分な turn_start 発火を防ぐ
-        "move_used":   5.0,  # communication→unknown 遷移は1ターンに1回のみのため短縮。
-                              # faint後の繰り出し選択で再び通信待機中になるケースに備えて 5s 残す。
+        "move_used":  10.0,  # 相手を見るパネル等で通信待機中バッジが十数秒隠れて再出現する
+                              # ケースの再発火を抑える。faint後の繰り出し選択で再び通信待機中に
+                              # なる正当なケース（20秒以上先）は許容される。
         "faint":      25.0,  # 相手を見るパネルが0/211を表示し続けることで多重発火する問題の防止
     }
+
+    # turn_start脱出弁: move_usedを取りこぼすと_allow_turn_start=Falseのまま固着し、
+    # turn_startが恒久的にブロックされてターン番号がズレ続ける（診断ログで実測）。
+    # ターン内でも相手を見るパネル等でコマンド画面が最大80秒程度消えることがあるため、
+    # セッション区切りは実測のターン間ギャップ最小値（192秒）との間を取って120秒。
+    _CMD_SESSION_GAP_SEC   = 120.0  # コマンド画面がこの秒数以上消えていたら新セッション
+    _TURN_START_ESCAPE_SEC = 45.0   # 前回turn_start確定からこの秒数経過で脱出弁が開く
+    # faint再アーム: 「0/211」等は相手を見るパネルで最大210秒表示され続ける（実測）。
+    # 表示がこの秒数以上途切れてから再出現した場合のみ新しいfaintイベントとして扱う。
+    _FAINT_REARM_SEC = 20.0
 
     def __init__(self, debounce_seconds: float = 10.0):
         self._debounce = debounce_seconds
@@ -547,6 +570,15 @@ class BattlePhaseClassifier:
         # ダブルバトルで1匹目→2匹目コマンド選択中の余分なturn_startを
         # debounceに依存せず完全にブロックする。
         self._allow_turn_start = False
+        # 通信フェーズ平滑化（入場確認・退出猶予）
+        self._comm_streak = 0        # communication 連続検出フレーム数
+        self._comm_active = False    # 確定済み通信フェーズ中か
+        self._last_comm_seen = 0.0   # 最後に communication を検出した時刻
+        # turn_start脱出弁・faint再アーム用の追跡
+        self._last_cmd_seen = 0.0          # 最後に command_select を見た時刻
+        self._cmd_session_start = 0.0      # 現在のコマンドセッションの開始時刻
+        self._last_turn_start_fired = 0.0  # 最後に turn_start / battle_start が確定した時刻
+        self._last_faint_seen = 0.0        # 最後に faint フェーズを見た時刻
 
     def set_processing(self, v: bool) -> None:
         self._is_processing = v
@@ -566,6 +598,46 @@ class BattlePhaseClassifier:
         if event_type in ("faint", "move_used"):
             self._last_event_time["turn_start"] = now
 
+    def _is_communication(self, ocr_results: list[dict]) -> bool:
+        """通信待機中/通信中の表示があるかをファジー判定する。"""
+        for r in ocr_results:
+            if r["confidence"] < self._COMM_CONF_MIN:
+                continue
+            txt = r["text"].replace(" ", "")
+            if "マッチング" in txt:  # マッチメイキング画面の「マッチング待機中」は対象外
+                continue
+            if self._COMM_RE.search(txt):
+                return True
+        return False
+
+    def _smooth_communication(self, raw: str) -> str:
+        """communication フェーズの入退場を平滑化する。
+        入場は連続 _COMM_ENTRY_FRAMES フレームで確定（単発誤検出の排除）、
+        退場は _COMM_EXIT_GRACE_SEC の猶予付き（取りこぼしによる move_used 多重発火の防止）。
+        退場確定フレームでは実際の画面種別に関わらず "unknown" を返す:
+        communication→command_select と直接遷移すると turn_start の prev 条件に
+        引っかかって move_used 後の turn_start が永久に発火できなくなるため、
+        必ず communication→unknown→(次フレームで実フェーズ) の順に遷移させる。
+        """
+        if raw == "battle_end":
+            self._comm_streak = 0
+            self._comm_active = False
+            return raw
+        now = time.time()
+        if raw == "communication":
+            self._comm_streak += 1
+            self._last_comm_seen = now
+            if not self._comm_active and self._comm_streak >= self._COMM_ENTRY_FRAMES:
+                self._comm_active = True
+            return "communication" if self._comm_active else "unknown"
+        self._comm_streak = 0
+        if self._comm_active:
+            if now - self._last_comm_seen < self._COMM_EXIT_GRACE_SEC:
+                return "communication"
+            self._comm_active = False
+            return "unknown"  # 退場確定の合成フレーム（communication→unknown 遷移で move_used 発火）
+        return raw
+
     def classify(self, ocr_results: list[dict]) -> str:
         """OCR 結果から現在のフェーズを判定する（優先度順）。"""
         texts = {r["text"] for r in ocr_results if r["confidence"] >= 0.4}
@@ -578,7 +650,8 @@ class BattlePhaseClassifier:
         # 通信待機中: Champions特有の「全コマンド確定待ち」画面
         # この画面の終了を move_used のトリガーとして使う。
         # faint/switch_select より先にチェックして誤分類を防ぐ。
-        if any(kw in t for kw in self._COMM_KW for t in texts):
+        # OCR誤読（通信待様中等）・低conf対策のためファジー判定（_COMM_RE参照）
+        if self._is_communication(ocr_results):
             return "communication"
         # 選出画面: バトル前のポケモン選択画面（ここでのイベント発火を防ぐ）
         if any(kw in t for kw in self._SELECTION_KW for t in texts):
@@ -601,9 +674,22 @@ class BattlePhaseClassifier:
         """フェーズ遷移からイベントを返す。イベントなし or 処理中 は None。
         ただし battle_end は処理中でも割り込み検知する（実況中の試合終了を見逃さないため）。
         """
-        curr = self.classify(ocr_results)
+        raw = self.classify(ocr_results)
+        curr = self._smooth_communication(raw)
         prev = self._prev_phase
         self._prev_phase = curr
+        now = time.time()
+
+        # コマンド画面の出現を追跡（脱出弁用: 長い空白の後の出現 = 新しいコマンドセッション）
+        if curr == "command_select":
+            if now - self._last_cmd_seen >= self._CMD_SESSION_GAP_SEC:
+                self._cmd_session_start = now
+            self._last_cmd_seen = now
+        # faint表示の継続を追跡（_FAINT_REARM_SEC 以上途切れてからの再出現のみ新イベント扱い）
+        faint_rearmed = False
+        if curr == "faint":
+            faint_rearmed = now - self._last_faint_seen >= self._FAINT_REARM_SEC
+            self._last_faint_seen = now
 
         # 処理中でも battle_end だけは割り込み検知
         if self._is_processing:
@@ -638,7 +724,9 @@ class BattlePhaseClassifier:
             # 通信待機中終了 = 全コマンド確定後にアニメーション開始
             # Champions特有: ダブルバトルで双方の全コマンドが揃ったことを示す唯一の信頼できるシグナル。
             event = "move_used"
-        elif curr == "faint" and prev != "faint":
+        elif curr == "faint" and prev != "faint" and faint_rearmed:
+            # エッジトリガ: 相手を見るパネル等で「0/211」が長時間残り、OCRのチラつきで
+            # faint⇄他フェーズを往復するたびにデバウンス(25s)を貫通して再発火する問題の防止
             event = "faint"
         elif curr == "switch_select" and prev not in ("switch_select", "communication"):
             event = "switch"
@@ -650,6 +738,20 @@ class BattlePhaseClassifier:
             # turn_start が発火するのを抑制する
             self._last_event_time["turn_start"] = time.time()
 
+        # 脱出弁: move_used取りこぼしで_allow_turn_start=Falseのまま固着した場合の回復措置。
+        # 新しいコマンドセッションの2フレーム目以降（開始10秒以内）かつ前回turn_start確定から
+        # _TURN_START_ESCAPE_SEC 以上経過していれば、遷移条件・デバウンスを無視して発火する。
+        # （通常経路がデバウンスで握りつぶされた場合も次フレームでここが拾う）
+        escape = False
+        if (event is None and curr == "command_select" and self._battle_started
+                and self._cmd_session_start > 0
+                and 0 < now - self._cmd_session_start <= 10.0
+                and now - self._last_turn_start_fired >= self._TURN_START_ESCAPE_SEC):
+            event = "turn_start"
+            escape = True
+            log.info("[脱出弁] turn_start を強制発火（前回確定から %.0f 秒・move_used 取りこぼしの疑い）",
+                     now - self._last_turn_start_fired)
+
         if curr != prev:
             if event:
                 log.info(f"[フェーズ] {prev} → {curr} | イベント: {event}")
@@ -657,11 +759,10 @@ class BattlePhaseClassifier:
                 log.debug(f"[フェーズ] {prev} → {curr}")
 
         if event:
-            now = time.time()
             no_debounce = {"battle_start", "battle_end"}
             debounce = self._DEBOUNCE_OVERRIDES.get(event, self._debounce)
             last = self._last_event_time.get(event, 0.0)
-            if event not in no_debounce and now - last < debounce:
+            if event not in no_debounce and not escape and now - last < debounce:
                 log.debug(f"デバウンス中のためスキップ: {event} (残り {debounce-(now-last):.1f}s)")
                 return None
             self._last_event_time[event] = now
@@ -673,6 +774,10 @@ class BattlePhaseClassifier:
                 # turn_start確定 → 次のmove_usedまでturn_startを禁止
                 # （1匹目→2匹目コマンド選択中の余分なturn_startをdebounce非依存でブロック）
                 self._allow_turn_start = False
+                self._last_turn_start_fired = now
+            elif event == "battle_start":
+                # T1のturn_start相当として記録（直後に脱出弁が誤発火するのを防ぐ）
+                self._last_turn_start_fired = now
 
         return event
 
@@ -700,7 +805,7 @@ _MOVE_ALIAS_MAP: dict[str, str] = {
 _OCR_KANA_NORM_RE = re.compile(
     r'(?<=[きしちにひみりぎじびぴ])[よゆ]|'  # ひらがな: きよ→きょ, じゆ→じゅ 等
     r'(?<=[チシジ])[エユ]|'                   # カタカナ: チエ→チェ, シユ→シュ 等
-    r'(?<=[ファフヴ])[オアイエ]|'              # フォ/ファ/ヴォ 等
+    r'(?<=[ファフヴウ])[オアイエ]|'            # フォ/ファ/ヴォ/ウィ 等
     r'デイ|テイ'                              # ディ/ティ
 )
 _OCR_KANA_NORM_MAP = {
@@ -718,12 +823,27 @@ def _normalize_ocr_kana(text: str) -> str:
         きよじゆうだん → きょじゅうだん
         ボデイプレス   → ボディプレス
         ワイドフオース → ワイドフォース
+        ダブルウイング → ダブルウィング
     """
     def _replace(m: re.Match) -> str:
         s = m.group(0)
         return _OCR_KANA_NORM_MAP.get(s, _OCR_KANA_NORM_MAP.get(s[-1], s))
 
     return _OCR_KANA_NORM_RE.sub(_replace, text)
+
+
+# メッセージボックスROI特有の既知OCR誤読（促音ッ/清音ツの混同など、_normalize_ocr_kana の
+# 大文字→小文字かな正規化とは別種のため単純な文字列置換テーブルで対応する）
+_MSG_OCR_FIX_MAP: dict[str, str] = {
+    "バッグンだ": "バツグンだ",
+}
+
+
+def _normalize_ocr_message(text: str) -> str:
+    """メッセージボックスROIのテキストに対する既知OCR誤読の補正。"""
+    for wrong, correct in _MSG_OCR_FIX_MAP.items():
+        text = text.replace(wrong, correct)
+    return text
 
 
 class BattleMessageParser:
@@ -799,7 +919,7 @@ class BattleMessageParser:
             if self.MSG_X_MIN <= cx < self.MSG_X_MAX and self.MSG_Y_MIN < cy < self.MSG_Y_MAX:
                 items.append((cy, cx, r["text"]))
         items.sort(key=lambda t: (round(t[0] / 40), t[1]))
-        return " ".join(t[2] for t in items)
+        return _normalize_ocr_message(" ".join(t[2] for t in items))
 
     def parse(self, ocr_results: list[dict]) -> list[dict]:
         """OCR結果からメッセージイベントのリストを返す（重複はデバウンスでスキップ）。"""
@@ -1997,7 +2117,7 @@ class Pipeline:
                         # 定期OCRでも自分側ポケモン名を蓄積（battle_start時に映らなかったポケモンの補完）
                         # イベントOCRに比べてUIノイズが多いため、y座標分類済みのみを対象とする
                         if ocr_results:
-                            _periodic_gs = _extract_structured_info(ocr_results)
+                            _periodic_gs = _extract_structured_info(ocr_results, self._classifier)
                             _periodic_player = _periodic_gs.get("name_candidates_player", [])
                             for _pname in _periodic_player:
                                 self._battle_tracker.accumulate_player_name(_pname)
