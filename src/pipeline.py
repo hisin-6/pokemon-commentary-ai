@@ -1047,16 +1047,54 @@ class BattleStateTracker:
 
     # ── 内部ヘルパー ─────────────────────────────────────────────────────────
 
-    def _get_or_create(self, slots: list[FieldPokemon], name: str) -> FieldPokemon | None:
-        """名前でスロットを検索。なければ新規作成（MAX_SLOTS を超えたら None）。"""
+    # 前方一致吸収の最小文字数: 2文字名（ピィ等）同士の偶発一致を避ける
+    _ABSORB_MIN_LEN = 3
+
+    def _get_or_create(self, slots: list[FieldPokemon], name: str,
+                       allow_evict: bool = True) -> FieldPokemon | None:
+        """名前でスロットを検索。なければ新規作成（MAX_SLOTS を超えたら None）。
+
+        幽霊ポケモン対策:
+        ①前方一致吸収: OCRの末尾欠け誤読（リザードン→リザード）で同一ポケモンが
+          別スロットに二重登録されるのを防ぐ。短い方が長い方の前方部分文字列なら
+          同一個体とみなし、スロット名は長い方に揃える。
+          注: ゴース/ゴーストのような実在の前方一致ペアは誤吸収するが、
+          同一チームに揃う確率よりOCR末尾欠け誤読の頻度の方が圧倒的に高い。
+        ②満杯時eviction（allow_evict=True時のみ）: 満杯で新規登録できない場合、
+          場におらず未気絶で目撃回数（confidence）最少のスロットを幽霊とみなして
+          削除する（幽霊が1枠を永久占有し本物の4匹目が登録不可になる問題の防止）。
+          evictionは繰り出しメッセージ等で名前が確認された高信頼経路のみに許可する。
+          定期OCR由来の低信頼経路（allow_evict=False）に許すと、相手の繰り出し
+          メッセージの誤分類などで本物のスロットが道連れ削除される（実機で確認）。
+        """
         for s in slots:
             if s.name == name:
+                return s
+        # ①前方一致吸収
+        for s in slots:
+            if min(len(s.name), len(name)) < self._ABSORB_MIN_LEN:
+                continue
+            if s.name.startswith(name):
+                log.info(f"[戦況] {name} は既存 {s.name} の前方一致 → 同一個体として吸収")
+                return s
+            if name.startswith(s.name):
+                log.info(f"[戦況] ロスターの {s.name} を {name} に更新（前方一致吸収）")
+                s.name = name
                 return s
         if len(slots) < self.MAX_SLOTS:
             slot = FieldPokemon(name=name)
             slots.append(slot)
             return slot
-        return None  # 4匹超過は無視
+        # ②満杯時eviction（場にいる・気絶済みスロットは本物確定なので対象外）
+        candidates = [s for s in slots if not s.on_field and not s.fainted] if allow_evict else []
+        if candidates:
+            victim = min(candidates, key=lambda s: s.confidence)
+            slots.remove(victim)
+            log.info(f"[戦況] ロスター満杯 → 幽霊疑い {victim.name}（目撃{victim.confidence}回）を削除して {name} を登録")
+            slot = FieldPokemon(name=name)
+            slots.append(slot)
+            return slot
+        return None  # 全スロットが場or気絶済み: 登録不可
 
     def _cap_on_field(self, slots: list[FieldPokemon]) -> None:
         """ダブルバトル制約: 場に出せるのは最大 MAX_ON_FIELD 匹。超えた分は confidence が低い方を除外。"""
@@ -1212,7 +1250,7 @@ class BattleStateTracker:
             already_in_player_slots = any(s.name == name for s in self._player)
             if already_in_opponent and not already_in_player_slots and name not in current_opponent_names:
                 continue  # 相手側にのみ登録済みで相手エリアにも見えていない → 誤分類として除外
-            slot = self._get_or_create(self._player, name)
+            slot = self._get_or_create(self._player, name, allow_evict=False)
             if slot:
                 slot.confidence += 1
                 slot.last_seen_turn = self.turn
@@ -1231,7 +1269,7 @@ class BattleStateTracker:
             already_in_player = any(s.name == name for s in self._player)
             if already_in_player and name not in current_player_names:
                 continue  # 自分側に登録済みで自分エリアにも見えていない → 誤分類として除外
-            slot = self._get_or_create(self._opponent, name)
+            slot = self._get_or_create(self._opponent, name, allow_evict=False)
             if slot:
                 slot.confidence += 1
                 slot.last_seen_turn = self.turn
@@ -1561,15 +1599,19 @@ class BattleStateTracker:
         already_in_player = any(s.name == name for s in self._player)
         if already_in_player:
             for s in self._player:
-                if s.name == name and not s.fainted and not s.on_field:
-                    if on_field_count < 2:
+                if s.name == name:
+                    # 目撃カウント: eviction判定（目撃最少=幽霊疑い）が本物を誤爆しないよう、
+                    # 定期OCRで見えている本物のスロットには目撃回数を積む
+                    s.confidence += 1
+                    if not s.fainted and not s.on_field and on_field_count < 2:
                         s.on_field = True
                         s.last_seen_turn = self.turn
                         log.info(f"[戦況] {s.name} 定期OCR検出 → 場に追加")
             return
         if on_field_count >= 2:
             return  # ダブルバトル上限: 新規追加しない
-        slot = self._get_or_create(self._player, name)
+        # 定期OCRは相手繰り出しメッセージ等の誤分類が混入しうる低信頼経路のため eviction 禁止
+        slot = self._get_or_create(self._player, name, allow_evict=False)
         if slot and not slot.fainted:
             slot.on_field = True
             slot.last_seen_turn = self.turn
