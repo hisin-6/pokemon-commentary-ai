@@ -201,8 +201,15 @@ def run(
             cap.read()
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # 動画モードでは動画内時間（video_sec = 0始まりフレーム番号 / fps）をJSONLに記録する。
+    # elapsed はOCR処理の実時間累積であり動画内時間ではない（約10倍間延び・実測）ため、
+    # 時間ベースの解析には video_sec を使うこと。
+    video_fps = (cap.get(cv2.CAP_PROP_FPS) or 30.0) if input_path else None
     source_label = input_path or f"カメラ {camera_index}"
-    log.info(f"{source_label} オープン完了: {w}x{h}")
+    if video_fps:
+        log.info(f"{source_label} オープン完了: {w}x{h} @ {video_fps:.2f}fps")
+    else:
+        log.info(f"{source_label} オープン完了: {w}x{h}")
 
     # EasyOCR初期化
     reader = init_reader(gpu=True)
@@ -292,6 +299,10 @@ def run(
                 "ocr": ocr_structured,
                 "yolo": ball_dict,
             }
+            if video_fps:
+                # 動画内時間（時間ベース解析はこちらを使う。elapsed は処理時間累積で間延びする）
+                record["video_sec"] = round((frame_no - 1) / video_fps, 3)
+                record["fps"] = round(video_fps, 3)
             jsonl_file.write(json.dumps(record, ensure_ascii=False) + "\n")
             jsonl_file.flush()
 

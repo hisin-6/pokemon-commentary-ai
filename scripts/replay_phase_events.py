@@ -2,10 +2,17 @@
 
 ocr_logger.py で収集した診断ログ（フレーム全体OCR）を実際の
 BattlePhaseClassifier に流し込み、イベント発火数を実ターン数と突き合わせる。
-時刻は JSONL の elapsed（動画内経過秒）で仮想化するため、実時間はかからない。
+時刻は BattlePhaseClassifier の clock 注入で仮想化するため、実時間はかからない。
+
+時間軸は動画内時間を使う（優先順）:
+  1. JSONL の video_sec フィールド（新しい ocr_logger.py が記録）
+  2. (frame - 1) / --fps（旧ログ用フォールバック。frame は動画フレーム番号）
+  3. elapsed（最終フォールバック・警告表示。OCR処理時間の累積であり
+     約10倍間延びしているため時間ベース閾値の検証には使えない）
 
 実パイプラインの挙動の模擬:
-  - --interval 秒ごとにフレームを間引く（デフォルト 1.0 = メインOCR相当）
+  - --interval 秒（動画内時間）ごとにフレームを間引く
+    （デフォルト 1.0 = 本番メインOCRの約1Hzサンプリング相当）
   - turn_start 以外のイベント発火後は --processing 秒分フレームをスキップし、
     その後 reset_after_processing() を呼ぶ（Bedrock+VOICEVOX の処理ブロック相当）
 
@@ -42,9 +49,22 @@ class _MarkerCounter(logging.Handler):
             self.count += 1
 
 
-def replay(path: str, interval: float, processing: float, verbose: bool):
+def _frame_time(fr: dict, fps: float) -> tuple[float | None, str]:
+    """JSONLレコードから動画内時間を復元する。(時刻, 時間軸ソース名) を返す。"""
+    t = fr.get("video_sec")
+    if t is not None:
+        return t, "video_sec"
+    frame = fr.get("frame")
+    if frame is not None:
+        return (frame - 1) / fps, "frame/fps"
+    return fr.get("elapsed"), "elapsed"
+
+
+def replay(path: str, interval: float, processing: float, fps: float, verbose: bool):
     """1ファイルをリプレイしてイベント数と脱出弁発火数を返す。"""
-    clf = pl.BattlePhaseClassifier()
+    clock = {"t": 0.0}
+    # 時計注入: 動画内時間をそのまま classifier の時刻に使う（本番のライブ実時間と等価な軸）
+    clf = pl.BattlePhaseClassifier(clock=lambda: clock["t"])
     valve = _MarkerCounter("脱出弁")
     pl.log.addHandler(valve)
     pl.log.setLevel(logging.INFO)  # 脱出弁カウンタはINFOログ経由のため常にINFO
@@ -57,6 +77,7 @@ def replay(path: str, interval: float, processing: float, verbose: bool):
     skip_until = -1.0
     pending_reset: str | None = None
     events_detail: list[str] = []
+    time_source = ""
 
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -64,14 +85,20 @@ def replay(path: str, interval: float, processing: float, verbose: bool):
                 fr = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            t = fr.get("elapsed")
+            t, src = _frame_time(fr, fps)
             if t is None:
                 continue
+            if not time_source:
+                time_source = src
+                if src == "elapsed":
+                    print(f"警告: {Path(path).name} は video_sec/frame が無く elapsed 軸で"
+                          f"リプレイします（約10倍間延び・時間閾値の検証には不適）",
+                          file=sys.stderr)
             if t < next_t:
                 continue
             if interval > 0:
                 next_t = t + interval
-            pl.time.time = lambda t=t: t  # 仮想時計: 動画内経過秒をそのまま時刻に使う
+            clock["t"] = t
             if t < skip_until:
                 continue
             if pending_reset is not None:
@@ -91,7 +118,7 @@ def replay(path: str, interval: float, processing: float, verbose: bool):
                     pending_reset = ev
 
     pl.log.removeHandler(valve)
-    return counts, valve.count, events_detail
+    return counts, valve.count, events_detail, time_source
 
 
 def main() -> None:
@@ -99,15 +126,18 @@ def main() -> None:
     ap.add_argument("files", nargs="+",
                     help="JSONLパス（末尾に :実ターン数 を付けると照合する）")
     ap.add_argument("--interval", type=float, default=1.0,
-                    help="サンプリング間隔秒（0=全フレーム・デフォルト1.0=メインOCR相当）")
+                    help="サンプリング間隔（動画内時間の秒。0=全フレーム・"
+                         "デフォルト1.0=本番メインOCRの約1Hz相当）")
     ap.add_argument("--processing", type=float, default=12.0,
                     help="イベント処理ブロックの模擬秒数（デフォルト12）")
+    ap.add_argument("--fps", type=float, default=30.0,
+                    help="video_sec が無い旧JSONLで frame→動画内時間の換算に使うfps（デフォルト30）")
     ap.add_argument("--verbose", action="store_true",
                     help="フェーズ遷移・イベントのINFOログとイベント時系列を表示")
     args = ap.parse_args()
 
     header = (f"{'ファイル':<38} {'実T':>3} {'battle':>6} {'turn':>5} "
-              f"{'move':>5} {'faint':>5} {'switch':>6} {'end':>4} {'脱出弁':>6}  判定")
+              f"{'move':>5} {'faint':>5} {'switch':>6} {'end':>4} {'脱出弁':>6} {'時間軸':>9}  判定")
     print(header)
     print("-" * len(header))
     ok_all = True
@@ -117,7 +147,8 @@ def main() -> None:
             expected: int | None = int(exp)
         else:
             path, expected = spec, None
-        counts, valve_count, detail = replay(path, args.interval, args.processing, args.verbose)
+        counts, valve_count, detail, time_source = replay(
+            path, args.interval, args.processing, args.fps, args.verbose)
         b = counts.get("battle_start", 0)
         ts = counts.get("turn_start", 0)
         if expected is None:
@@ -129,7 +160,8 @@ def main() -> None:
             ok_all = False
         print(f"{Path(path).name:<38} {expected if expected is not None else '-':>3} "
               f"{b:>6} {ts:>5} {counts.get('move_used', 0):>5} {counts.get('faint', 0):>5} "
-              f"{counts.get('switch', 0):>6} {counts.get('battle_end', 0):>4} {valve_count:>6}  {mark}")
+              f"{counts.get('switch', 0):>6} {counts.get('battle_end', 0):>4} {valve_count:>6} "
+              f"{time_source:>9}  {mark}")
         if args.verbose:
             for d in detail:
                 print("    " + d)

@@ -526,7 +526,11 @@ class BattlePhaseClassifier:
     # 誤読バリエーションでノイズ混入はごく僅か。_COMM_RE自体が十分specificなため
     # conf閾値はほぼ無効化し、正規表現の一致自体を信頼する。
     _COMM_CONF_MIN = 0.0
-    _COMM_ENTRY_FRAMES   = 2    # 通信フェーズ入場に必要な連続検出フレーム数（単発誤検出の排除）
+    # 通信フェーズ入場に必要な連続検出秒数（単発誤検出・0.1〜0.3秒の微小ブリップの排除）。
+    # フレーム数ベース（旧_COMM_ENTRY_FRAMES=2）だとサンプリングレート依存になり、
+    # 30fpsリプレイでは0.07秒相当・本番1Hzでは2秒相当と挙動が変わってしまうため秒ベースに統一。
+    # 本番1Hzでは連続2フレーム目（1.0秒）で確定し、旧実装と同じ入場遅延になる。
+    _COMM_ENTRY_SEC      = 0.7
     _COMM_EXIT_GRACE_SEC = 3.0  # 通信フェーズ退出の猶予秒数（単発の取りこぼしを吸収）
     # 技選択画面の型相性ラベル（これが見えている = 技選択UI が開いている = command_select 継続）
     # 「こうかあり」はバトルメッセージには出ず技選択UIにのみ出現するため安全な指標
@@ -552,16 +556,24 @@ class BattlePhaseClassifier:
 
     # turn_start脱出弁: move_usedを取りこぼすと_allow_turn_start=Falseのまま固着し、
     # turn_startが恒久的にブロックされてターン番号がズレ続ける（診断ログで実測）。
-    # ターン内でも相手を見るパネル等でコマンド画面が最大80秒程度消えることがあるため、
-    # セッション区切りは実測のターン間ギャップ最小値（192秒）との間を取って120秒。
-    _CMD_SESSION_GAP_SEC   = 120.0  # コマンド画面がこの秒数以上消えていたら新セッション
-    _TURN_START_ESCAPE_SEC = 45.0   # 前回turn_start確定からこの秒数経過で脱出弁が開く
+    # 閾値は動画内時間（=本番実時間）で実測して決定（診断JSONL 7本・30fps全数OCR）:
+    #   セッション内のコマンド表示途切れ最大 5.7秒 < 10 < ターン間ギャップ最小 18.1秒
+    #   turn_start間隔の最小 19.5秒 > 15
+    # （旧値120/45秒はOCR処理時間で約11倍間延びした軸での実測に基づいており、
+    #   真の時間軸ではターン間ギャップより大きく、脱出弁がほぼ開かなかった）
+    _CMD_SESSION_GAP_SEC   = 10.0  # コマンド画面がこの秒数以上消えていたら新セッション
+    _TURN_START_ESCAPE_SEC = 15.0  # 前回turn_start確定からこの秒数経過で脱出弁が開く
     # faint再アーム: 「0/211」等は相手を見るパネルで最大210秒表示され続ける（実測）。
     # 表示がこの秒数以上途切れてから再出現した場合のみ新しいfaintイベントとして扱う。
     _FAINT_REARM_SEC = 20.0
 
-    def __init__(self, debounce_seconds: float = 10.0):
+    def __init__(self, debounce_seconds: float = 10.0, clock=None):
         self._debounce = debounce_seconds
+        # 時計注入: 動画検証では clock=（動画内時間を返す関数）を渡すことで、
+        # デバウンス・脱出弁45s・セッション区切り120s等の全時間閾値が
+        # 動画内時間で動き、本番（実時間=カメラ入力）と挙動が一致する。
+        # デフォルトは実時間（ライブカメラ運用）。
+        self._clock = clock if clock is not None else time.time
         self._last_event_time: dict[str, float] = {}
         self._prev_phase = "unknown"
         self._battle_started = False
@@ -571,14 +583,16 @@ class BattlePhaseClassifier:
         # debounceに依存せず完全にブロックする。
         self._allow_turn_start = False
         # 通信フェーズ平滑化（入場確認・退出猶予）
-        self._comm_streak = 0        # communication 連続検出フレーム数
-        self._comm_active = False    # 確定済み通信フェーズ中か
-        self._last_comm_seen = 0.0   # 最後に communication を検出した時刻
+        # 時刻の初期値は -inf: 動画内時間は0付近から始まるため、初期値0.0だと
+        # 「最後に見てから十分経過した」系の判定が動画冒頭で誤って偽になる。
+        self._comm_streak_start: float | None = None  # communication 連続検出の開始時刻
+        self._comm_active = False                     # 確定済み通信フェーズ中か
+        self._last_comm_seen = float("-inf")          # 最後に communication を検出した時刻
         # turn_start脱出弁・faint再アーム用の追跡
-        self._last_cmd_seen = 0.0          # 最後に command_select を見た時刻
-        self._cmd_session_start = 0.0      # 現在のコマンドセッションの開始時刻
-        self._last_turn_start_fired = 0.0  # 最後に turn_start / battle_start が確定した時刻
-        self._last_faint_seen = 0.0        # 最後に faint フェーズを見た時刻
+        self._last_cmd_seen = float("-inf")           # 最後に command_select を見た時刻
+        self._cmd_session_start: float | None = None  # 現在のコマンドセッションの開始時刻
+        self._last_turn_start_fired = float("-inf")   # 最後に turn_start / battle_start が確定した時刻
+        self._last_faint_seen = float("-inf")         # 最後に faint フェーズを見た時刻
 
     def set_processing(self, v: bool) -> None:
         self._is_processing = v
@@ -590,13 +604,14 @@ class BattlePhaseClassifier:
         move_used が即再発火する問題を防ぐ。
         """
         self._prev_phase = "unknown"
-        now = time.time()
+        now = self._clock()
         # move_used デバウンスを現在時刻に更新（処理完了直後の再発火を抑止）
         self._last_event_time["move_used"] = now
-        # faint後・move_used後は command_select 誤分類による turn_start 多重発火を抑制
-        # （move_used: アニメーション中に一瞬 command_select が映り turn_start が早期発火する問題）
-        if event_type in ("faint", "move_used"):
-            self._last_event_time["turn_start"] = now
+        # 注: 以前はfaint/move_used後にturn_startデバウンスも押し込んでいたが、
+        # 真の時間軸ではfaint直後の本物のコマンド画面（最短6秒後・実測）を握りつぶして
+        # ターン欠落の原因になっていたため撤去。turn_startの多重発火は
+        # _allow_turn_start フラグと15秒デバウンスで引き続き防がれる
+        # （診断JSONL 7本のリプレイで過剰カウントなしを確認済み）。
 
     def _is_communication(self, ocr_results: list[dict]) -> bool:
         """通信待機中/通信中の表示があるかをファジー判定する。"""
@@ -612,7 +627,7 @@ class BattlePhaseClassifier:
 
     def _smooth_communication(self, raw: str) -> str:
         """communication フェーズの入退場を平滑化する。
-        入場は連続 _COMM_ENTRY_FRAMES フレームで確定（単発誤検出の排除）、
+        入場は連続 _COMM_ENTRY_SEC 秒の検出で確定（単発誤検出・微小ブリップの排除）、
         退場は _COMM_EXIT_GRACE_SEC の猶予付き（取りこぼしによる move_used 多重発火の防止）。
         退場確定フレームでは実際の画面種別に関わらず "unknown" を返す:
         communication→command_select と直接遷移すると turn_start の prev 条件に
@@ -620,17 +635,18 @@ class BattlePhaseClassifier:
         必ず communication→unknown→(次フレームで実フェーズ) の順に遷移させる。
         """
         if raw == "battle_end":
-            self._comm_streak = 0
+            self._comm_streak_start = None
             self._comm_active = False
             return raw
-        now = time.time()
+        now = self._clock()
         if raw == "communication":
-            self._comm_streak += 1
+            if self._comm_streak_start is None:
+                self._comm_streak_start = now
             self._last_comm_seen = now
-            if not self._comm_active and self._comm_streak >= self._COMM_ENTRY_FRAMES:
+            if not self._comm_active and now - self._comm_streak_start >= self._COMM_ENTRY_SEC:
                 self._comm_active = True
             return "communication" if self._comm_active else "unknown"
-        self._comm_streak = 0
+        self._comm_streak_start = None
         if self._comm_active:
             if now - self._last_comm_seen < self._COMM_EXIT_GRACE_SEC:
                 return "communication"
@@ -678,7 +694,7 @@ class BattlePhaseClassifier:
         curr = self._smooth_communication(raw)
         prev = self._prev_phase
         self._prev_phase = curr
-        now = time.time()
+        now = self._clock()
 
         # コマンド画面の出現を追跡（脱出弁用: 長い空白の後の出現 = 新しいコマンドセッション）
         if curr == "command_select":
@@ -697,7 +713,7 @@ class BattlePhaseClassifier:
                 self._battle_started = False
                 # battle_end後の結果画面が command_select と誤分類されて
                 # turn_start が発火するのを抑制する
-                self._last_event_time["turn_start"] = time.time()
+                self._last_event_time["turn_start"] = now
                 log.info(f"[フェーズ] {prev} → {curr} | イベント: battle_end (実況中割り込み)")
                 return "battle_end"
             return None
@@ -736,7 +752,7 @@ class BattlePhaseClassifier:
             self._allow_turn_start = False
             # battle_end後の結果画面が command_select と誤分類されて
             # turn_start が発火するのを抑制する
-            self._last_event_time["turn_start"] = time.time()
+            self._last_event_time["turn_start"] = now
 
         # 脱出弁: move_used取りこぼしで_allow_turn_start=Falseのまま固着した場合の回復措置。
         # 新しいコマンドセッションの2フレーム目以降（開始10秒以内）かつ前回turn_start確定から
@@ -744,7 +760,7 @@ class BattlePhaseClassifier:
         # （通常経路がデバウンスで握りつぶされた場合も次フレームでここが拾う）
         escape = False
         if (event is None and curr == "command_select" and self._battle_started
-                and self._cmd_session_start > 0
+                and self._cmd_session_start is not None
                 and 0 < now - self._cmd_session_start <= 10.0
                 and now - self._last_turn_start_fired >= self._TURN_START_ESCAPE_SEC):
             event = "turn_start"
@@ -761,15 +777,18 @@ class BattlePhaseClassifier:
         if event:
             no_debounce = {"battle_start", "battle_end"}
             debounce = self._DEBOUNCE_OVERRIDES.get(event, self._debounce)
-            last = self._last_event_time.get(event, 0.0)
+            # デフォルト -inf: 時計の原点が0付近（動画内時間）でも初回イベントが誤デバウンスされない
+            last = self._last_event_time.get(event, float("-inf"))
             if event not in no_debounce and not escape and now - last < debounce:
                 log.debug(f"デバウンス中のためスキップ: {event} (残り {debounce-(now-last):.1f}s)")
                 return None
             self._last_event_time[event] = now
             if event == "move_used":
-                # move_used確定 → 次のコマンド選択でturn_startを許可
+                # move_used確定 → 次のコマンド選択でturn_startを許可。
+                # 注: 以前はここでturn_startデバウンスも押し込んでいたが、本物のコマンド画面は
+                # 通信フェーズ終了の数秒後（最短0.1秒・実測）に来るため、15秒デバウンスが
+                # 直後の正当なturn_startを握りつぶしてターン欠落の主因になっていた（撤去済み）。
                 self._allow_turn_start = True
-                self._last_event_time["turn_start"] = now
             elif event == "turn_start":
                 # turn_start確定 → 次のmove_usedまでturn_startを禁止
                 # （1匹目→2匹目コマンド選択中の余分なturn_startをdebounce非依存でブロック）
@@ -1937,7 +1956,10 @@ class Pipeline:
         self._interval = interval
         self._ec2_url = ec2_url
         self._diff_detector = DiffDetector()             # 静止フレームのスキップ用
-        self._phase_classifier = BattlePhaseClassifier() # フェーズ分類 + イベント検知
+        # 動画モードでは run() が毎フレーム _video_now に動画内時間をセットする。
+        # ライブモード（None のまま）では実時間にフォールバック。
+        self._video_now: float | None = None
+        self._phase_classifier = BattlePhaseClassifier(clock=self._now)  # フェーズ分類 + イベント検知
         self._last_ocr_time: float = 0.0                  # 定期OCR用タイマー
         self._PERIODIC_OCR_INTERVAL_BATTLE = 1.5         # バトル中: 終了画面を取りこぼさないよう短め
         self._PERIODIC_OCR_INTERVAL_IDLE   = 3.0         # バトル外: 重くならないよう長め
@@ -1983,6 +2005,14 @@ class Pipeline:
 
         log.info("=== 初期化完了 ===")
 
+    def _now(self) -> float:
+        """BattlePhaseClassifier 用の時計。
+        動画モードでは動画内時間（frame_pos / fps）、ライブでは実時間を返す。
+        動画のフレームはOCR処理時間と無関係にフレーム数で進むため、実時間を使うと
+        デバウンス・脱出弁等の時間閾値が約10倍間延びした軸で動いてしまう（実測）。
+        """
+        return self._video_now if self._video_now is not None else time.time()
+
     def run(self) -> None:
         _is_video = self._video_path is not None
         cap = cv2.VideoCapture(self._video_path if _is_video else self._camera_index)
@@ -2018,6 +2048,9 @@ class Pipeline:
                 loop_start = time.perf_counter()
 
                 ret, frame = cap.read()
+                if ret and _is_video:
+                    # 今読んだフレームの動画内時間を classifier の時計に反映
+                    self._video_now = _video_frame_pos / fps
                 if not ret:
                     if _is_video:
                         log.info("動画ファイルの末尾に達しました。終了します。")
@@ -2082,7 +2115,9 @@ class Pipeline:
                                 finally:
                                     self._phase_classifier.set_processing(False)
                                     self._phase_classifier._battle_started = False
-                                    self._phase_classifier._last_event_time["turn_start"] = time.time()
+                                    # classifier の時計（動画モードでは動画内時間）で書き込む。
+                                    # time.time() だと動画モードで時計の原点が異なり debounce 判定が壊れる
+                                    self._phase_classifier._last_event_time["turn_start"] = self._now()
                                 continue
                     else:
                         self._end_screen_count = 0
