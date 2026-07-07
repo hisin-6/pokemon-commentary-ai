@@ -101,6 +101,21 @@ class HpBarAnalyzer:
         """指定スロットの満タン幅を手動設定する。"""
         self._observed_max[slot_key] = width
 
+    def reset_slot(self, slot_key: str) -> None:
+        """スロットの安定化状態をリセットする（占有ポケモンの交代時に呼ぶ）。
+        _last_stable はスロット（画面位置）に紐づくため、中のポケモンが交代しても
+        前のポケモンの確定値を返し続ける。リセットしないと交代直後のアニメーション中
+        （バー非表示）に新しいポケモンへ前任者のHP%が付与される（実機で確認）。
+        """
+        if slot_key in self._buf:
+            self._buf[slot_key] = []
+            self._last_stable[slot_key] = None
+
+    def reset(self) -> None:
+        """全スロットの安定化状態をリセットする（試合開始時に呼ぶ）。"""
+        for key in self._slots:
+            self.reset_slot(key)
+
     def analyze(self, frame: np.ndarray) -> dict[str, float | None]:
         """
         フレームを解析して各スロットのHP%を返す。

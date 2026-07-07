@@ -926,6 +926,10 @@ class BattleMessageParser:
         r'もどれ[、,]\s*(.{2,12})'          # SV: もどれ、〇〇（ひらがな）
         r'|(.{2,12})と\s*こうたいした'       # 交代技: 〇〇とこうたいした
         r'|(\S{2,12})\s*戻れ'               # Champions: 〇〇\n戻れ！（漢字）
+        r'|([^\s]{2,12})を\s*引っ?[こ込]めた'  # 相手: 「(名前)は 〇〇を 引っこめた！」
+        # 相手の引っ込めを取りこぼすと、そのポケモンが on_field のまま古い
+        # slot_index を保持し続け、交代で入った別ポケモンと互いのHPバーを
+        # 読み合う完全反転が起きる（実機で確認: リザードン⇔ガブリアス）
     )
     # 状態異常メッセージ: 「〇〇は まひじょうたいになった」等
     _STATUS_RE = re.compile(
@@ -991,7 +995,8 @@ class BattleMessageParser:
 
             m = self._SWITCH_OUT_RE.search(text)
             if m:
-                _emit("switch_out", (m.group(1) or m.group(2) or m.group(3) or ""))
+                _emit("switch_out",
+                      (m.group(1) or m.group(2) or m.group(3) or m.group(4) or ""))
 
         # 状態異常はROI外も含めた全OCRから検索（メッセージ表示フレームを取りこぼす場合に備える）
         full_text = " ".join(r["text"] for r in ocr_results if r["confidence"] >= 0.35)
@@ -1017,7 +1022,9 @@ class FieldPokemon:
     """1匹のポケモンの戦況スロット（ダブルバトル対応）。"""
     name: str
     hp: str | None = None                        # "176/176" 形式（最新HP）
+    hp_turn: int = -1                             # hp を最後に更新した内部ターン（鮮度比較用）
     hp_pct_pixel: float | None = None            # ピクセル解析によるHP% (0.0-1.0)
+    hp_px_turn: int = -1                          # hp_pct_pixel を最後に更新した内部ターン
     status: str | None = None                    # まひ / やけど / どく / ひんし
     moves_used: list[str] = field(default_factory=list)  # このポケモンが使った技リスト
     on_field: bool = False                        # 現在場にいるか
@@ -1053,6 +1060,10 @@ class BattleStateTracker:
         self._event_log: list[str] = []
         # 低信頼経路（定期OCR）の新規登録ヒステリシス: (側, 名前) → (目撃数, 最終目撃turn)
         self._pending_new: dict[tuple[str, str], tuple[int, int]] = {}
+        # スロット占有者の追跡（key例: "player_0"）と交代時コールバック
+        # （HpBarAnalyzerの安定化状態リセット用。PipelineRunnerが接続する）
+        self._slot_occupant: dict[str, str] = {}
+        self.slot_reset_cb = None  # Callable[[str], None] | None
         # ボール数トラッキング（気絶推定・控え不明表示用）
         self._prev_opponent_alive: int | None = None  # 前ターンの相手生存数
         self._player_alive_count:  int | None = None  # 最新の自分生存数
@@ -1193,6 +1204,38 @@ class BattleStateTracker:
                 if i < len(on_field):
                     on_field[i].hp = hp
 
+    def assign_slots_from_ocr(
+        self,
+        player_name_cx: list[tuple[str, float]],
+        opponent_name_cx: list[tuple[str, float]],
+        command_cy: float | None = None,
+    ) -> None:
+        """定期OCRの名前+x座標からスロット番号を割り当てる（イベント外の補完）。
+        イベント発火時のフレームはメッセージ画面等で相手ネームプレートが読めない
+        ことが多く、update() 内の割当だけでは相手側の slot_index がほぼ付かない
+        （実機で確認: 相手側のHPpxが1件も取れなかった）。
+
+        command_cy が行動選択画面の範囲（300〜450）にある時のみ割り当てる:
+        「相手を見る」パネル等では名前が本来と違う位置に表示され、そのcxで
+        割り当てると別スロットのバーを読む誤割当が起きる（実機で確認:
+        リザードン再登場後にガブリアスのバー位置へ誤割当）。
+        """
+        if command_cy is None or not (300 <= command_cy <= 450):
+            return
+        self._release_stale_slot_indices()
+        self._assign_slot_indices(self._player,   player_name_cx)
+        self._assign_slot_indices(self._opponent, opponent_name_cx)
+
+    def _release_stale_slot_indices(self) -> None:
+        """場を離れたポケモン（交代・気絶・不検出降ろし）の slot_index を解放する。
+        物理スロット位置は交代のたびに入れ替わるため、古い slot_index を持ったまま
+        再登場すると別のポケモンのHPバーを読み続ける（実機で確認: リザードンが
+        T1の位置のままガブリアスのバー42%を「リザードン43%」として表示し続けた）。
+        """
+        for s in self._player + self._opponent:
+            if not s.on_field and s.slot_index is not None:
+                s.slot_index = None
+
     def _assign_slot_indices(
         self,
         slots: list[FieldPokemon],
@@ -1228,9 +1271,11 @@ class BattleStateTracker:
             candidates[0][0].slot_index = available[0]
             log.info(f"[スロット] {candidates[0][0].name} → スロット{available[0]} (cx={candidates[0][1]:.0f}, 空きスロット割当)")
         else:
-            for i, (slot, cx) in enumerate(candidates[:2]):
-                slot.slot_index = i
-                log.info(f"[スロット] {slot.name} → スロット{slot.slot_index} (cx={cx:.0f})")
+            # 空きスロット番号のみを cx 昇順の候補に割り当てる
+            # （固定で0,1を振ると使用中スロットと重複し、同じバーを2匹が読む）
+            for (slot, cx), idx in zip(candidates, available):
+                slot.slot_index = idx
+                log.info(f"[スロット] {slot.name} → スロット{idx} (cx={cx:.0f})")
 
     def _assign_hp_by_slot(
         self,
@@ -1259,15 +1304,17 @@ class BattleStateTracker:
                 i = slot.slot_index
                 if i < len(effective) and effective[i]:
                     slot.hp = effective[i]
+                    slot.hp_turn = self.turn
                     assigned_slots.add(i)
 
-        # パス2: slot_index 未設定のポケモンは残りのHP値をインデックス順で割り当て
+        # パス2: slot_index 未設定のポケモンは「1対1で曖昧さがない場合のみ」割り当てる。
+        # 2匹以上を登録順×x座標順で機械的にzipすると左右スワップが起きる
+        # （実機で確認: T1でプテラのHP157がオオニューラに付いた）
         remaining_hp = [hp for i, hp in enumerate(effective) if i not in assigned_slots and hp]
-        idx = 0
-        for slot in on_field:
-            if slot.slot_index is None and idx < len(remaining_hp):
-                slot.hp = remaining_hp[idx]
-                idx += 1
+        unassigned = [s for s in on_field if s.slot_index is None]
+        if len(unassigned) == 1 and len(remaining_hp) == 1:
+            unassigned[0].hp = remaining_hp[0]
+            unassigned[0].hp_turn = self.turn
 
     # ── メイン更新 ───────────────────────────────────────────────────────────
 
@@ -1344,6 +1391,8 @@ class BattleStateTracker:
         # 画面左側に集まって表示されるためスロット判定が不正確になる。
         # turn_start/move_used 以降の安定したフレームでのみスロットを確定する。
         if event_type != "battle_start":
+            # 場を離れたポケモンの古い slot_index を解放してから割り当てる
+            self._release_stale_slot_indices()
             player_name_cx   = game_state.get("name_player_with_cx", [])
             opponent_name_cx = game_state.get("name_opponent_with_cx", [])
             self._assign_slot_indices(self._player,   player_name_cx)
@@ -1527,6 +1576,8 @@ class BattleStateTracker:
         slot_index 設定済みポケモンに優先割り当て。未設定が1匹だけなら
         物理スロット位置から早期割り当てを行う（T2等のOCR取得前フレームに対応）。
         """
+        # 場を離れたポケモンの古い slot_index を解放（再登場時の別バー誤読防止）
+        self._release_stale_slot_indices()
         side_map: dict[str, tuple[list[FieldPokemon], int]] = {
             "player_0":   (self._player,   0),
             "player_1":   (self._player,   1),
@@ -1542,22 +1593,51 @@ class BattleStateTracker:
             matched = False
             for p in slots:
                 if p.on_field and p.slot_index == slot_idx:
+                    if self._claim_slot(key, p.name):
+                        break  # 占有者交代を検知 → 今サイクルの値は前任者のものなのでスキップ
                     old = p.hp_pct_pixel
                     p.hp_pct_pixel = pct
+                    p.hp_px_turn = self.turn
                     if old is None or abs(pct - old) >= 0.05:
                         log.info("[HPpx] %s %s → %.1f%%", key, p.name, pct * 100)
                     matched = True
                     break
 
-            # パス2: 未割り当てが1匹だけなら位置ベース早期割り当て
+            # パス2: 未割り当てが1匹だけなら位置ベース早期割り当て。
+            # ただし同サイドの両スロットに読み値があり、もう一方のスロットの主が
+            # 不明な場合はどちらのバーか判別できないため保留する
+            # （実機で確認: 相手2匹中1匹しか把握していない時に左バーへ誤割当され、
+            #   リザードンがガブリアスのバー42%を読み続けた）
             if not matched:
                 unassigned = [p for p in slots if p.on_field and p.slot_index is None]
-                if len(unassigned) == 1:
+                other_idx = 1 - slot_idx
+                other_key = key.rsplit("_", 1)[0] + f"_{other_idx}"
+                other_held = any(q.on_field and q.slot_index == other_idx for q in slots)
+                unambiguous = other_held or pixel_hp.get(other_key) is None
+                if len(unassigned) == 1 and unambiguous:
                     p = unassigned[0]
                     p.slot_index = slot_idx
                     log.info("[スロット早期割] %s → スロット%d (HPpxフォールバック)", p.name, slot_idx)
+                    if self._claim_slot(key, p.name):
+                        continue  # 占有者交代 → 前任者の値はスキップ（次サイクル以降の新確定値を待つ）
                     p.hp_pct_pixel = pct
+                    p.hp_px_turn = self.turn
                     log.info("[HPpx] %s %s → %.1f%%", key, p.name, pct * 100)
+
+    def _claim_slot(self, key: str, name: str) -> bool:
+        """物理スロットの占有者を更新する。占有者が交代した場合 True を返し、
+        コールバック（HpBarAnalyzerの安定化状態リセット）を呼ぶ。
+        アナライザーの確定値はスロット（画面位置）に紐づくため、交代直後は
+        前任ポケモンの値が返り続ける。リセットして新しい確定値を待つ。"""
+        prev = self._slot_occupant.get(key)
+        if prev == name:
+            return False
+        self._slot_occupant[key] = name
+        if prev is not None and self.slot_reset_cb is not None:
+            log.info("[HPpx] %s 占有者交代 %s → %s（安定化リセット）", key, prev, name)
+            self.slot_reset_cb(key)
+            return True
+        return False
 
     def update_move(self, pokemon_name: str, move_name: str, is_opponent: bool = False) -> None:
         """ポケモンが技を使ったことを記録する（per-pokemon 技リスト更新）。
@@ -1714,12 +1794,20 @@ class BattleStateTracker:
     # ── コンテキスト生成 ─────────────────────────────────────────────────────
 
     def _format_pokemon(self, p: FieldPokemon) -> str:
-        """場にいるポケモンの詳細フォーマット（HP・状態異常・使用技を含む）。"""
+        """場にいるポケモンの詳細フォーマット（HP・状態異常・使用技を含む）。
+
+        HP表示は「より新しく更新された方」を採用する:
+        OCR数値HP（62/135等・正確）が同ターン以降に取れていればそれを優先し、
+        古い場合のみHPpx（ピクセル解析・近似値）を表示する。
+        従来のHPpx無条件優先は、アニメーション中に更新が止まった古いpx値が
+        正確な数値HPを隠す問題があった（実機で確認）。
+        """
         s = p.name
         if p.status:
             s += f"({p.status})"
-        if p.hp_pct_pixel is not None:
-            # HPpx優先（座標固定で2匹を独立計測）
+        px_is_fresher = (p.hp_pct_pixel is not None
+                         and (p.hp is None or p.hp_px_turn > p.hp_turn))
+        if px_is_fresher:
             pct_px = p.hp_pct_pixel * 100
             s += f" HP:{pct_px:.0f}%(px)"
             if pct_px <= 25:
@@ -2060,6 +2148,8 @@ class Pipeline:
         self._PERIODIC_OCR_INTERVAL_IDLE   = 3.0         # バトル外: 重くならないよう長め
         self._battle_tracker = BattleStateTracker()       # 戦況累積
         self._hpbar_analyzer = HpBarAnalyzer()             # HPバーピクセル解析
+        # スロット占有者交代時にアナライザーの安定化状態をリセットする配線
+        self._battle_tracker.slot_reset_cb = self._hpbar_analyzer.reset_slot
         self._msg_parser = BattleMessageParser()           # バトルメッセージ解析
         self._battle_active = False  # battle_start〜battle_end の間のみ True
         self._last_battle_end_time: float = 0.0  # battle_end 後のクールダウン用
@@ -2217,6 +2307,15 @@ class Pipeline:
                     else:
                         self._end_screen_count = 0
 
+                # ── HPバーピクセル解析（バトル中は毎フレーム）────────────────
+                # 軽量なピクセル処理のためOCRサイクルに依存させない。
+                # コマンド画面は静止していてdiff検出が発火せず、OCRゲート内（旧実装）だと
+                # 定期1.5秒間隔のみ→安定化フィルタ（連続6サンプル）が埋まらず
+                # HP%がほぼ更新されなかった（実機で確認）
+                if self._battle_active:
+                    _pixel_hp = self._hpbar_analyzer.analyze(frame)
+                    self._battle_tracker.update_pixel_hp(_pixel_hp)
+
                 # ── 差分検出（静止フレームの OCR スキップ用）────────────────
                 diff_changed, diff_score = self._diff_detector.detect(frame)
                 now = time.perf_counter()
@@ -2240,10 +2339,7 @@ class Pipeline:
                     if periodic_ocr and ocr_results:
                         _save_ocr_debug_image(frame, ocr_results, turn * 1000 + int(now) % 1000)
 
-                    # ── HPバーピクセル解析（バトル中の毎OCRサイクル）──────────
                     if self._battle_active:
-                        pixel_hp = self._hpbar_analyzer.analyze(frame)
-                        self._battle_tracker.update_pixel_hp(pixel_hp)
                         # 定期OCRでも自分側ポケモン名を蓄積（battle_start時に映らなかったポケモンの補完）
                         # イベントOCRに比べてUIノイズが多いため、y座標分類済みのみを対象とする
                         if ocr_results:
@@ -2252,6 +2348,13 @@ class Pipeline:
                             _periodic_opp = _periodic_gs.get("name_candidates_opponent", [])
                             for _pname in _periodic_player:
                                 self._battle_tracker.accumulate_player_name(_pname, _periodic_opp)
+                            # スロット番号の補完割当（イベント時フレームでは相手名が
+                            # 読めないことが多く、ここでの割当が相手側HPpxの生命線。
+                            # command_cyゲート付き=行動選択画面のみ）
+                            self._battle_tracker.assign_slots_from_ocr(
+                                _periodic_gs.get("name_player_with_cx", []),
+                                _periodic_gs.get("name_opponent_with_cx", []),
+                                _periodic_gs.get("command_cy"))
 
                     # ── 技使用・交代メッセージの検出（バトル中は常時監視）──────
                     if self._battle_active:
@@ -2542,6 +2645,9 @@ class Pipeline:
         if event_type == "battle_start":
             # バトル開始: トラッカーをリセットしてアクティブ化
             self._battle_tracker = BattleStateTracker()
+            self._battle_tracker.slot_reset_cb = self._hpbar_analyzer.reset_slot
+            # アナライザーの確定値も前試合・試合前画面の値が残るためリセット
+            self._hpbar_analyzer.reset()
             self._battle_active = True
             self._battle_active_since = time.time()
             self._end_screen_count = 0
