@@ -398,10 +398,21 @@ class TestBattlePhaseClassifier:
         assert event is None
 
     def test_detect_move_used_on_communication_to_animation(self):
-        """move_used は 通信待機中→バトルアニメーション の遷移で発火する（Champions方式）。"""
-        self.clf.detect(self._ocr_list("たたかう"))   # battle_start
-        self.clf.detect(self._ocr_list("通信中"))     # communication
-        event = self.clf.detect(self._ocr_list("バツグンだ"))  # move_used
+        """move_used は 通信待機中→バトルアニメーション の遷移で発火する（Champions方式）。
+
+        通信フェーズ平滑化の仕様に合わせて clock 注入で時間を進める:
+          入場 = 連続 _COMM_ENTRY_SEC（0.7秒）以上の検出で確定
+          退場 = _COMM_EXIT_GRACE_SEC（3秒）以上検出が途切れて確定
+        """
+        t = {"now": 0.0}
+        clf = BattlePhaseClassifier(debounce_seconds=0.0, clock=lambda: t["now"])
+        clf.detect(self._ocr_list("たたかう"))    # battle_start
+        t["now"] = 10.0
+        clf.detect(self._ocr_list("通信中"))      # communication 検出開始
+        t["now"] = 11.0
+        clf.detect(self._ocr_list("通信中"))      # 連続0.7秒以上 → 通信フェーズ確定
+        t["now"] = 15.0                            # 退出猶予3秒を超えて通信表示が消える
+        event = clf.detect(self._ocr_list("バツグンだ"))  # move_used
         assert event == "move_used"
 
     def test_detect_switch_on_command_to_switch_select(self):
