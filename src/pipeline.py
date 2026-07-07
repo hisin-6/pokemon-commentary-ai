@@ -142,6 +142,15 @@ _UI_OVERLAY_WORDS = {
 # 部分一致で弾くシステムテキストのキーワード（ポケモン名に含まれないもの）
 _UI_OVERLAY_SUBSTRINGS = {"通信待機", "待機中", "通信中"}
 
+# 漢字のみのUIラベル（中国語ポケモン名フォールバックの除外リスト）
+# 相手エリアに出る「かなを含まない漢字テキスト」は中国語名として素通しされるため、
+# 日本語UIの漢字ラベルを明示的に除外する（実機で「能力」が幽霊登録された）
+_CJK_UI_WORDS = {
+    "能力", "特性", "持ち物", "状態", "急所", "選出", "交代", "通信", "待機",
+    "説明", "戻", "勝負", "降参", "接続", "対戦", "観戦", "設定", "確認",
+    "決定", "中止", "終了", "順番", "変更", "相手", "自分", "味方", "技",
+}
+
 
 def _ocr_results_to_text(
     ocr_results: list[dict],
@@ -344,7 +353,9 @@ def _extract_structured_info(
                         and 2 <= len(text) <= 8):
                     has_cjk  = any('\u4e00' <= c <= '\u9fff' for c in text)
                     has_kana = any('\u3040' <= c <= '\u30ff' for c in text)
-                    if has_cjk and not has_kana:
+                    # 日本語UIの漢字ラベルがこのフォールバックを通過して幽霊登録される
+                    # （実機で「能力」が相手ポケモンとして登録され場スロットまで占有した）ため除外
+                    if has_cjk and not has_kana and text not in _CJK_UI_WORDS:
                         log.debug("中国語ポケモン名候補: %s", text)
                         name_opponent_with_xy.append((text, center_x, center_y))
                 # ポケモン名でなければ除外（技・特性・アイテム・不明）
@@ -1040,6 +1051,8 @@ class BattleStateTracker:
         self._player:   list[FieldPokemon] = []  # 自分の最大4匹
         self._opponent: list[FieldPokemon] = []  # 相手の最大4匹
         self._event_log: list[str] = []
+        # 低信頼経路（定期OCR）の新規登録ヒステリシス: (側, 名前) → (目撃数, 最終目撃turn)
+        self._pending_new: dict[tuple[str, str], tuple[int, int]] = {}
         # ボール数トラッキング（気絶推定・控え不明表示用）
         self._prev_opponent_alive: int | None = None  # 前ターンの相手生存数
         self._player_alive_count:  int | None = None  # 最新の自分生存数
@@ -1049,10 +1062,30 @@ class BattleStateTracker:
 
     # 前方一致吸収の最小文字数: 2文字名（ピィ等）同士の偶発一致を避ける
     _ABSORB_MIN_LEN = 3
+    # 低信頼経路（定期OCR）の新規登録ヒステリシス:
+    # 1フレームのOCRノイズがPokeClassifierで実在名に化けて登録される幽霊
+    # （ラン→トランセル等・実機で頻発）を防ぐため、複数サイクルの連続目撃を要求する
+    _NEW_NAME_CONFIRM_COUNT = 2   # 新規登録に必要な目撃サイクル数
+    _NEW_NAME_PENDING_TTL   = 8   # この内部ターン数以上空いたら目撃カウントを失効
+
+    def _confirm_new_name(self, side: str, name: str) -> bool:
+        """低信頼経路の新規名を _NEW_NAME_CONFIRM_COUNT 回目撃するまで保留する。"""
+        cnt, last = self._pending_new.get((side, name), (0, -999))
+        if self.turn - last > self._NEW_NAME_PENDING_TTL:
+            cnt = 0
+        cnt += 1
+        self._pending_new[(side, name)] = (cnt, self.turn)
+        if cnt < self._NEW_NAME_CONFIRM_COUNT:
+            log.info(f"[戦況] 新規名 {name}（{side}）を保留（目撃{cnt}回・{self._NEW_NAME_CONFIRM_COUNT}回で登録）")
+            return False
+        return True
 
     def _get_or_create(self, slots: list[FieldPokemon], name: str,
-                       allow_evict: bool = True) -> FieldPokemon | None:
+                       low_trust: bool = False) -> FieldPokemon | None:
         """名前でスロットを検索。なければ新規作成（MAX_SLOTS を超えたら None）。
+
+        low_trust=True は定期OCR由来の経路（update の名前蓄積・accumulate_player_name）。
+        メッセージ確認済みの高信頼経路（繰り出し/ゆけっ！検出）は False（デフォルト）。
 
         幽霊ポケモン対策:
         ①前方一致吸収: OCRの末尾欠け誤読（リザードン→リザード）で同一ポケモンが
@@ -1060,12 +1093,12 @@ class BattleStateTracker:
           同一個体とみなし、スロット名は長い方に揃える。
           注: ゴース/ゴーストのような実在の前方一致ペアは誤吸収するが、
           同一チームに揃う確率よりOCR末尾欠け誤読の頻度の方が圧倒的に高い。
-        ②満杯時eviction（allow_evict=True時のみ）: 満杯で新規登録できない場合、
-          場におらず未気絶で目撃回数（confidence）最少のスロットを幽霊とみなして
-          削除する（幽霊が1枠を永久占有し本物の4匹目が登録不可になる問題の防止）。
-          evictionは繰り出しメッセージ等で名前が確認された高信頼経路のみに許可する。
-          定期OCR由来の低信頼経路（allow_evict=False）に許すと、相手の繰り出し
-          メッセージの誤分類などで本物のスロットが道連れ削除される（実機で確認）。
+        ②新規登録ヒステリシス（low_trust時のみ）: 新規名は複数サイクルの連続目撃で
+          確定するまでスロットを作らない（1フレームのノイズ由来の幽霊登録防止）。
+        ③満杯時eviction（高信頼経路のみ）: 満杯で新規登録できない場合、場におらず
+          未気絶で目撃回数（confidence）最少のスロットを幽霊とみなして削除する。
+          低信頼経路に許すと相手繰り出しメッセージの誤分類などで本物のスロットが
+          道連れ削除される（実機で確認）。
         """
         for s in slots:
             if s.name == name:
@@ -1081,12 +1114,16 @@ class BattleStateTracker:
                 log.info(f"[戦況] ロスターの {s.name} を {name} に更新（前方一致吸収）")
                 s.name = name
                 return s
+        # ②新規登録ヒステリシス（低信頼経路のみ）
+        side = "自分側" if slots is self._player else "相手側"
+        if low_trust and not self._confirm_new_name(side, name):
+            return None
         if len(slots) < self.MAX_SLOTS:
             slot = FieldPokemon(name=name)
             slots.append(slot)
             return slot
-        # ②満杯時eviction（場にいる・気絶済みスロットは本物確定なので対象外）
-        candidates = [s for s in slots if not s.on_field and not s.fainted] if allow_evict else []
+        # ③満杯時eviction（場にいる・気絶済みスロットは本物確定なので対象外）
+        candidates = [s for s in slots if not s.on_field and not s.fainted] if not low_trust else []
         if candidates:
             victim = min(candidates, key=lambda s: s.confidence)
             slots.remove(victim)
@@ -1250,7 +1287,7 @@ class BattleStateTracker:
             already_in_player_slots = any(s.name == name for s in self._player)
             if already_in_opponent and not already_in_player_slots and name not in current_opponent_names:
                 continue  # 相手側にのみ登録済みで相手エリアにも見えていない → 誤分類として除外
-            slot = self._get_or_create(self._player, name, allow_evict=False)
+            slot = self._get_or_create(self._player, name, low_trust=True)
             if slot:
                 slot.confidence += 1
                 slot.last_seen_turn = self.turn
@@ -1269,7 +1306,7 @@ class BattleStateTracker:
             already_in_player = any(s.name == name for s in self._player)
             if already_in_player and name not in current_player_names:
                 continue  # 自分側に登録済みで自分エリアにも見えていない → 誤分類として除外
-            slot = self._get_or_create(self._opponent, name, allow_evict=False)
+            slot = self._get_or_create(self._opponent, name, low_trust=True)
             if slot:
                 slot.confidence += 1
                 slot.last_seen_turn = self.turn
@@ -1586,15 +1623,27 @@ class BattleStateTracker:
         """相手側のポケモン気絶確認（「相手の〇〇はたおれた」メッセージ）。"""
         return self._confirm_faint_on_side(self._opponent, name)
 
-    def accumulate_player_name(self, name: str) -> None:
+    def accumulate_player_name(self, name: str,
+                               opponent_candidates: list[str] | None = None) -> None:
         """定期OCRで検出されたプレイヤーポケモン名を蓄積する（イベント以外の補完用）。
         相手側に同名ポケモンがいる場合はスキップ（y座標誤分類対策）。
+        opponent_candidates: 同一フレームで相手エリアに見えている名前（渡されると
+        その名前は相手側の誤分類とみなしてスキップする）。
         未登録なら新規スロットを作成して on_field=True にする。
         ダブルバトル上限（場2匹）を超える場合は新規追加しない。
         """
-        already_in_opponent = any(s.name == name for s in self._opponent)
+        # 相手を見るパネル等では相手ポケモン名が画面中央（y>500=自分エリア扱い）に
+        # 表示され、自分側に誤蓄積される（実機でユキメノコ・ロトムが自分側に混入）。
+        # 相手ロスターとの照合は前方一致（OCR末尾欠け）も含めて行う
+        already_in_opponent = any(
+            s.name == name
+            or (min(len(s.name), len(name)) >= self._ABSORB_MIN_LEN
+                and (s.name.startswith(name) or name.startswith(s.name)))
+            for s in self._opponent)
         if already_in_opponent:
             return
+        if opponent_candidates and name in opponent_candidates:
+            return  # 同一フレームで相手エリアにも見えている → 相手側の誤分類
         on_field_count = sum(1 for s in self._player if s.on_field and not s.fainted)
         already_in_player = any(s.name == name for s in self._player)
         if already_in_player:
@@ -1610,8 +1659,9 @@ class BattleStateTracker:
             return
         if on_field_count >= 2:
             return  # ダブルバトル上限: 新規追加しない
-        # 定期OCRは相手繰り出しメッセージ等の誤分類が混入しうる低信頼経路のため eviction 禁止
-        slot = self._get_or_create(self._player, name, allow_evict=False)
+        # 定期OCRは相手繰り出しメッセージ等の誤分類が混入しうる低信頼経路
+        # （eviction禁止＋新規登録ヒステリシス）
+        slot = self._get_or_create(self._player, name, low_trust=True)
         if slot and not slot.fainted:
             slot.on_field = True
             slot.last_seen_turn = self.turn
@@ -1634,6 +1684,9 @@ class BattleStateTracker:
             slot.last_seen_turn = self.turn
             log.info(f"[戦況] {slot.name} 繰り出し確認（メッセージ由来）")
             return True
+        if slot is None:
+            # 実機でフラエッテがこの経路で無言のまま登録失敗していた（幽霊が場を占有）
+            log.warning(f"[戦況] 自分スロットが満杯のため {name} を登録できません")
         return False
 
     def register_opponent_on_field(self, name: str) -> bool:
@@ -2196,8 +2249,9 @@ class Pipeline:
                         if ocr_results:
                             _periodic_gs = _extract_structured_info(ocr_results, self._classifier)
                             _periodic_player = _periodic_gs.get("name_candidates_player", [])
+                            _periodic_opp = _periodic_gs.get("name_candidates_opponent", [])
                             for _pname in _periodic_player:
-                                self._battle_tracker.accumulate_player_name(_pname)
+                                self._battle_tracker.accumulate_player_name(_pname, _periodic_opp)
 
                     # ── 技使用・交代メッセージの検出（バトル中は常時監視）──────
                     if self._battle_active:

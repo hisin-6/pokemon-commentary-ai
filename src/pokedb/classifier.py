@@ -160,6 +160,13 @@ class PokeClassifier:
         if best.score < CANDIDATE_THRESHOLD:
             return _UNKNOWN
 
+        # 短断片ゲート: 3文字以下の入力はWRatioのpartial一致が実質無意味で、
+        # OCRノイズ断片が実在名に化ける（実測: ラン→トランセル90・オニ→オニスズメ90・
+        # スピ→スピアー90・ゲン→ケンタロス90）。正読・正規化バリアント一致なら
+        # 100が出るため、95未満は棄却する（プデラ→プテラ100等は影響なし）。
+        if len(text) <= 3 and best.score < 95:
+            return _UNKNOWN
+
         return best
 
     def _best_match(
