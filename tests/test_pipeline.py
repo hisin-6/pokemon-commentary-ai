@@ -706,6 +706,85 @@ class TestBattleStateTracker:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# スロット番号割り当て（_assign_slot_indices・HPスロット反転バグの回帰ガード）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSlotIndexAssignment:
+    """ネームプレートcxによる物理スロット（0=左, 1=右）の割り当て。
+    バー中心x（player: 292/688・opponent: 1336/1732）は hpbar_analyzer 実測値。
+    """
+
+    def setup_method(self):
+        self.tracker = BattleStateTracker()
+
+    def _add(self, side, name):
+        slots = self.tracker._player if side == "player" else self.tracker._opponent
+        p = FieldPokemon(name=name, on_field=True)
+        slots.append(p)
+        return p
+
+    def test_single_candidate_right_bar_gets_slot1(self):
+        """両スロット空き＋候補1匹が右バー位置 → スロット1。
+        旧実装は zip で cx 無視のスロット0割当となり、後続の左側ポケモンと
+        HP表示が丸ごと入れ替わった（06-25-46 実機で確認）。"""
+        vana = self._add("opponent", "フシギバナ")
+        self.tracker._assign_slot_indices(
+            self.tracker._opponent, [("フシギバナ", 1672.0)], "opponent")
+        assert vana.slot_index == 1
+
+    def test_single_candidate_left_bar_gets_slot0(self):
+        liza = self._add("opponent", "リザードン")
+        self.tracker._assign_slot_indices(
+            self.tracker._opponent, [("リザードン", 1275.0)], "opponent")
+        assert liza.slot_index == 0
+
+    def test_inversion_scenario_regression(self):
+        """06-25-46 実機シナリオ: フシギバナ(右)が先に見え、リザードン(左)が後続。
+        フシギバナ→1・リザードン→0 で反転しないこと。"""
+        vana = self._add("opponent", "フシギバナ")
+        self.tracker._assign_slot_indices(
+            self.tracker._opponent, [("フシギバナ", 1672.0)], "opponent")
+        liza = self._add("opponent", "リザードン")
+        self.tracker._assign_slot_indices(
+            self.tracker._opponent, [("リザードン", 1275.0)], "opponent")
+        assert vana.slot_index == 1
+        assert liza.slot_index == 0
+
+    def test_single_candidate_far_from_bars_deferred(self):
+        """選出リスト等バー位置と無関係な cx は割り当てず保留する。"""
+        vana = self._add("opponent", "フシギバナ")
+        self.tracker._assign_slot_indices(
+            self.tracker._opponent, [("フシギバナ", 250.0)], "opponent")
+        assert vana.slot_index is None
+
+    def test_player_side_single_candidate(self):
+        """自分側バー中心（688）近傍の候補1匹 → スロット1。"""
+        p = self._add("player", "ピカチュウ")
+        self.tracker._assign_slot_indices(
+            self.tracker._player, [("ピカチュウ", 655.0)], "player")
+        assert p.slot_index == 1
+
+    def test_two_candidates_relative_order(self):
+        """2匹同時は従来通り相対x順（左→0, 右→1）。"""
+        a = self._add("player", "ピカチュウ")
+        b = self._add("player", "ゴリランダー")
+        self.tracker._assign_slot_indices(
+            self.tracker._player,
+            [("ゴリランダー", 650.0), ("ピカチュウ", 250.0)], "player")
+        assert a.slot_index == 0
+        assert b.slot_index == 1
+
+    def test_one_candidate_one_free_slot_forced(self):
+        """片方使用中＋候補1匹は残りの空きスロットへ（従来挙動維持）。"""
+        vana = self._add("opponent", "フシギバナ")
+        vana.slot_index = 1
+        liza = self._add("opponent", "リザードン")
+        self.tracker._assign_slot_indices(
+            self.tracker._opponent, [("リザードン", 1275.0)], "opponent")
+        assert liza.slot_index == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FieldPokemon dataclass
 # ═══════════════════════════════════════════════════════════════════════════════
 

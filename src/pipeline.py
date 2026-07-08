@@ -1065,6 +1065,14 @@ class BattleStateTracker:
     _HP_RE = re.compile(r'(\d{1,3})/(\d{1,3})')
     # 画面中央x座標: これより左がスロット0（左）、右がスロット1（右）
     _SLOT_X_CENTER = 960
+    # HPバー中心x座標（1920x1080実測・hpbar_analyzer._DEFAULT_SLOTS 準拠）。
+    # ネームプレートは各バーの直上に表示され、cx はバー中心から±140px以内に収まる
+    # （診断JSONL実測: 自分側 cx 200-299/600-699・相手側 cx 1200-1299/1600-1699 の
+    #   2クラスタがバー中心 292/688・1336/1732 に対応）
+    _SLOT_BAR_CENTERS = {"player": (292, 688), "opponent": (1336, 1732)}
+    # 最寄りバー中心からこの距離を超える cx はネームプレート由来ではない
+    # （選出リスト cx≈250 が相手側スロットを誤取得するのを防ぐ）
+    _SLOT_CX_TOLERANCE = 200
 
     def __init__(self):
         self.turn = 0       # 内部イベントカウンター（_ON_FIELD_MISS_THRESHOLD 用）
@@ -1237,8 +1245,8 @@ class BattleStateTracker:
         if command_cy is None or not (300 <= command_cy <= 450):
             return
         self._release_stale_slot_indices()
-        self._assign_slot_indices(self._player,   player_name_cx)
-        self._assign_slot_indices(self._opponent, opponent_name_cx)
+        self._assign_slot_indices(self._player,   player_name_cx,   "player")
+        self._assign_slot_indices(self._opponent, opponent_name_cx, "opponent")
 
     def _release_stale_slot_indices(self) -> None:
         """場を離れたポケモン（交代・気絶・不検出降ろし）の slot_index を解放する。
@@ -1254,11 +1262,14 @@ class BattleStateTracker:
         self,
         slots: list[FieldPokemon],
         name_with_cx: list[tuple[str, float]],
+        side: str,
     ) -> None:
         """初登場時に OCR x座標からスロット番号（0=左, 1=右）を割り当てる。
         固定閾値ではなく、同フレームで見えた未割り当てポケモン同士の相対x順で決定する。
         （SV のプレイヤー側2匹のHPバーは両方とも画面左半分に表示されるため
         cx=960 の固定閾値は使えない）
+        候補が1匹しか見えず両スロット空きの場合は相対順が使えないため、
+        _SLOT_BAR_CENTERS（side="player"/"opponent"）との近接で決定する。
         既に slot_index が設定済みのポケモンはスキップする。
         """
         # 名前マッチングで未割り当て on_field スロットと cx を収集
@@ -1284,6 +1295,24 @@ class BattleStateTracker:
         if len(candidates) == 1 and len(available) == 1:
             candidates[0][0].slot_index = available[0]
             log.info(f"[スロット] {candidates[0][0].name} → スロット{available[0]} (cx={candidates[0][1]:.0f}, 空きスロット割当)")
+        elif len(candidates) < len(available):
+            # 両スロット空きで候補1匹: 相対x順では左右を決められない。
+            # zip で機械的にスロット0を振ると画面右の候補が先取りして完全反転する
+            # （実機で確認: フシギバナ cx=1672 がスロット0を先取り→後続リザードンが
+            #   空きスロット割当で1に入り、HP表示が2匹丸ごと入れ替わった）。
+            # 最寄りバー中心とのx近接で決定し、どのバーにも近くない候補
+            # （選出リスト・パネル等の座標）は次フレーム以降に保留する。
+            centers = self._SLOT_BAR_CENTERS[side]
+            for slot, cx in candidates:
+                if not available:
+                    break
+                idx = min(available, key=lambda i: abs(cx - centers[i]))
+                if abs(cx - centers[idx]) > self._SLOT_CX_TOLERANCE:
+                    log.info(f"[スロット] {slot.name} 保留 (cx={cx:.0f} がバー位置と不一致)")
+                    continue
+                slot.slot_index = idx
+                available.remove(idx)
+                log.info(f"[スロット] {slot.name} → スロット{idx} (cx={cx:.0f}, バー近接判定)")
         else:
             # 空きスロット番号のみを cx 昇順の候補に割り当てる
             # （固定で0,1を振ると使用中スロットと重複し、同じバーを2匹が読む）
@@ -1409,8 +1438,8 @@ class BattleStateTracker:
             self._release_stale_slot_indices()
             player_name_cx   = game_state.get("name_player_with_cx", [])
             opponent_name_cx = game_state.get("name_opponent_with_cx", [])
-            self._assign_slot_indices(self._player,   player_name_cx)
-            self._assign_slot_indices(self._opponent, opponent_name_cx)
+            self._assign_slot_indices(self._player,   player_name_cx,   "player")
+            self._assign_slot_indices(self._opponent, opponent_name_cx, "opponent")
 
         # ── OCR HP値をスロット番号（x座標）で割り当て ──────────────────────
         # COMMAND が行動選択・技選択画面（cy 300〜450）にある時のみセット。
