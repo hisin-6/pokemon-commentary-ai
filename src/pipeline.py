@@ -915,12 +915,17 @@ class BattleMessageParser:
     # トークン間スペース対応: 「ウルガモスを くゆだした」のようにスペース区切りでも捕捉
     # プレイヤー名の「は」を読み飛ばし: 「たかひとはウルガモスを」→ ウルガモスのみ捕捉
     # Champions対応: 漢字形式「繰り出した」/「繰ゆ出した」（り→ゆ誤読）も捕捉
+    # 末尾見切れ対応: メッセージROIの下端で「〜を 繰」までしか読めないフレームが
+    # 継続するケースがある（実機: 「rixohは ランクマスター ガブリアスを 繰」が
+    # 10秒間一度も完全形にならず相手ガブリアスが未登録のままfaintも帰属失敗）。
+    # 「繰」+末尾ノイズ最大3文字で文末なら繰り出しとみなす
+    _KURIDASHITA_SFX = r'(?:く[りゆ]だした|繰[りゆ]出した|繰[\s\S]{0,3}$)'
     _OPPONENT_SWITCH_IN_RE = re.compile(
-        r'(?:[^\s]{2,12}と\s*)?(?:[^\s]*は\s*)?([^\s]{2,12}?)を\s*(?:く[りゆ]だした|繰[りゆ]出した)'
+        r'(?:[^\s]{2,12}と\s*)?(?:[^\s]*は\s*)?([^\s]{2,12}?)を\s*' + _KURIDASHITA_SFX
     )
     # ダブルバトル「AとBをくりだした」形式でAとBを両方捕捉する専用RE
     _DUAL_OPPONENT_SWITCH_IN_RE = re.compile(
-        r'([^\s]{2,12}?)と\s*([^\s]{2,12}?)を\s*(?:く[りゆ]だした|繰[りゆ]出した)'
+        r'([^\s]{2,12}?)と\s*([^\s]{2,12}?)を\s*' + _KURIDASHITA_SFX
     )
     _SWITCH_OUT_RE = re.compile(
         r'もどれ[、,]\s*(.{2,12})'          # SV: もどれ、〇〇（ひらがな）
@@ -1782,6 +1787,20 @@ class BattleStateTracker:
             log.info(f"[戦況] 相手 {slot.name} 繰り出し確認（メッセージ由来）")
         return True
 
+    def register_opponent_fainted(self, name: str) -> bool:
+        """気絶メッセージ由来の遅延登録: 未登録の相手が「たおれた」場合に登録して気絶確定する。
+        繰り出しメッセージの取りこぼし（battle_startリセットで消滅・OCR末尾見切れ等）で
+        ロスターにいないまま倒れた相手の救済（実機: ロトム・ガブリアスの気絶が無言消滅）。
+        """
+        slot = self._get_or_create(self._opponent, name)
+        if slot is None:
+            log.warning(f"[戦況] 相手スロットが満杯のため {name} の気絶登録に失敗")
+            return False
+        slot.fainted = True
+        slot.on_field = False
+        log.info(f"[戦況] 相手 {slot.name} 気絶確認（メッセージ由来・遅延登録）")
+        return True
+
     def mark_bench_by_name(self, name: str) -> bool:
         """メッセージ由来の引っ込め確認: 名前でスロットを検索してon_field=Falseにする。"""
         slot = self._find_slot(name)
@@ -2163,6 +2182,11 @@ class Pipeline:
         self._last_ability_msg: dict[str, str] = {}     # 最後に検出した特性・道具発動メッセージ
         self._pre_battle_opponent: list[str] = []  # battle_start前に検出した相手ポケモン名キャッシュ
         self._pre_battle_player: list[str] = []    # battle_start前に検出した自分ポケモン名キャッシュ（ゆけっ！検出）
+        # メッセージ由来の繰り出し履歴 (時刻, side, 名前)。繰り出し演出は
+        # battle_start（コマンド画面）より先に流れるため、遅延起動中のトラッカーに
+        # 登録済みでもbattle_startのリセットで消える → リセット直後に引き継ぐ
+        self._recent_sendouts: list[tuple[float, str, str]] = []
+        self._SENDOUT_CARRYOVER_SEC = 25.0  # battle_startからこの秒数以内の繰り出しを引き継ぐ
         self._commentary_history: list[str] = []
         self._dense_scan_remaining: int = 0  # move_used後の高密度メッセージROIスキャン残りフレーム数
         self._dense_scan_start_turn: int | None = None  # dense scan起点ターン（技ログのターン番号固定用）
@@ -2664,6 +2688,18 @@ class Pipeline:
             for name in self._pre_battle_player:
                 self._battle_tracker.mark_on_field_by_name(name)
             self._pre_battle_player.clear()
+            # battle_start直前のメッセージ由来繰り出しをリセット後のトラッカーに引き継ぐ
+            # （実機: 相手ロトム/オオニューラが登録7秒後のリセットで消滅し、以降
+            #   保留どまり→opponent_faintが帰属先なしで消えていた）
+            now = self._now()
+            for ts, side, name in self._recent_sendouts:
+                if now - ts > self._SENDOUT_CARRYOVER_SEC:
+                    continue
+                if side == "opponent":
+                    self._battle_tracker.register_opponent_on_field(name)
+                else:
+                    self._battle_tracker.mark_on_field_by_name(name)
+            self._recent_sendouts.clear()
 
         # battle_start が OCR品質不足でスキップされた場合のフォールバック
         # バトルイベントが来た時点でアクティブ化（トラッカーはリセットしない・既存情報を保持）
@@ -2798,6 +2834,7 @@ class Pipeline:
             self._last_battle_end_time = time.time()
             self._pre_battle_opponent.clear()
             self._pre_battle_player.clear()
+            self._recent_sendouts.clear()  # 前試合の繰り出しを次試合に引き継がない
             log.info("[戦況] バトル終了 → トラッカー非アクティブ化")
 
         # デバッグ用スクリーンショット保存
@@ -2970,19 +3007,36 @@ class Pipeline:
                         log.info(f"[交代検知] {result.canonical_ja} が場から退いた（戻れ検出）")
                     break
 
+    def _note_sendout(self, side: str, name: str) -> None:
+        """メッセージ由来の繰り出しを履歴に記録する（battle_startリセット後の引き継ぎ用）。"""
+        now = self._now()
+        self._recent_sendouts = [(t, s, n) for (t, s, n) in self._recent_sendouts
+                                 if now - t <= 60.0]
+        self._recent_sendouts.append((now, side, name))
+
     def _handle_message_event(self, ev: dict) -> None:
         """BattleMessageParser から受け取ったメッセージイベントで戦況を補完する。"""
         event_type = ev["type"]
         pokemon = ev["pokemon"]
         if event_type == "faint":
-            self._battle_tracker.confirm_player_faint_by_name(pokemon)
+            if not self._battle_tracker.confirm_player_faint_by_name(pokemon):
+                log.warning(f"[戦況] 気絶メッセージの帰属先が見つかりません: 自分 {pokemon}")
         elif event_type == "opponent_faint":
             canonical = pokemon
+            confident = False
             if self._classifier:
                 result = self._classifier.classify(pokemon)
                 if result and result.canonical_ja:
                     canonical = result.canonical_ja
-            self._battle_tracker.confirm_opponent_faint_by_name(canonical)
+                    confident = (result.category == CATEGORY_POKEMON
+                                 and result.score >= 90)
+            if not self._battle_tracker.confirm_opponent_faint_by_name(canonical):
+                # 繰り出し取りこぼしで未登録のまま倒れた相手の救済。
+                # 気絶メッセージ＋DB高確信マッチの二重根拠がある場合のみ登録する
+                if confident:
+                    self._battle_tracker.register_opponent_fainted(canonical)
+                else:
+                    log.warning(f"[戦況] 気絶メッセージの帰属先が見つかりません: 相手 {canonical}")
         elif event_type == "switch_in":
             canonical = pokemon
             if self._classifier:
@@ -2990,6 +3044,7 @@ class Pipeline:
                 if result and result.canonical_ja:
                     canonical = result.canonical_ja
             self._battle_tracker.mark_on_field_by_name(canonical)
+            self._note_sendout("player", canonical)
         elif event_type == "opponent_switch_in":
             # PokeClassifierで正規化してから相手スロットに登録
             canonical = pokemon
@@ -2998,6 +3053,7 @@ class Pipeline:
                 if result and result.canonical_ja:
                     canonical = result.canonical_ja
             self._battle_tracker.register_opponent_on_field(canonical)
+            self._note_sendout("opponent", canonical)
         elif event_type == "switch_out":
             canonical = pokemon
             if self._classifier:
