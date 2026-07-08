@@ -211,8 +211,13 @@ class TestExtractStructuredInfo:
         return _ocr(text, conf, y_center=200.0)
 
     def _player_ocr(self, text, conf=0.9):
-        """自分エリア（_PLAYER_Y_THRESHOLD <= y < _COMMAND_Y_MIN）の OCR 結果。"""
+        """自分エリア（_PLAYER_Y_THRESHOLD <= y < _COMMAND_Y_MIN）の OCR 結果。
+        名前候補としては中間帯（メッセージ/選出/パネル）のため採用されない。"""
         return _ocr(text, conf, y_center=600.0)
+
+    def _player_nameplate_ocr(self, text, conf=0.9):
+        """自分ネームプレート帯（y > _PLAYER_NAME_Y_MIN）の OCR 結果。"""
+        return _ocr(text, conf, y_center=960.0)
 
     def _command_ocr(self, text, conf=0.9):
         """コマンドメニューエリア（y >= _COMMAND_Y_MIN）の OCR 結果。"""
@@ -279,9 +284,24 @@ class TestExtractStructuredInfo:
         mock_result.canonical_ja = "ピカチュウ"
         mock_clf.classify.return_value = mock_result
 
-        results = [self._player_ocr("ピカチュウ")]
+        results = [self._player_nameplate_ocr("ピカチュウ")]
         info = _extract_structured_info(results, classifier=mock_clf)
         assert "ピカチュウ" in info["name_candidates_player"]
+
+    def test_message_band_name_excluded_from_player(self):
+        """メッセージ帯（500<y<=930）のポケモン名は自分側候補に入らない。
+        相手の繰り出し・技メッセージ内の相手名が自分側に混入し、
+        新規登録ヒステリシスを貫通する問題（2026-07-08）のリグレッションガード。"""
+        mock_clf = MagicMock()
+        mock_result = MagicMock()
+        mock_result.category = "pokemon"
+        mock_result.canonical_ja = "ガブリアス"
+        mock_clf.classify.return_value = mock_result
+
+        results = [_ocr("ガブリアスを", y_center=819.0)]  # メッセージボックス内
+        info = _extract_structured_info(results, classifier=mock_clf)
+        assert "ガブリアス" not in info["name_candidates_player"]
+        assert "ガブリアス" not in info["name_candidates_opponent"]
 
     def test_with_classifier_non_pokemon_excluded(self):
         """PokeClassifier が技名と判定したテキストは除外される。"""
@@ -302,7 +322,7 @@ class TestExtractStructuredInfo:
         mock_result.canonical_ja = "テスト"
         mock_clf.classify.return_value = mock_result
 
-        results = [self._player_ocr(f"ポケモン{i}") for i in range(10)]
+        results = [self._player_nameplate_ocr(f"ポケモン{i}") for i in range(10)]
         info = _extract_structured_info(results, classifier=mock_clf)
         assert len(info["name_candidates_player"]) <= 5
 

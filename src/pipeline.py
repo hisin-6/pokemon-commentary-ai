@@ -109,6 +109,14 @@ _END_SCREEN_OCR_KEYWORDS = ("勝った", "負けた", "選ばれました")
 # 画面上半分（y < この値）= 相手エリア、下半分 = 自分エリア（1080p 基準）
 _PLAYER_Y_THRESHOLD = 500
 
+# 自分ネームプレート帯（y > この値のみ自分側ポケモン名として採用・1080p 基準）。
+# 診断JSONL実測（2026-07-08・2動画）: 自分ネームプレートは cy 950-999 に集中、
+# cy 800-899 はメッセージボックス、cy 500-699 は選出画面/相手を見るパネル、
+# cy 900-949 は0件（自然な境界）。メッセージ内の相手名（「ガブリアスを 繰り出した」
+# 等が最大10秒表示）が自分側名前候補に毎サイクル蓄積され、新規登録ヒステリシス
+# （2サイクル連続目撃）を貫通して相手ポケモンが自分側に混入する主因だった
+_PLAYER_NAME_Y_MIN = 930
+
 # コマンドメニュー（y > この値）= 技選択UI → ポケモン名候補から除外（1080p 基準）
 _COMMAND_Y_MIN = 700
 
@@ -372,8 +380,9 @@ def _extract_structured_info(
         # 自分/相手エリアに振り分け（x/y座標も記録）
         if center_y < _PLAYER_Y_THRESHOLD:
             name_opponent_with_xy.append((canonical, center_x, center_y))
-        else:
+        elif center_y > _PLAYER_NAME_Y_MIN:
             name_player_with_xy.append((canonical, center_x, center_y))
+        # 500 <= cy <= 930 の中間帯（メッセージ/選出/パネル）はどちらの候補にもしない
 
     # y座標（同y時はx座標）でソート（画面の上から下の順）
     hp_player_with_xy.sort(key=lambda t: (t[2], t[1]))
