@@ -991,7 +991,27 @@ class BattleMessageParser:
             if m:
                 prefix, name = m.group(1), m.group(2)
                 # 「相手の」プレフィックスがあれば相手側、なければ自分側
-                _emit("opponent_faint" if prefix.strip() else "faint", name)
+                is_opponent = bool(prefix.strip())
+                if not is_opponent:
+                    # 「相手の」の崩れ読み対策: 「あい 手の イトウは たおれたー」のように
+                    # プレフィックスが分断されると自分側と誤判定され、同名ミラー戦で
+                    # 生存中の自分ポケモンを誤ひんし化する（実機: 自分イダイトウ139/201）。
+                    # 名前の直前に相手プレフィックスの痕跡があれば相手側として扱う
+                    head = text[:m.start(2)][-10:]
+                    if re.search(r'(?:あい\s*て?|相?手\s*の?)\s*$', head):
+                        is_opponent = True
+                if is_opponent:
+                    _emit("opponent_faint", name)
+                else:
+                    # 同名ミラー対策: 直近で相手側として発火済みの名前（OCR欠けの
+                    # 部分一致含む）はプレフィックス取りこぼしの再読とみなしスキップ
+                    stripped = name.strip().rstrip('！!」、')
+                    dup = any(et == "opponent_faint"
+                              and now - t < self.DEDUP_TTL
+                              and (nm in stripped or stripped in nm)
+                              for (et, nm), t in self._seen.items())
+                    if not dup:
+                        _emit("faint", name)
 
             m = self._SWITCH_IN_RE.search(text)
             if m:
@@ -1009,8 +1029,16 @@ class BattleMessageParser:
 
             m = self._SWITCH_OUT_RE.search(text)
             if m:
-                _emit("switch_out",
-                      (m.group(1) or m.group(2) or m.group(3) or m.group(4) or ""))
+                if m.group(4):
+                    # 「(トレーナー名)は 〇〇を 引っこめた」は相手の交代のみ。
+                    # 同名ミラー戦で自分側を誤ベンチ化しないようサイドを分けて発行する
+                    # （実機: 「rixohは オオニューラを 引っこめた」で自分のオオニューラが
+                    #   ベンチ化し、相手のオオニューラは場に残留した）
+                    _emit("opponent_switch_out", m.group(4))
+                else:
+                    # もどれ、〇〇 / 〇〇 戻れ！ / 〇〇と こうたいした = 自分側の交代
+                    _emit("switch_out",
+                          (m.group(1) or m.group(2) or m.group(3) or ""))
 
         # 状態異常はROI外も含めた全OCRから検索（メッセージ表示フレームを取りこぼす場合に備える）
         full_text = " ".join(r["text"] for r in ocr_results if r["confidence"] >= 0.35)
@@ -1839,13 +1867,18 @@ class BattleStateTracker:
         log.info(f"[戦況] 相手 {slot.name} 気絶確認（メッセージ由来・遅延登録）")
         return True
 
-    def mark_bench_by_name(self, name: str) -> bool:
-        """メッセージ由来の引っ込め確認: 名前でスロットを検索してon_field=Falseにする。"""
-        slot = self._find_slot(name)
-        if slot:
-            slot.on_field = False
-            log.info(f"[戦況] {slot.name} 引っ込め確認（メッセージ由来）")
-            return True
+    def mark_bench_by_name(self, name: str, side: str = "both") -> bool:
+        """メッセージ由来の引っ込め確認: 名前でスロットを検索してon_field=Falseにする。
+        side="player"/"opponent" で検索範囲を限定する。同名ミラー戦では両側検索だと
+        相手の引っ込めメッセージが自分側スロットを誤ベンチ化する（実機で確認）。
+        """
+        pools = {"player": self._player, "opponent": self._opponent}
+        slots = pools.get(side) if side in pools else (self._player + self._opponent)
+        for slot in slots:
+            if slot.name == name or name in slot.name or slot.name in name:
+                slot.on_field = False
+                log.info(f"[戦況] {slot.name} 引っ込め確認（メッセージ由来）")
+                return True
         return False
 
     # ── コンテキスト生成 ─────────────────────────────────────────────────────
@@ -3040,7 +3073,8 @@ class Pipeline:
                 candidate = roi_tokens[j][1].rstrip("！!」、")
                 result = self._classifier.classify(candidate)
                 if result and result.canonical_ja and result.score >= 80:
-                    found = self._battle_tracker.mark_bench_by_name(result.canonical_ja)
+                    # 「〇〇 戻れ！」は自分のコマンド交代のみ（相手は「引っこめた」形式）
+                    found = self._battle_tracker.mark_bench_by_name(result.canonical_ja, side="player")
                     if found:
                         log.info(f"[交代検知] {result.canonical_ja} が場から退いた（戻れ検出）")
                     break
@@ -3098,7 +3132,16 @@ class Pipeline:
                 result = self._classifier.classify(pokemon)
                 if result and result.canonical_ja:
                     canonical = result.canonical_ja
-            self._battle_tracker.mark_bench_by_name(canonical)
+            # もどれ/戻れ/こうたいした = 自分の交代（同名ミラーで相手側を誤ベンチ化しない）
+            self._battle_tracker.mark_bench_by_name(canonical, side="player")
+        elif event_type == "opponent_switch_out":
+            canonical = pokemon
+            if self._classifier:
+                result = self._classifier.classify(pokemon)
+                if result and result.canonical_ja:
+                    canonical = result.canonical_ja
+            # 「(トレーナー名)は 〇〇を 引っこめた」= 相手の交代
+            self._battle_tracker.mark_bench_by_name(canonical, side="opponent")
         elif event_type == "status":
             self._battle_tracker.update_status_by_name(pokemon, ev.get("status", ""))
 

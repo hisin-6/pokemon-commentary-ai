@@ -28,6 +28,7 @@ from src.pipeline import (
     _extract_structured_info,
     _is_battle_screen,
     _ocr_results_to_text,
+    BattleMessageParser,
     BattlePhaseClassifier,
     BattleStateTracker,
     FieldPokemon,
@@ -703,6 +704,86 @@ class TestBattleStateTracker:
         self.tracker.update(gs2, "move_used")
         slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
         assert slot.hp is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BattleMessageParser（同名ミラー戦のサイド誤帰属の回帰ガード）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _msg_ocr(*texts):
+    """メッセージボックスROI内（cx 120-900, cy 740-930）のOCR結果リストを作る。"""
+    results = []
+    for i, t in enumerate(texts):
+        x = 150 + i * 120
+        results.append({
+            "text": t, "confidence": 0.9,
+            "bbox": [[x, 800], [x + 100, 800], [x + 100, 830], [x, 830]],
+        })
+    return results
+
+
+class TestBattleMessageParser:
+
+    def setup_method(self):
+        self.parser = BattleMessageParser()
+
+    def _types(self, events):
+        return [(e["type"], e["pokemon"]) for e in events]
+
+    def test_faint_player_side_no_prefix(self):
+        events = self.parser.parse(_msg_ocr("オオニューラは", "たおれた!"))
+        assert ("faint", "オオニューラ") in self._types(events)
+
+    def test_faint_opponent_with_prefix(self):
+        events = self.parser.parse(_msg_ocr("相手の", "イダイトウは", "たおれた!"))
+        assert ("opponent_faint", "イダイトウ") in self._types(events)
+
+    def test_faint_mangled_opponent_prefix_not_player(self):
+        """「相手の イダイトウは」の崩れ読み「あい 手の イトウは」を自分側と誤判定しない。
+        （実機: 同名ミラー戦で生存中の自分イダイトウ139/201が誤ひんし化した回帰ガード）"""
+        events = self.parser.parse(_msg_ocr("あい", "手の", "イトウは", "たおれたー"))
+        types = self._types(events)
+        assert ("opponent_faint", "イトウ") in types
+        assert all(t != "faint" for t, _ in types)
+
+    def test_faint_cross_dedup_after_opponent(self):
+        """相手側として発火済みの名前は、プレフィックス欠けの再読でfaintを発行しない。"""
+        self.parser.parse(_msg_ocr("相手の", "イダイトウは", "たおれた!"))
+        events = self.parser.parse(_msg_ocr("イダイトウは", "たおれた!"))
+        assert all(t != "faint" for t, _ in self._types(events))
+
+    def test_hikkometa_is_opponent_switch_out(self):
+        """「(トレーナー名)は 〇〇を 引っこめた」は相手側の交代イベントとして発行される。"""
+        events = self.parser.parse(_msg_ocr("rixohは", "オオニューラを", "引っこめた!"))
+        types = self._types(events)
+        assert ("opponent_switch_out", "オオニューラ") in types
+        assert all(t != "switch_out" for t, _ in types)
+
+    def test_modore_is_player_switch_out(self):
+        """「〇〇 戻れ！」は自分側の交代イベントとして発行される。"""
+        events = self.parser.parse(_msg_ocr("オオニューラ", "戻れ!"))
+        assert ("switch_out", "オオニューラ") in self._types(events)
+
+
+class TestMarkBenchBySide:
+    """mark_bench_by_name の side 限定（同名ミラー戦の誤ベンチ化防止）"""
+
+    def setup_method(self):
+        self.tracker = BattleStateTracker()
+        self.mine = FieldPokemon(name="オオニューラ", on_field=True)
+        self.theirs = FieldPokemon(name="オオニューラ", on_field=True)
+        self.tracker._player.append(self.mine)
+        self.tracker._opponent.append(self.theirs)
+
+    def test_opponent_side_does_not_bench_player(self):
+        assert self.tracker.mark_bench_by_name("オオニューラ", side="opponent") is True
+        assert self.theirs.on_field is False
+        assert self.mine.on_field is True  # 自分側は無傷
+
+    def test_player_side_does_not_bench_opponent(self):
+        assert self.tracker.mark_bench_by_name("オオニューラ", side="player") is True
+        assert self.mine.on_field is False
+        assert self.theirs.on_field is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
