@@ -2,7 +2,7 @@
 
 **ブランチ**: `dev/champions-v1`  
 **作成日**: 2026-04-08  
-**更新日**: 2026-04-18  
+**更新日**: 2026-04-18（タスク状態のみ2026-07-09に見直し）  
 
 ---
 
@@ -26,7 +26,7 @@
 |---|--------|----------|------|
 | 1 | ROI 座標の確認・再キャリブレーション | `yolo_detector.py` ROIS、`pipeline.py` 定数 | ✅ 2026-04-18 |
 | 2 | HP バーピクセル解析の確認 | `hpbar_analyzer.py` | ✅ 2026-04-13 |
-| 3 | OBS カメラ接続・フレーム取得確認 | `src/pipeline.py` | 未着手 |
+| 3 | OBS カメラ接続・フレーム取得確認 | `src/pipeline.py` | ✅ 完了（デバイス番号3・解像度1920x1080で稼働中） |
 
 ### 高優先（OCR・テキスト系）
 
@@ -34,7 +34,7 @@
 |---|--------|----------|------|
 | 4 | **相手 HP% の OCR パース追加** | `src/pipeline.py` | ✅ 2026-04-13 |
 | 5 | メッセージボックスの OCR 確認 | `src/pipeline.py` | ✅ 2026-04-18（動画01:09確認） |
-| 6 | switch-in 検出 regex の確認 | `src/pipeline.py` | 未着手 |
+| 6 | switch-in 検出 regex の確認 | `src/pipeline.py` | ✅ 完了（`_OPPONENT_SWITCH_IN_RE`/`_DUAL_OPPONENT_SWITCH_IN_RE`等でその後も継続改修） |
 | 7 | 技名・ポケモン名 OCR 精度確認 | `src/pipeline.py` | 🔧 2026-04-18（HP `/`→`1` 誤読あり） |
 | 8 | **特性・道具発動メッセージ OCR 追加** | `src/pipeline.py` `_scan_ability_msg` | ✅ 2026-04-18 |
 

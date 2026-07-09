@@ -32,6 +32,7 @@ from src.pipeline import (
     BattlePhaseClassifier,
     BattleStateTracker,
     FieldPokemon,
+    Pipeline,
     _PLAYER_Y_THRESHOLD,
     _COMMAND_Y_MIN,
 )
@@ -784,6 +785,94 @@ class TestMarkBenchBySide:
         assert self.tracker.mark_bench_by_name("オオニューラ", side="player") is True
         assert self.mine.on_field is False
         assert self.theirs.on_field is True
+
+
+class TestOnFieldMissThresholdUsesGameTurn:
+    """_ON_FIELD_MISS_THRESHOLD は self.turn（内部イベントカウンター）ではなく
+    self.game_turn（実ターン数）で判定する回帰ガード。
+
+    実機（07-00-19）で、メガシンカ・道具発動・毒ダメージ等のメッセージが
+    立て込む区間で update() が同一ゲームターン内に何度も呼ばれ、内部イベント
+    カウンターだけで閾値判定すると実際は1ターンも経っていないのに誤って
+    場から降ろされていた（自分のオオニューラ・イダイトウが同時に誤って
+    場外扱いになり、片方は試合終了まで復帰しなかった）。
+    """
+
+    def setup_method(self):
+        self.tracker = BattleStateTracker()
+        self.mine = FieldPokemon(name="オオニューラ", on_field=True, last_seen_turn=0)
+        self.tracker._player.append(self.mine)
+
+    def test_many_updates_within_same_turn_does_not_demote(self):
+        """同一game_turn内でupdate()が何度呼ばれても場から降ろされない。"""
+        gs = _make_game_state()  # 自分側名前候補なし（名前が見えないフレーム想定）
+        for _ in range(10):
+            self.tracker.update(gs, "move_used")  # game_turn は増やさない
+        assert self.mine.on_field is True
+
+    def test_real_turns_elapsed_still_demotes(self):
+        """実際にゲームターンが閾値を超えて進めば従来通り正しく場から降ろされる。"""
+        gs = _make_game_state()
+        for _ in range(self.tracker._ON_FIELD_MISS_THRESHOLD + 1):
+            self.tracker.game_turn += 1
+            self.tracker.update(gs, "move_used")
+        assert self.mine.on_field is False
+
+    def test_hp_pixel_tracking_counts_as_seen(self):
+        """名前OCRが再検出されなくても、HPpxが実測できていれば場に残り続ける。
+
+        実機（07-00-19）で、オオニューラの名前が繰り出し後ほぼOCR再検出されない
+        まま HPpx だけは継続的に読めていたのに、名前だけを見る旧ロジックでは
+        game_turn 経過で機械的に場から降ろされ、二度と復帰しなかった。
+        """
+        self.mine.slot_index = 0
+        gs = _make_game_state()  # 自分側名前候補なし
+        for _ in range(self.tracker._ON_FIELD_MISS_THRESHOLD + 3):
+            self.tracker.game_turn += 1
+            self.tracker.update_pixel_hp({"player_0": 0.5})  # HPpxは継続して読める
+            self.tracker.update(gs, "move_used")
+        assert self.mine.on_field is True
+
+
+class TestUpdateSwitchOut:
+    """_update_switch_out のパターン1（「〜は戻っていく」検出）の誤爆防止回帰ガード。
+
+    実機（2026-07-09・20-14-17と07-00-19の2本）で、「しろいハーブで ステータスを
+    元に戻した」（アイテム回復メッセージ）が旧ゲート（「戻」1文字含有）に誤反応し、
+    交代と無関係なポケモンを set_not_on_field の無条件両側検索で誤ベンチ化していた。
+    """
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)  # __init__ を経由せず属性だけ用意
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._classifier = None
+        self.mine = FieldPokemon(name="オオニューラ", on_field=True)
+        self.runner._battle_tracker._player.append(self.mine)
+
+    def test_shiroi_herb_message_does_not_bench(self):
+        """「しろいハーブで元に戻した」はとんぼがえり誤検出させない。"""
+        events = [
+            _ocr("オオニューラは"), _ocr("しろいハーブで"),
+            _ocr("もと"), _ocr("もど"),
+            _ocr("ステータスを"), _ocr("元に戻した!"),
+        ]
+        Pipeline._update_switch_out(self.runner, events)
+        assert self.mine.on_field is True
+
+    def test_mamoru_success_message_does_not_bench(self):
+        """OCR誤読「戻る」を含む「攻撃から身を守った」も誤検出させない。"""
+        events = [
+            _ocr("戻る"), _ocr("あいて"), _ocr("相手の"), _ocr("オオニューラは"),
+            _ocr("こうげき"), _ocr("まも"), _ocr("攻撃から"), _ocr("身を守った!"),
+        ]
+        Pipeline._update_switch_out(self.runner, events)
+        assert self.mine.on_field is True
+
+    def test_tonbogaeri_still_detected(self):
+        """本来の「〜は 戻っていく」（とんぼがえり）は引き続き検出される。"""
+        events = [_ocr("オオニューラは"), _ocr("ともの元へ"), _ocr("戻っていく")]
+        Pipeline._update_switch_out(self.runner, events)
+        assert self.mine.on_field is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -147,6 +147,25 @@ runs/detect/train/
 
 ## ROI 定義（yolo_detector.py）
 
+> **⚠️2026-07-09更新**: 下記は旧SV版（4キー・広域ROI）の定義。チャンピオンズ対応で
+> per-pokemon 4スロット構造に変更済み。現在の実値は以下（`src/capture/yolo_detector.py`）:
+>
+> ```python
+> ROIS: dict[str, tuple[float, float, float, float]] = {
+>     "opponent_status_0": (1135/1920, 20/1080,  1215/1920, 80/1080),   # 相手スロット0 状態異常
+>     "opponent_status_1": (1535/1920, 20/1080,  1615/1920, 80/1080),   # 相手スロット1 状態異常
+>     "player_status_0":   (105/1920,  900/1080, 170/1920,  960/1080),  # 自分スロット0 状態異常
+>     "player_status_1":   (505/1920,  900/1080, 570/1920,  960/1080),  # 自分スロット1 状態異常
+>     "opponent_balls":    (0.86, 0.15, 0.93, 0.19),                    # 右上端: 相手ボール数
+>     "player_balls":      (0.04, 0.80, 0.11, 0.84),                    # 左下端: 自分ボール数
+> }
+> ```
+>
+> `BattleState`のフィールドも`opponent_status`/`player_status`単一値から
+> `opponent_status_0/1`・`player_status_0/1`（スロット別）に変更されている。
+
+以下は当時（SV / 剣盾対応時）の記録として残す:
+
 ```python
 ROIS = {
     "opponent_status": (0.57, 0.00, 1.00, 0.28),  # 右上: 相手HP・状態
@@ -249,4 +268,4 @@ ROI座標（`yolo_detector.py`）もUIレイアウトが変わった場合は要
 - val側にも新クラスを均等に含めて再分割する
 - ボール系だけ別モデルとして学習する
 
-**現在の方針: 状態異常系（poison/burn/paralysis/sleep/freeze）だけで実況パイプライン統合を優先する。ボール残数カウントは後回し。**
+**2026-07-09追記**: 上記の課題は解消済み。ROIクロップ学習＋yolov8s（`train7`）でボール検出（alive/faint/status）もパイプラインに統合され、`src/pipeline.py`の起動コマンドで`--ball-model runs/detect/train7/weights/best.pt`として常用されている。ただし`train7`はチャンピオンズ発売前（2026-03-25）に学習されたSV版のボールデザインのままで、チャンピオンズの新デザイン（新位置・横並び）向けの再学習はまだ実施していない（`docs/champions-v1-plan.md`参照）。

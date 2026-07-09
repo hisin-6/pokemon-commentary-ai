@@ -31,7 +31,10 @@ class Phi3Client:
         ollama_url: str = OLLAMA_URL,
         model: str = MODEL_NAME,
         history_size: int = HISTORY_SIZE,
-        timeout: int = 60,
+        timeout: int = 20,
+        # Bedrock失敗時のフォールバックとして同期呼び出しされるため、メインループを
+        # 長時間ブロックしないよう、プライマリ経路（Bedrock, timeout=15s）と近い値に
+        # 抑える。旧値60sはOllamaハング時にメインループを最大60秒止めてしまっていた。
     ):
         self.ollama_url = ollama_url
         self.model = model

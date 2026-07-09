@@ -56,9 +56,10 @@ MAX_MOVES_FOR_RAG = 12
 
 # ─── 結果型 ──────────────────────────────────────────────────────────────────
 
-@dataclass
+@dataclass(frozen=True)
 class ClassifyResult:
-    """classify() の返り値。"""
+    """classify() の返り値。frozen: _UNKNOWN が全呼び出しで共有される
+    シングルトンのため、呼び出し側での誤った属性書き換えを防ぐ。"""
     category:     str    # pokemon / move / ability / item / unknown
     canonical_ja: str    # DB に登録された正規の日本語名
     score:        float  # 類似スコア（0〜100）
@@ -99,6 +100,11 @@ class PokeClassifier:
         # pokemon_name_ja → row のキャッシュ（RAG 用）
         self._pokemon_rows: dict[str, dict] = {}
 
+        # 起動時に一度だけ開いて使い回す（_get_moves_for_pokemon 用）。
+        # 読み取り専用の単発クエリのみなので check_same_thread=False で共有する。
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+
         self._load()
         log.info(
             "PokeClassifier 初期化完了: pokemon=%d, moves=%d, abilities=%d, items=%d",
@@ -109,26 +115,21 @@ class PokeClassifier:
     # ── ロード ───────────────────────────────────────────────────────────────
 
     def _load(self) -> None:
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                "SELECT id, name_ja, type1, type2, ability1, ability2, ability_hidden FROM pokemon"
-            ).fetchall()
-            for row in rows:
-                self._pokemon.append(row["name_ja"])
-                self._pokemon_rows[row["name_ja"]] = dict(row)
+        rows = self._conn.execute(
+            "SELECT id, name_ja, type1, type2, ability1, ability2, ability_hidden FROM pokemon"
+        ).fetchall()
+        for row in rows:
+            self._pokemon.append(row["name_ja"])
+            self._pokemon_rows[row["name_ja"]] = dict(row)
 
-            for row in conn.execute("SELECT name_ja FROM moves"):
-                self._moves.append(row["name_ja"])
+        for row in self._conn.execute("SELECT name_ja FROM moves"):
+            self._moves.append(row["name_ja"])
 
-            for row in conn.execute("SELECT name_ja FROM abilities"):
-                self._abilities.append(row["name_ja"])
+        for row in self._conn.execute("SELECT name_ja FROM abilities"):
+            self._abilities.append(row["name_ja"])
 
-            for row in conn.execute("SELECT name_ja FROM items"):
-                self._items.append(row["name_ja"])
-        finally:
-            conn.close()
+        for row in self._conn.execute("SELECT name_ja FROM items"):
+            self._items.append(row["name_ja"])
 
     # ── メイン分類 ───────────────────────────────────────────────────────────
 
@@ -268,24 +269,20 @@ class PokeClassifier:
 
     def _get_moves_for_pokemon(self, pokemon_id: int) -> list[str]:
         """pokemon_moves テーブルから代表技リストを取得する。"""
-        conn = sqlite3.connect(self._db_path)
-        try:
-            rows = conn.execute(
-                """
-                SELECT m.name_ja, m.category, m.power
-                FROM pokemon_moves pm
-                JOIN moves m ON pm.move_id = m.id
-                WHERE pm.pokemon_id = ?
-                ORDER BY
-                    CASE m.category WHEN '物理' THEN 1 WHEN '特殊' THEN 2 ELSE 3 END,
-                    COALESCE(m.power, 0) DESC
-                LIMIT ?
-                """,
-                (pokemon_id, MAX_MOVES_FOR_RAG),
-            ).fetchall()
-            return [r[0] for r in rows]
-        finally:
-            conn.close()
+        rows = self._conn.execute(
+            """
+            SELECT m.name_ja, m.category, m.power
+            FROM pokemon_moves pm
+            JOIN moves m ON pm.move_id = m.id
+            WHERE pm.pokemon_id = ?
+            ORDER BY
+                CASE m.category WHEN '物理' THEN 1 WHEN '特殊' THEN 2 ELSE 3 END,
+                COALESCE(m.power, 0) DESC
+            LIMIT ?
+            """,
+            (pokemon_id, MAX_MOVES_FOR_RAG),
+        ).fetchall()
+        return [r[0] for r in rows]
 
     # ── ユーティリティ ────────────────────────────────────────────────────────
 

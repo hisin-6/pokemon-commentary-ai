@@ -1,7 +1,7 @@
 # システム設計書 - ポケモン対戦実況AI
 
 **バージョン**: 1.0
-**作成日**: 2026-02-25
+**作成日**: 2026-02-25（2026-07-09にデバウンス記述を見直し。他の記述は概ね現状と一致）
 **対象GPU**: NVIDIA GeForce RTX 3080 / VRAM 10GB
 
 ---
@@ -161,7 +161,10 @@
       command_select / switch_select / animation / faint / battle_end / selection_screen / unknown
     フェーズ遷移でイベントを発火:
       battle_start / move_used / switch / faint / battle_end
-    デバウンス 10秒で多重発火を防止
+    デバウンスはイベント種別ごとに個別設定＋通信フェーズ検出・turn_start脱出弁・
+    faint再アーム等の補助ロジックを組み合わせて多重発火を防止（2026-07時点で大幅改修済み。
+    現在の秒数・詳細ロジックは `docs/pipeline-logic-overview.md` および
+    `src/pipeline.py` の `_DEBOUNCE_OVERRIDES` を参照）
 
 [5] バトル外判定（イベント発生時）
     _NON_BATTLE_KEYWORDS に該当 → スキップ

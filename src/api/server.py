@@ -40,6 +40,9 @@ VALID_EVENT_TYPES = {"battle_start", "move_used", "switch", "faint", "battle_end
 # ─── Flask・AWS クライアント初期化 ────────────────────────────────────────────
 
 app = Flask(__name__)
+# リクエストボディの上限（Flask/Werkzeugがこの値を超えるボディを早期拒否する）。
+# 画像は最大 IMAGE_MAX_BYTES だが、Base64化・JSON全体のオーバーヘッド分の余裕を持たせる。
+app.config["MAX_CONTENT_LENGTH"] = IMAGE_MAX_BYTES * 2
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -249,10 +252,10 @@ def vision():
             logger.warning("Bedrock スロットリング: %s", e)
             return jsonify({"success": False, "error": "bedrock_timeout", "message": f"Bedrock スロットリング: {code}"}), 504
         logger.error("Bedrock ClientError: %s", e)
-        return jsonify({"success": False, "error": "bedrock_error", "message": str(e)}), 502
+        return jsonify({"success": False, "error": "bedrock_error", "message": "Bedrock呼び出しでエラーが発生しました"}), 502
     except Exception as e:
         logger.error("Bedrock 予期しないエラー: %s", e)
-        return jsonify({"success": False, "error": "bedrock_error", "message": str(e)}), 502
+        return jsonify({"success": False, "error": "bedrock_error", "message": "Bedrock呼び出しでエラーが発生しました"}), 502
 
     latency_ms = int((time.monotonic() - start_ms) * 1000)
 
@@ -284,13 +287,15 @@ def log_save():
         return jsonify({"success": False, "error": "invalid_json", "message": "リクエストボディがJSONではありません"}), 400
 
     session_id: str = data.get("session_id", "")
-    turn: int = data.get("turn", 0)
+    turn = data.get("turn", 0)
     commentary: str = data.get("commentary", "")
 
     if not session_id:
         return jsonify({"success": False, "error": "missing_session_id", "message": "session_id が必要です"}), 400
     if not commentary:
         return jsonify({"success": False, "error": "missing_commentary", "message": "commentary が必要です"}), 400
+    if not isinstance(turn, int) or isinstance(turn, bool):
+        return jsonify({"success": False, "error": "invalid_turn", "message": "turn は整数である必要があります"}), 400
     if not S3_BUCKET:
         return jsonify({"success": False, "error": "s3_not_configured", "message": "S3_BUCKET 環境変数が未設定です"}), 500
 
@@ -318,7 +323,7 @@ def log_save():
         )
     except ClientError as e:
         logger.error("S3 ログ保存失敗: %s", e)
-        return jsonify({"success": False, "error": "s3_error", "message": str(e)}), 502
+        return jsonify({"success": False, "error": "s3_error", "message": "S3への保存でエラーが発生しました"}), 502
 
     response_body: dict = {
         "success": True,

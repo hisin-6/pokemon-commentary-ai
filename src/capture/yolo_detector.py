@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -246,6 +247,12 @@ class YoloDetector:
                 raw.append((cls_id, label, conf, x1, y1, x2, y2))
         return raw
 
+    # ROI優先順位（opponent_balls は opponent_status の内側に重なっているため順序制御が必要）
+    _ROI_ORDER_BALLS  = ("opponent_balls", "player_balls",
+                         "opponent_status_0", "opponent_status_1", "player_status_0", "player_status_1")
+    _ROI_ORDER_STATUS = ("opponent_status_0", "opponent_status_1", "player_status_0", "player_status_1",
+                         "opponent_balls", "player_balls")
+
     def _assign_roi(
         self,
         frame: np.ndarray,
@@ -253,18 +260,13 @@ class YoloDetector:
     ) -> list[Detection]:
         """検出結果をROI座標で振り分ける。
         ボール系クラスは _balls ROI を優先、状態異常クラスは _status ROI を優先する。
-        （opponent_balls は opponent_status の内側に重なっているため順序制御が必要）
         """
         h, w = frame.shape[:2]
         detections: list[Detection] = []
-        roi_order_balls  = ["opponent_balls", "player_balls",
-                             "opponent_status_0", "opponent_status_1", "player_status_0", "player_status_1"]
-        roi_order_status = ["opponent_status_0", "opponent_status_1", "player_status_0", "player_status_1",
-                             "opponent_balls", "player_balls"]
         for cls_id, label, conf, x1, y1, x2, y2 in raw:
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
-            priority = roi_order_balls if label in BALL_LABELS else roi_order_status
+            priority = self._ROI_ORDER_BALLS if label in BALL_LABELS else self._ROI_ORDER_STATUS
             roi_name = None
             for name in priority:
                 rx1, ry1, rx2, ry2 = ROIS[name]
@@ -346,7 +348,6 @@ class YoloDetector:
         if not self._ball_model:
             return BattleState(mode=self._mode)
 
-        import cv2, time
         all_detections: list[Detection] = []
         for roi_name, roi_ratio in ROIS.items():
             if not roi_name.endswith("_balls"):

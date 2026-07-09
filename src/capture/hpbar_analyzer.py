@@ -98,6 +98,24 @@ _DEFAULT_ANCHORS: dict[str, AnchorConfig] = {
 }
 
 
+def slot_bar_centers(slots: dict[str, SlotConfig] = _DEFAULT_SLOTS) -> dict[str, tuple[float, float]]:
+    """side（"player"/"opponent"）ごとの (slot0中心x, slot1中心x) を返す。
+
+    HPバーROI座標(`_DEFAULT_SLOTS`)から算出するため、ROIを再キャリブレーションしても
+    ネームプレート近接判定用の中心座標が自動的に追従する（手計算のハードコード値が
+    ROI変更に追従できず静かにズレるのを防ぐ）。
+    """
+    centers: dict[str, tuple[float, float]] = {}
+    for side in ("player", "opponent"):
+        slot0 = slots[f"{side}_0"]
+        slot1 = slots[f"{side}_1"]
+        centers[side] = (
+            (slot0.x_left + slot0.x_right) / 2,
+            (slot1.x_left + slot1.x_right) / 2,
+        )
+    return centers
+
+
 class HpBarAnalyzer:
     """
     フレームからHP%を推定する。

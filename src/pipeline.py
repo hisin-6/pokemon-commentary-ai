@@ -43,7 +43,7 @@ _ROOT = str(Path(__file__).parent.parent)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from src.capture.hpbar_analyzer import HpBarAnalyzer
+from src.capture.hpbar_analyzer import HpBarAnalyzer, slot_bar_centers
 from src.capture.screen_capture import DiffDetector, init_reader, run_ocr
 from src.capture.yolo_detector import BattleState, YoloDetector
 from src.commentary.phi3_client import Phi3Client
@@ -950,8 +950,11 @@ class BattleMessageParser:
         r'(.{2,12})(?:は|が)\s*(まひ|やけど|どく|もうどく|こおり|ねむり)\s*(?:じょうたい|状態)?'
     )
 
-    def __init__(self) -> None:
+    def __init__(self, clock=None) -> None:
         self._seen: dict[tuple[str, str], float] = {}
+        # 動画モードでは time.time() が実処理時間(OCR時間)を返し、動画内時間から
+        # 大きく乖離するため（BattlePhaseClassifierと同じ問題）、clock注入に対応する。
+        self._clock = clock or time.time
 
     def _extract_msg_text(self, ocr_results: list[dict]) -> str:
         """メッセージボックスROI内のテキストをy→x順に結合して返す。"""
@@ -972,7 +975,7 @@ class BattleMessageParser:
     def parse(self, ocr_results: list[dict]) -> list[dict]:
         """OCR結果からメッセージイベントのリストを返す（重複はデバウンスでスキップ）。"""
         text = self._extract_msg_text(ocr_results)
-        now = time.time()
+        now = self._clock()
         events: list[dict] = []
 
         def _emit(event_type: str, pokemon: str, raw: str = "") -> None:
@@ -1088,19 +1091,33 @@ class BattleStateTracker:
     MAX_SLOTS       = 4    # 試合全体での最大登録数（4匹パーティ）
     MAX_ON_FIELD    = 2    # ダブルバトル: 同時に場に出せる最大数
     MAX_EVENTS      = 8
-    # on_field=True でこのターン数以上不検出なら場にいないと判断
+    # on_field=True でこの「ゲームターン数」以上不検出なら場にいないと判断。
+    # ⚠️ last_seen_turn は self.game_turn（実ターン数）で管理すること。
+    # 内部イベントカウンター self.turn を使うと、メガシンカ・道具発動・毒ダメージ等
+    # メッセージが立て込む区間で同一ターン内に update() が何度も呼ばれ、実際は
+    # 1ターンも経っていないのに閾値を超えて誤って場から降ろしてしまう（実機:
+    # 07-00-19でオオニューラ・イダイトウが同時に誤って場から降ろされ、片方は
+    # 試合終了まで復帰しなかった）。
     _ON_FIELD_MISS_THRESHOLD = 3
     _HP_RE = re.compile(r'(\d{1,3})/(\d{1,3})')
     # 画面中央x座標: これより左がスロット0（左）、右がスロット1（右）
     _SLOT_X_CENTER = 960
-    # HPバー中心x座標（1920x1080実測・hpbar_analyzer._DEFAULT_SLOTS 準拠）。
+    # HPバー中心x座標。hpbar_analyzer.slot_bar_centers() で _DEFAULT_SLOTS から算出する
+    # （ハードコードだとROI再キャリブレーション時に手計算し忘れて静かにズレるため）。
     # ネームプレートは各バーの直上に表示され、cx はバー中心から±140px以内に収まる
     # （診断JSONL実測: 自分側 cx 200-299/600-699・相手側 cx 1200-1299/1600-1699 の
     #   2クラスタがバー中心 292/688・1336/1732 に対応）
-    _SLOT_BAR_CENTERS = {"player": (292, 688), "opponent": (1336, 1732)}
+    _SLOT_BAR_CENTERS = slot_bar_centers()
     # 最寄りバー中心からこの距離を超える cx はネームプレート由来ではない
     # （選出リスト cx≈250 が相手側スロットを誤取得するのを防ぐ）
     _SLOT_CX_TOLERANCE = 200
+
+    @staticmethod
+    def _fuzzy_name_match(a: str, b: str) -> bool:
+        """OCR揺らぎ（前方一致・末尾見切れ）を許容したポケモン名の同一性判定。
+        完全一致 or どちらかがもう一方の部分文字列なら同一個体とみなす。
+        """
+        return a == b or a in b or b in a
 
     def __init__(self):
         self.turn = 0       # 内部イベントカウンター（_ON_FIELD_MISS_THRESHOLD 用）
@@ -1237,7 +1254,7 @@ class BattleStateTracker:
             for name, hp in pokemon_hp_pairs:
                 for slot in on_field:
                     if id(slot) not in matched:
-                        if slot.name == name or name in slot.name or slot.name in name:
+                        if self._fuzzy_name_match(slot.name, name):
                             slot.hp = hp
                             matched.add(id(slot))
                             break
@@ -1304,7 +1321,7 @@ class BattleStateTracker:
         candidates: list[tuple[FieldPokemon, float]] = []
         for name, cx in name_with_cx:
             for slot in slots:
-                if slot.name == name or name in slot.name or slot.name in name:
+                if self._fuzzy_name_match(slot.name, name):
                     if slot.on_field and slot.slot_index is None:
                         candidates.append((slot, cx))
                     break
@@ -1408,14 +1425,14 @@ class BattleStateTracker:
             slot = self._get_or_create(self._player, name, low_trust=True)
             if slot:
                 slot.confidence += 1
-                slot.last_seen_turn = self.turn
+                slot.last_seen_turn = self.game_turn
                 if not slot.fainted:
                     slot.on_field = True  # 現フレームで見えた → 場にいる
 
         # 長期間不検出のポケモンを場から降ろす（OCRノイズで一時的に消える場合は維持）
         for slot in self._player:
             if slot.on_field and not slot.fainted:
-                if self.turn - slot.last_seen_turn > self._ON_FIELD_MISS_THRESHOLD:
+                if self.game_turn - slot.last_seen_turn > self._ON_FIELD_MISS_THRESHOLD:
                     slot.on_field = False
                     log.info(f"[戦況] {slot.name} が{self._ON_FIELD_MISS_THRESHOLD}ターン不検出 → 場から降ろす")
 
@@ -1427,7 +1444,7 @@ class BattleStateTracker:
             slot = self._get_or_create(self._opponent, name, low_trust=True)
             if slot:
                 slot.confidence += 1
-                slot.last_seen_turn = self.turn
+                slot.last_seen_turn = self.game_turn
                 if slot.fainted:
                     # OCR で再検出されたにもかかわらず fainted=True → 誤ひんし判定を解除
                     # （ボール数ロジックの誤判定でひんし扱いされたポケモンが復帰できるようにする）
@@ -1443,12 +1460,16 @@ class BattleStateTracker:
                 # OCR で相手名が検出されている場合: そのフレームで見えないなら即座に降ろす
                 # （交代直後に旧ポケモンが残り続けるのを防ぐ）
                 if current_opponent_names and slot.name not in current_opponent_names:
+                    # こちらは「今フレームに他の相手名が見えているのにこの名前だけ無い」
+                    # という直接証拠に基づく即時判定のため、意図的に self.turn
+                    # （イベント単位）のままにする。self.game_turn 化すると次のターン
+                    # 境界まで除去が遅延し、交代直後に旧ポケモンが残り続けてしまう。
                     quick_threshold = 1
                     if self.turn - slot.last_seen_turn >= quick_threshold:
                         slot.on_field = False
                         newly_removed_opponent.append(slot)
                         log.info(f"[戦況] {slot.name} がOCR不検出（{slot.name} not in {current_opponent_names}）→ 場から降ろす")
-                elif self.turn - slot.last_seen_turn > self._ON_FIELD_MISS_THRESHOLD:
+                elif self.game_turn - slot.last_seen_turn > self._ON_FIELD_MISS_THRESHOLD:
                     slot.on_field = False
                     newly_removed_opponent.append(slot)
                     log.info(f"[戦況] {slot.name} が{self._ON_FIELD_MISS_THRESHOLD}ターン不検出 → 場から降ろす")
@@ -1607,16 +1628,18 @@ class BattleStateTracker:
                 no_status[0].status = status
                 log.info(f"[戦況] {no_status[0].name} 状態異常: {status}（OCRアイコン スロット不明）")
 
-    # 確定状態異常技テーブル (技名 → (状態異常, 全体技かどうか))
+    # 確定状態異常技テーブル (技名 → 状態異常)
     # 技名はpokedb.sqlite の moves.name_ja と一致させること
     # ※ でんじは（単体技）はYOLOアイコン検出で正確なターゲットを特定するため除外
-    _STATUS_MOVE_TABLE: dict[str, tuple[str, bool]] = {
-        "おにび":         ("やけど",  True),    # 全体技
-        "どくどく":       ("もうどく", False),
-        "どくのこな":     ("どく",    False),
-        "キノコのほうし": ("ねむり",  False),
-        "さいみんじゅつ": ("ねむり",  False),
-        "うたう":         ("ねむり",  False),
+    # ※ 全体技/単体技を問わず、場に複数いる場合は全員に付与する（下記docstring参照）ため
+    #   技ごとの範囲情報は持たない
+    _STATUS_MOVE_TABLE: dict[str, str] = {
+        "おにび":         "やけど",   # 全体技
+        "どくどく":       "もうどく",
+        "どくのこな":     "どく",
+        "キノコのほうし": "ねむり",
+        "さいみんじゅつ": "ねむり",
+        "うたう":         "ねむり",
     }
 
     def apply_status_from_move(self, user_name: str, move_name: str) -> None:
@@ -1625,14 +1648,13 @@ class BattleStateTracker:
         既に状態異常があるポケモン・気絶済みポケモンはスキップ。
         単体技でも場に複数いる場合は全員に付与する（ダブルバトルでターゲット特定不能のため）。
         """
-        entry = self._STATUS_MOVE_TABLE.get(move_name)
-        if not entry:
+        status = self._STATUS_MOVE_TABLE.get(move_name)
+        if not status:
             return
-        status, _is_spread = entry
 
         # 使用者がどちらのチームか判定（部分一致で対応）
         in_player = any(
-            s.name == user_name or user_name in s.name or s.name in user_name
+            self._fuzzy_name_match(s.name, user_name)
             for s in self._player
         )
         target_side = self._opponent if in_player else self._player
@@ -1669,6 +1691,10 @@ class BattleStateTracker:
                     old = p.hp_pct_pixel
                     p.hp_pct_pixel = pct
                     p.hp_px_turn = self.turn
+                    # HPバーが物理スロットで読めている＝そのポケモンが確実に場にいる証拠。
+                    # 名前OCRでの独立再検出頻度が低い個体（実機: 07-00-19のオオニューラ）が
+                    # _ON_FIELD_MISS_THRESHOLD で誤って場から降ろされるのを防ぐ。
+                    p.last_seen_turn = self.game_turn
                     if old is None or abs(pct - old) >= 0.05:
                         log.info("[HPpx] %s %s → %.1f%%", key, p.name, pct * 100)
                     matched = True
@@ -1693,6 +1719,7 @@ class BattleStateTracker:
                         continue  # 占有者交代 → 前任者の値はスキップ（次サイクル以降の新確定値を待つ）
                     p.hp_pct_pixel = pct
                     p.hp_px_turn = self.turn
+                    p.last_seen_turn = self.game_turn  # HPバー実測＝場にいる証拠（上のパス1と同様）
                     log.info("[HPpx] %s %s → %.1f%%", key, p.name, pct * 100)
 
     def _claim_slot(self, key: str, name: str) -> bool:
@@ -1743,14 +1770,14 @@ class BattleStateTracker:
     def _find_slot(self, name: str) -> FieldPokemon | None:
         """名前で両チームを検索してスロットを返す（部分一致OK）。"""
         for slot in self._player + self._opponent:
-            if slot.name == name or name in slot.name or slot.name in name:
+            if self._fuzzy_name_match(slot.name, name):
                 return slot
         return None
 
     def _confirm_faint_on_side(self, slots: list, name: str) -> bool:
         """指定した側のスロットのみを検索してfaintedフラグを立てる。"""
         for slot in slots:
-            if slot.name == name or name in slot.name or slot.name in name:
+            if self._fuzzy_name_match(slot.name, name):
                 if not slot.fainted:
                     slot.fainted = True
                     slot.on_field = False
@@ -1761,10 +1788,6 @@ class BattleStateTracker:
                     log.info(f"[戦況] {slot.name} 気絶確認（メッセージ由来）")
                 return True
         return False
-
-    def confirm_faint_by_name(self, name: str) -> bool:
-        """メッセージ由来の気絶確認: 両陣営を検索（サイド不明の場合のフォールバック用）。"""
-        return self._confirm_faint_on_side(self._player + self._opponent, name)
 
     def confirm_player_faint_by_name(self, name: str) -> bool:
         """自分側のポケモン気絶確認（「たおれた」メッセージに「相手の」なし）。"""
@@ -1805,7 +1828,7 @@ class BattleStateTracker:
                     s.confidence += 1
                     if not s.fainted and not s.on_field and on_field_count < 2:
                         s.on_field = True
-                        s.last_seen_turn = self.turn
+                        s.last_seen_turn = self.game_turn
                         log.info(f"[戦況] {s.name} 定期OCR検出 → 場に追加")
             return
         if on_field_count >= 2:
@@ -1815,7 +1838,7 @@ class BattleStateTracker:
         slot = self._get_or_create(self._player, name, low_trust=True)
         if slot and not slot.fainted:
             slot.on_field = True
-            slot.last_seen_turn = self.turn
+            slot.last_seen_turn = self.game_turn
             log.info(f"[戦況] {slot.name} 定期OCR検出 → 新規登録して場に追加")
 
     def mark_on_field_by_name(self, name: str) -> bool:
@@ -1825,14 +1848,14 @@ class BattleStateTracker:
         """
         slot = None
         for s in self._player:
-            if s.name == name or name in s.name or s.name in name:
+            if self._fuzzy_name_match(s.name, name):
                 slot = s
                 break
         if slot is None:
             slot = self._get_or_create(self._player, name)
         if slot and not slot.fainted:
             slot.on_field = True
-            slot.last_seen_turn = self.turn
+            slot.last_seen_turn = self.game_turn
             log.info(f"[戦況] {slot.name} 繰り出し確認（メッセージ由来）")
             return True
         if slot is None:
@@ -1849,7 +1872,7 @@ class BattleStateTracker:
         if not slot.fainted:
             slot.on_field = True
             slot.confidence += 1
-            slot.last_seen_turn = self.turn
+            slot.last_seen_turn = self.game_turn
             log.info(f"[戦況] 相手 {slot.name} 繰り出し確認（メッセージ由来）")
         return True
 
@@ -1875,7 +1898,7 @@ class BattleStateTracker:
         pools = {"player": self._player, "opponent": self._opponent}
         slots = pools.get(side) if side in pools else (self._player + self._opponent)
         for slot in slots:
-            if slot.name == name or name in slot.name or slot.name in name:
+            if self._fuzzy_name_match(slot.name, name):
                 slot.on_field = False
                 log.info(f"[戦況] {slot.name} 引っ込め確認（メッセージ由来）")
                 return True
@@ -2240,7 +2263,7 @@ class Pipeline:
         self._hpbar_analyzer = HpBarAnalyzer()             # HPバーピクセル解析
         # スロット占有者交代時にアナライザーの安定化状態をリセットする配線
         self._battle_tracker.slot_reset_cb = self._hpbar_analyzer.reset_slot
-        self._msg_parser = BattleMessageParser()           # バトルメッセージ解析
+        self._msg_parser = BattleMessageParser(clock=self._now)  # バトルメッセージ解析
         self._battle_active = False  # battle_start〜battle_end の間のみ True
         self._last_battle_end_time: float = 0.0  # battle_end 後のクールダウン用
         self._BATTLE_START_COOLDOWN = 10.0  # battle_end 後この秒数は battle_start をブロック
@@ -2371,7 +2394,7 @@ class Pipeline:
                         log.debug(f"[YOLO/balls] コマンド選択時に検出: {ball_state.summary()}")
 
                 # ── 終了画面 YOLO 検知（毎フレーム・連続確認あり）──────────
-                _battle_elapsed = time.time() - self._battle_active_since
+                _battle_elapsed = self._now() - self._battle_active_since
                 if (self._battle_active
                         and not self._phase_classifier._is_processing
                         and _battle_elapsed >= self._MIN_BATTLE_DURATION):
@@ -2533,8 +2556,8 @@ class Pipeline:
                     # （リザルト画面・ロビー画面の command_select 誤検知対策）
                     if (event_type == "battle_start"
                             and self._last_battle_end_time > 0
-                            and time.time() - self._last_battle_end_time < self._BATTLE_START_COOLDOWN):
-                        remaining = self._BATTLE_START_COOLDOWN - (time.time() - self._last_battle_end_time)
+                            and self._now() - self._last_battle_end_time < self._BATTLE_START_COOLDOWN):
+                        remaining = self._BATTLE_START_COOLDOWN - (self._now() - self._last_battle_end_time)
                         log.debug(f"battle_end 後クールダウン中のため battle_start をスキップ (残り {remaining:.1f}s)")
                         event_type = None
 
@@ -2585,7 +2608,7 @@ class Pipeline:
                             # 通らず 75秒タイムアウトまで待ってしまう問題を防ぐ。
                             if (event_type == "move_used"
                                     and self._pending_faint_state is not None):
-                                elapsed = time.time() - self._pending_faint_time
+                                elapsed = self._now() - self._pending_faint_time
                                 log.info(
                                     "[faint早期フラッシュ] OCR品質不足だがmove_usedが来たので"
                                     "保留faintを単独送信 (%.1f秒後)", elapsed
@@ -2705,7 +2728,7 @@ class Pipeline:
                 log.info(f"[ターン] T{self._battle_tracker.game_turn} 開始")
             # 保留中のfaintがタイムアウトしていれば単独Bedrock送信でフラッシュ
             if (self._pending_faint_state is not None
-                    and time.time() - self._pending_faint_time >= self._FAINT_PENDING_TIMEOUT):
+                    and self._now() - self._pending_faint_time >= self._FAINT_PENDING_TIMEOUT):
                 log.info("[faintフラッシュ] タイムアウト(%gs超過) → 保留faintを単独送信",
                          self._FAINT_PENDING_TIMEOUT)
                 self._flush_pending_faint()
@@ -2744,7 +2767,7 @@ class Pipeline:
             # アナライザーの確定値も前試合・試合前画面の値が残るためリセット
             self._hpbar_analyzer.reset()
             self._battle_active = True
-            self._battle_active_since = time.time()
+            self._battle_active_since = self._now()
             self._end_screen_count = 0
             self._commentary_history = []
             self._move_log = []
@@ -2777,7 +2800,7 @@ class Pipeline:
         if not self._battle_active and event_type in {"move_used", "faint", "switch"}:
             log.warning("[戦況] battle_start 未検知 → バトルをアクティブ化（遅延起動）")
             self._battle_active = True
-            self._battle_active_since = time.time()
+            self._battle_active_since = self._now()
             # 事前キャッシュが残っていれば登録（battle_start スキップで未登録のケース）
             if self._pre_battle_opponent:
                 for name in self._pre_battle_opponent:
@@ -2818,14 +2841,14 @@ class Pipeline:
                 self._pending_faint_state = game_state
                 self._pending_faint_battle_context = battle_context
                 self._pending_faint_frame = frame
-                self._pending_faint_time = time.time()
+                self._pending_faint_time = self._now()
                 self._pending_faint_game_turn = self._battle_tracker.game_turn
                 # 実況・VOICEVOX もスキップして終了（戦況更新は済み）
                 return
 
             # ── move_usedで保留中のfaint情報があれば統合 ──
             if event_type == "move_used" and self._pending_faint_state is not None:
-                elapsed = time.time() - self._pending_faint_time
+                elapsed = self._now() - self._pending_faint_time
                 if elapsed < self._FAINT_PENDING_TIMEOUT:
                     log.info("[faint統合] 保留faint(%.1f秒前)をmove_usedに統合", elapsed)
                     # turn_start がデバウンスで飛ばされた場合のみ繰り上げが必要。
@@ -2902,7 +2925,7 @@ class Pipeline:
         # バトル終了後にアクティブフラグをリセット（Bedrock呼び出し後）
         if event_type == "battle_end":
             self._battle_active = False
-            self._last_battle_end_time = time.time()
+            self._last_battle_end_time = self._now()
             self._pre_battle_opponent.clear()
             self._pre_battle_player.clear()
             self._recent_sendouts.clear()  # 前試合の繰り出しを次試合に引き継がない
@@ -3038,18 +3061,22 @@ class Pipeline:
         Champions交代: "オオニューラ / (もと) / 戻れ！" → PokeClassifierで名前を特定
         """
         texts = [r["text"].strip() for r in ocr_results if r["confidence"] >= 0.3]
-        has_return_text = any("戻" in t or "もど" in t for t in texts)
-        if not has_return_text:
-            return
 
         # パターン1: 「〜は戻っていく」（とんぼがえり等の交代技）
         # 例: "ゴリランダーは" → "ゴリランダー"
-        for text in texts:
-            if text.endswith("は") and len(text) >= 3:
-                pokemon_name_candidate = text[:-1]
-                found = self._battle_tracker.set_not_on_field(pokemon_name_candidate)
-                if found:
-                    log.info(f"[交代検知] {pokemon_name_candidate} が場から退いた（「戻っていく」テキスト検出）")
+        # ⚠️ ゲートは「戻って」（連用形）に限定する。旧実装は「戻」1文字含有で
+        # ゲートしていたため、「しろいハーブで ステータスを 元に戻した」（アイテム回復
+        # メッセージ）や「攻撃から 身を守った」のOCR誤読断片「戻る」にも誤反応し、
+        # set_not_on_field の無条件両側検索で無関係なポケモンを誤ベンチ化していた
+        # （実機: 20-14-17でオンバーン/オオニューラが一時誤ベンチ化・自己修復。
+        #   07-00-19では自分のオオニューラが試合終了まで誤ベンチのまま残留）。
+        if any("戻って" in t for t in texts):
+            for text in texts:
+                if text.endswith("は") and len(text) >= 3:
+                    pokemon_name_candidate = text[:-1]
+                    found = self._battle_tracker.set_not_on_field(pokemon_name_candidate)
+                    if found:
+                        log.info(f"[交代検知] {pokemon_name_candidate} が場から退いた（「戻っていく」テキスト検出）")
 
         # パターン2: 「〇〇\n戻れ！」（Champions式コマンド交代）
         # OCR結合テキストに "戻れ" が含まれる場合、MSG ROI内のトークンを縦順にスキャンして
@@ -3305,7 +3332,7 @@ class Pipeline:
             # メッセージ付近（y≈600-740）に出るポケモン名トークンのみを拾う。
             _MSG_AREA_Y_MIN = BattleMessageParser.MSG_Y_MIN - 140  # 600
             # dense scan 時は ocr_results が msg ROI のみ → メインOCRキャッシュも合わせて検索する
-            search_sources = ocr_results if ocr_results is not self._last_full_ocr_results else ocr_results
+            search_sources = ocr_results
             if self._last_full_ocr_results and self._last_full_ocr_results is not ocr_results:
                 search_sources = list(ocr_results) + self._last_full_ocr_results
             speculative: str | None = None  # known_opponents 未一致でも有効なポケモン名
