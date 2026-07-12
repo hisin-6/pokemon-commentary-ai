@@ -2885,7 +2885,7 @@ class Pipeline:
             bedrock_commentary, bedrock_analysis = _call_bedrock_vision(
                 self._ec2_url, frame, game_state, event_type,
                 self._commentary_history, battle_context, self._classifier,
-                self._move_log[-5:],
+                self._move_log_display(5),
             )
             if bedrock_commentary:
                 log.info(f"Bedrock 完了 ({time.perf_counter()-t0:.2f}s): 「{bedrock_commentary}」")
@@ -2954,7 +2954,7 @@ class Pipeline:
         bedrock_commentary, _ = _call_bedrock_vision(
             self._ec2_url, frame, game_state, "faint",
             self._commentary_history, battle_context, self._classifier,
-            self._move_log[-5:],
+            self._move_log_display(5),
         )
         if bedrock_commentary:
             commentary = _clean_commentary(bedrock_commentary)
@@ -3172,6 +3172,19 @@ class Pipeline:
         elif event_type == "status":
             self._battle_tracker.update_status_by_name(pokemon, ev.get("status", ""))
 
+    def _move_log_display(self, n: int = 5) -> list[str]:
+        """Bedrock 送信用に技ログ末尾 n 件を整形する。
+
+        使い手を特定できず「場の1匹目」フォールバックで仮登録し、まだ後付け修正
+        （_update_move_log 冒頭の仮確定エントリ突合）で確定していないエントリには
+        「（推定）」を付け、LLM に使い手の確度が低いことを伝える。
+        """
+        tentative_entries = {t["old_entry"] for t in self._tentative_opponent_moves}
+        return [
+            f"{e}（推定）" if e in tentative_entries else e
+            for e in self._move_log[-n:]
+        ]
+
     def _update_move_log(self, ocr_results: list[dict], is_main_ocr: bool = False) -> None:
         """OCR 結果から「〜の → 技名」パターンを検出して _move_log に追記する。
 
@@ -3248,6 +3261,30 @@ class Pipeline:
                 p_result = self._classifier.classify(_normalize_ocr_kana(pokemon_name))
                 if p_result and p_result.category == CATEGORY_POKEMON and p_result.score >= 80:
                     pokemon_name = p_result.canonical_ja or pokemon_name
+                else:
+                    # 図鑑全体のファジー分類に失敗した場合でも、既にロスターにいる
+                    # ポケモンの使用者名見切れ（例: 「ドドゲザンの」→「ドゲザンの」）の
+                    # 可能性があるため、ロスター名との前方一致吸収（_get_or_create と同じ
+                    # 考え方）で救済を試みる。それも失敗するなら生のOCR断片を技ログへ
+                    # 流すリスクが高いため登録を拒否する。
+                    # （実機で「トムの」「キの」等の見切れ断片が無検証のまま
+                    #   「信頼度高」技として実況に渡っていたバグの再発防止）
+                    roster_names = {s.name for s in self._battle_tracker._player} | \
+                                   {s.name for s in self._battle_tracker._opponent}
+                    matched = next(
+                        (rn for rn in roster_names
+                         if min(len(rn), len(pokemon_name)) >= self._battle_tracker._ABSORB_MIN_LEN
+                         and self._battle_tracker._fuzzy_name_match(rn, pokemon_name)),
+                        None,
+                    )
+                    if matched:
+                        log.info("[技ログ] 使用者名候補 %s はロスターの %s の見切れ断片と判定 → 補正",
+                                 pokemon_name, matched)
+                        pokemon_name = matched
+                    else:
+                        log.debug("[技ログ] 使用者名候補 %s を分類・ロスター一致とも失敗のため棄却（技候補: %s）",
+                                  pokemon_name, move_candidate)
+                        return False
                 # is_opponent=True の場合、登録済みポケモン優先だが
                 # Champions ダブルバトルではスロット割当前のため known_opp に入っていないことがある。
                 # 未登録でも弾かず、debug ログだけ残して続行する。

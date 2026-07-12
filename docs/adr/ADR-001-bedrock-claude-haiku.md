@@ -50,3 +50,18 @@ AWS BedrockのClaude Haiku Visionを**画面全体の状況理解（Vision分析
 ## 結果
 
 VRAMを消費せずVision処理をクラウドに逃がすことができ、ローカルリソースを3DモデルとローカルLLMに集中させられる。実況文生成はローカルLLM（ADR-003）が担当することでAPIコストをさらに抑制できる。
+
+## 追記（2026-07-12）: Claude Haiku 4.5への移行
+
+AWSより`anthropic.claude-3-haiku-20240307-v1:0`のBedrockモデル廃止通知を受領。Legacy状態は2026-03-10開始済み、EOLは2026-09-10。
+
+後継の`anthropic.claude-haiku-4-5-20251001-v1:0`（Claude Haiku 4.5）へ移行。「安価・高速なHaiku系列をBedrockで使う」という本ADRの決定自体に変更はないため、ADR自体の再改訂ではなく追記とする。
+
+ただしap-southeast-2リージョンはClaude Haiku 4.5のIn-Region直接呼び出しに非対応のため、AU向けクロスリージョン推論プロファイルID `au.anthropic.claude-haiku-4-5-20251001-v1:0` を使用する（`src/api/server.py`の`BEDROCK_MODEL_ID`）。実体としてはシドニー/メルボルンにルーティングされるのみでAU圏内に閉じる。
+
+**移行に必要な作業（ユーザー側）**:
+- Bedrockコンソールでモデルアクセス有効化
+- EC2 IAMロールが推論プロファイルARNへの`bedrock:InvokeModel`を許可しているか確認
+- `server.py`更新版をEC2へWinSCPデプロイ
+
+詳細手順: [Bedrock Claude Haiku 4.5 移行マニュアル](../manual/bedrock-haiku-4-5-migration.md)

@@ -87,3 +87,4 @@ Thumbs.db
 
 # Claude Code 設定・メモリ
 .claude/
+docs/manual/bedrock-haiku-4-5-migration.md

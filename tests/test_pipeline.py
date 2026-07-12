@@ -875,6 +875,85 @@ class TestUpdateSwitchOut:
         assert self.mine.on_field is False
 
 
+class TestTryRegisterRosterFallback:
+    """_try_register の使用者名見切れ検証（ロスター前方一致救済／未一致は棄却）の回帰ガード。
+
+    実機で「トムの」「キの」等のOCR見切れ断片が分類器で弾かれずそのまま_move_log に
+    登録され、「信頼度高」技としてBedrockに渡っていたバグの再発防止。
+    """
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)  # __init__ を経由せず属性だけ用意
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._tentative_opponent_moves = []
+        self.runner._battle_active = True
+        self.runner._dense_scan_start_turn = None
+        self.runner._move_log = []
+        self.runner._MAX_MOVE_LOG = 8
+        self.runner._dense_scan_remaining = 0
+        self.runner._last_full_ocr_results = []
+
+    def _set_classifier(self, moves, pokemon):
+        """moves/pokemon に完全一致する文字列だけを該当カテゴリと判定する簡易分類器モック。"""
+        class _Result:
+            def __init__(self, category, score, canonical_ja):
+                self.category = category
+                self.score = score
+                self.canonical_ja = canonical_ja
+
+        def classify(text):
+            if text in moves:
+                return _Result("move", 95, text)
+            if text in pokemon:
+                return _Result("pokemon", 95, pokemon[text])
+            return _Result("other", 0, text)
+
+        clf = MagicMock()
+        clf.classify.side_effect = classify
+        self.runner._classifier = clf
+
+    def test_unrecognized_truncated_name_without_roster_match_is_rejected(self):
+        """ロスターにも図鑑にも一致しない見切れ断片（例:「トム」）は技ログへ登録しない。"""
+        self._set_classifier(moves={"テクノバスター"}, pokemon={})
+        events = [_ocr("トムの", y_center=800.0), _ocr("テクノバスター", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+        assert self.runner._move_log == []
+
+    def test_truncated_roster_name_is_corrected_via_suffix_match(self):
+        """既知ロスター「ドドゲザン」への見切れ断片「ドゲザン」はロスター名に補正して登録される。"""
+        self.runner._battle_tracker._opponent.append(
+            FieldPokemon(name="ドドゲザン", on_field=True)
+        )
+        self._set_classifier(moves={"ドゲザン"}, pokemon={})
+        events = [_ocr("ドゲザンの", y_center=800.0), _ocr("ドゲザン", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+        assert self.runner._move_log == ["T0:ドドゲザンのドゲザン"]
+
+
+class TestMoveLogDisplay:
+    """_move_log_display: 後付け未修正の仮確定エントリに「（推定）」を付けてBedrockへ渡す。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._move_log = ["T1:オオニューラのわるだくみ", "T2:リキキリンのけたぐり"]
+
+    def test_confirmed_entry_has_no_marker(self):
+        self.runner._tentative_opponent_moves = []
+        assert self.runner._move_log_display(5) == [
+            "T1:オオニューラのわるだくみ", "T2:リキキリンのけたぐり",
+        ]
+
+    def test_unconfirmed_tentative_entry_gets_marked(self):
+        """使い手フォールバックのまま後付け修正されていないエントリのみ「（推定）」が付く。"""
+        self.runner._tentative_opponent_moves = [
+            {"old_entry": "T2:リキキリンのけたぐり", "move_name": "けたぐり",
+             "turn_label": "2", "fallback_pokemon": "リキキリン"},
+        ]
+        assert self.runner._move_log_display(5) == [
+            "T1:オオニューラのわるだくみ", "T2:リキキリンのけたぐり（推定）",
+        ]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # スロット番号割り当て（_assign_slot_indices・HPスロット反転バグの回帰ガード）
 # ═══════════════════════════════════════════════════════════════════════════════

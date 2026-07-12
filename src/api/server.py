@@ -27,8 +27,10 @@ from flask import Flask, jsonify, request
 
 # ─── 設定 ────────────────────────────────────────────────────────────────────
 
+# Claude 3 Haiku は2026-09-10 EOL（ADR-001参照）。後継のClaude Haiku 4.5に移行。
+# ap-southeast-2はIn-Region直接呼び出し非対応のため、AU推論プロファイルIDを使用。
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "ap-southeast-2")
-BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
+BEDROCK_MODEL_ID = "au.anthropic.claude-haiku-4-5-20251001-v1:0"
 BEDROCK_TIMEOUT_SEC = 5
 IMAGE_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 
@@ -122,8 +124,9 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict) 
         f"相手側のポケモン名候補（不正確・参考のみ）: {context.get('name_candidates_opponent', '不明')}",
         f"自分の状態異常: {context.get('status_player', 'なし')}",
         f"相手の状態異常: {context.get('status_opponent', 'なし')}",
-        f"OCRで検出した使用技（〜のXX形式・信頼度高）: {context.get('detected_moves', 'なし')}",
+        f"OCRで検出した使用技（〜のXX形式・信頼度高。「（推定）」付きは使い手ポケモンが未確定の仮推定）: {context.get('detected_moves', 'なし')}",
         "  ↑ このターンで実際に使われた技として最優先で参照すること",
+        "  （「（推定）」付きの場合、技自体は使われたが使い手の名前は断定せず「相手」等に留めること）",
     ]
     rag_info: list = context.get("rag_pokemon_info", [])
     if rag_info:
