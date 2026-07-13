@@ -765,6 +765,37 @@ class TestBattleMessageParser:
         events = self.parser.parse(_msg_ocr("オオニューラ", "戻れ!"))
         assert ("switch_out", "オオニューラ") in self._types(events)
 
+    def _statuses(self, events):
+        return [(e["pokemon"], e["status"]) for e in events if e["type"] == "status"]
+
+    def test_status_kanji_sleep_with_ocr_fragment(self):
+        """Champions漢字形式「眠ってしまった」を検出し「ねむり」に正規化する。
+        名前と状態語の間のOCR断片ノイズ「ねむ」も許容する
+        （実機: 16-14-39 T2「ペリッパーは ねむ 眠ってしまった!」のねむり漏れの回帰ガード）。"""
+        events = self.parser.parse(_msg_ocr("ペリッパーは", "ねむ", "眠ってしまった!"))
+        assert ("ペリッパー", "ねむり") in self._statuses(events)
+
+    def test_status_kanji_freeze(self):
+        """「凍りついた」→「こおり」に正規化される。"""
+        events = self.parser.parse(_msg_ocr("オオニューラは", "凍りついた!"))
+        assert ("オオニューラ", "こおり") in self._statuses(events)
+
+    def test_status_kanji_poison(self):
+        """「毒を あびた」→「どく」に正規化される。"""
+        events = self.parser.parse(_msg_ocr("イダイトウは", "毒を", "あびた!"))
+        assert ("イダイトウ", "どく") in self._statuses(events)
+
+    def test_status_hiragana_still_works(self):
+        """従来のひらがな形式（SV）は引き続き検出される。"""
+        events = self.parser.parse(_msg_ocr("ピカチュウは", "まひじょうたいになった!"))
+        assert ("ピカチュウ", "まひ") in self._statuses(events)
+
+    def test_status_not_triggered_by_imahitotsu(self):
+        """「効果は いまひとつだ」の「(い)まひ」を状態異常と誤検出しない。
+        ノイズスキップをひらがな状態語側に入れると実ログ53本で大量誤爆した回帰ガード。"""
+        events = self.parser.parse(_msg_ocr("相手の", "イダイトウに", "効果は", "いまひとつだ"))
+        assert self._statuses(events) == []
+
 
 class TestMarkBenchBySide:
     """mark_bench_by_name の side 限定（同名ミラー戦の誤ベンチ化防止）"""
@@ -1031,6 +1062,154 @@ class TestSlotIndexAssignment:
         self.tracker._assign_slot_indices(
             self.tracker._opponent, [("リザードン", 1275.0)], "opponent")
         assert liza.slot_index == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# assign_hp_from_ocr（定期OCR経路の数値HP補完割当）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAssignHpFromOcr:
+    """定期OCRからの数値HP割当（位置ゲート＋バー中心cx近接＋2回一致ヒステリシス）。
+    実機: 07-00-19 終盤のイダイトウ 7/201 が画面で正読されていたのに
+    イベント経路にしか数値HP割当がなく、HPpx物理限界の古い47%が表示され続けた。
+    座標は実測値（自分側数値=cy1000-1049・cx292/688近傍、相手側%=cy100-151・
+    cx1336/1732近傍）に基づく。"""
+
+    # 実測に基づく正当な表示位置
+    P0 = (292.0, 1028.0)   # 自分スロット0の数値位置
+    P1 = (688.0, 1028.0)   # 自分スロット1の数値位置
+    O0 = (1350.0, 147.0)   # 相手スロット0のHP%位置
+    O1 = (1750.0, 147.0)   # 相手スロット1のHP%位置
+
+    def setup_method(self):
+        self.tracker = BattleStateTracker()
+        self.p = FieldPokemon(name="イダイトウ", on_field=True, slot_index=0)
+        self.tracker._player.append(self.p)
+
+    def _p(self, hp, pos=None):
+        cx, cy = pos or self.P0
+        return [(hp, cx, cy)]
+
+    def test_assigns_after_two_consistent_reads(self):
+        self.tracker.assign_hp_from_ocr(self._p("7/201"), [])
+        assert self.p.hp is None  # 1回目は保留
+        self.tracker.assign_hp_from_ocr(self._p("7/201"), [])
+        assert self.p.hp == "7/201"
+
+    def test_single_or_flickering_read_not_assigned(self):
+        """単発誤読（1/205等）や毎サイクル値が変わる読みは割り当てない。"""
+        self.tracker.assign_hp_from_ocr(self._p("1/205"), [])
+        self.tracker.assign_hp_from_ocr(self._p("101/205"), [])
+        assert self.p.hp is None
+
+    def test_unreadable_cycle_does_not_reset_pending(self):
+        """HP未読サイクル（アニメ・パネル等）を挟んでも保留値は維持され、
+        次の同値読みで確定する（実機 07-00-19: 7/201→空→7/201 の交互列で
+        確定しなかった回帰ガード）。"""
+        self.tracker.assign_hp_from_ocr(self._p("7/201"), [])
+        self.tracker.assign_hp_from_ocr([], [])
+        self.tracker.assign_hp_from_ocr(self._p("7/201"), [])
+        assert self.p.hp == "7/201"
+
+    def test_hazard_band_rejected(self):
+        """交換選択パネル等の危険帯（自分側 cy 750-799・相手側 cy 350-399）の
+        HP風数値は割り当てない（実測: '201/201' cx787/cy766・'100%' cx813/cy386）。"""
+        self.tracker.assign_hp_from_ocr(self._p("117/155", (787.0, 766.0)), [])
+        self.tracker.assign_hp_from_ocr(self._p("117/155", (787.0, 766.0)), [])
+        assert self.p.hp is None
+        opp = FieldPokemon(name="ガブリアス", on_field=True, slot_index=0)
+        self.tracker._opponent.append(opp)
+        self.tracker.assign_hp_from_ocr([], [("100%", 813.0, 386.0)])
+        self.tracker.assign_hp_from_ocr([], [("100%", 813.0, 386.0)])
+        assert opp.hp is None
+
+    def test_cx_far_from_bar_center_rejected(self):
+        """バー中心からcx許容（200px）超の数値は割り当てない（画面中央の
+        bboxなしフォールバック座標 cx=960 等）。"""
+        self.tracker.assign_hp_from_ocr(self._p("7/201", (960.0, 999.0)), [])
+        self.tracker.assign_hp_from_ocr(self._p("7/201", (960.0, 999.0)), [])
+        assert self.p.hp is None
+
+    def test_zero_hp_not_assigned(self):
+        """0/X は誤気絶防止のため定期OCR経路でも割り当てない。"""
+        self.tracker.assign_hp_from_ocr(self._p("0/201"), [])
+        self.tracker.assign_hp_from_ocr(self._p("0/201"), [])
+        assert self.p.hp is None
+
+    def test_stale_px_loses_to_fresh_numeric_display(self):
+        """HPpxが物理限界（<6.6%）で更新できない時、後から読めた数値HPが表示に勝つ。"""
+        self.p.hp_pct_pixel = 0.473
+        self.p.hp_px_turn = self.tracker.turn
+        self.tracker.assign_hp_from_ocr(self._p("7/201"), [])
+        self.tracker.assign_hp_from_ocr(self._p("7/201"), [])
+        assert "HP:7/201" in self.tracker._format_pokemon(self.p)
+
+    def test_held_px_value_does_not_mask_numeric(self):
+        """アナライザーが保持値を返し続けても hp_px_turn は再スタンプされず、
+        数値HPが表示に勝ち続ける（実機 07-00-19: T6で7/201→T7で47%(px)に
+        戻ってしまった再発バグの回帰ガード）。"""
+        self.tracker.update_pixel_hp({"player_0": 0.473})
+        first_stamp = self.p.hp_px_turn
+        self.tracker.assign_hp_from_ocr(self._p("7/201"), [])
+        self.tracker.assign_hp_from_ocr(self._p("7/201"), [])
+        # 次のイベントで turn が進み、アナライザーは保持値 0.473 を返し続ける
+        self.tracker.turn += 1
+        self.tracker.update_pixel_hp({"player_0": 0.473})
+        assert self.p.hp_px_turn == first_stamp  # 保持値では再スタンプしない
+        assert "HP:7/201" in self.tracker._format_pokemon(self.p)
+
+    def test_px_change_still_stamps_fresh(self):
+        """値が実際に変わったpx読みは従来通り鮮度スタンプされ表示に勝つ。"""
+        self.tracker.assign_hp_from_ocr(self._p("100/201"), [])
+        self.tracker.assign_hp_from_ocr(self._p("100/201"), [])
+        self.tracker.turn += 1
+        self.tracker.update_pixel_hp({"player_0": 0.25})
+        assert "HP:25%(px)" in self.tracker._format_pokemon(self.p)
+
+    def test_opponent_side_slot_by_cx(self):
+        """相手側はHP%のcxからバー中心近接でスロットを直接決定する
+        （1匹しか読めないフレームでも取り違えない）。%形式は3回一致で確定。"""
+        opp = FieldPokemon(name="ガブリアス", on_field=True, slot_index=1)
+        self.tracker._opponent.append(opp)
+        self.tracker.assign_hp_from_ocr([], [("64%", *self.O1)])
+        self.tracker.assign_hp_from_ocr([], [("64%", *self.O1)])
+        assert opp.hp is None  # %形式は2回では確定しない
+        self.tracker.assign_hp_from_ocr([], [("64%", *self.O1)])
+        assert opp.hp == "64%"
+
+    def test_pct_needs_three_reads_against_digit_drop(self):
+        """%形式の桁欠け誤読（72%→2%）が2回連続しても確定しない回帰ガード
+        （実機 06-25-46: ガブリアス2%★ピンチがBedrockスナップショットに漏れた）。"""
+        opp = FieldPokemon(name="ガブリアス", on_field=True, slot_index=0)
+        self.tracker._opponent.append(opp)
+        for _ in range(3):
+            self.tracker.assign_hp_from_ocr([], [("72%", *self.O0)])
+        assert opp.hp == "72%"
+        self.tracker.assign_hp_from_ocr([], [("2%", *self.O0)])
+        self.tracker.assign_hp_from_ocr([], [("2%", *self.O0)])
+        assert opp.hp == "72%"  # 2回の誤読では上書きされない
+
+    def test_single_digit_pct_rejected_when_known_hp_high(self):
+        """1桁%はUI遮蔽の先頭桁欠け（72%→「2%」がconf1.0で14秒継続を実測）と
+        区別がつかないため、既知HPが高いうちは何回一致しても受け付けない。"""
+        opp = FieldPokemon(name="ガブリアス", on_field=True, slot_index=0)
+        self.tracker._opponent.append(opp)
+        for _ in range(3):
+            self.tracker.assign_hp_from_ocr([], [("72%", *self.O0)])
+        for _ in range(4):
+            self.tracker.assign_hp_from_ocr([], [("2%", *self.O0)])
+        assert opp.hp == "72%"
+
+    def test_single_digit_pct_accepted_when_already_low(self):
+        """既知HPがすでに低い（≤25%）場合、本物の低HP進行（13%→2%）は通る。"""
+        opp = FieldPokemon(name="ユキメノコ", on_field=True, slot_index=0)
+        self.tracker._opponent.append(opp)
+        for _ in range(3):
+            self.tracker.assign_hp_from_ocr([], [("13%", *self.O0)])
+        assert opp.hp == "13%"
+        for _ in range(3):
+            self.tracker.assign_hp_from_ocr([], [("2%", *self.O0)])
+        assert opp.hp == "2%"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

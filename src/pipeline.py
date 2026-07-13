@@ -427,6 +427,8 @@ def _extract_structured_info(
         "opponent_pokemon_hp":  opponent_pokemon_hp,
         "hp_player_by_slot":    hp_player_by_slot,    # [左HP, 右HP] x座標ソート
         "hp_opponent_by_slot":  hp_opponent_by_slot,
+        "hp_player_with_xy":    hp_player_with_xy[:4],    # (hp, cx, cy) 位置ゲート用
+        "hp_opponent_with_xy":  hp_opponent_with_xy[:4],
         "name_player_with_cx":   [(n, cx) for n, cx, _ in name_player_with_xy[:5]],
         "name_opponent_with_cx": [(n, cx) for n, cx, _ in name_opponent_with_xy[:5]],
         "command_cy":           command_cy,           # COMMAND テキストの y 座標（None=未検出）
@@ -945,10 +947,24 @@ class BattleMessageParser:
         # slot_index を保持し続け、交代で入った別ポケモンと互いのHPバーを
         # 読み合う完全反転が起きる（実機で確認: リザードン⇔ガブリアス）
     )
-    # 状態異常メッセージ: 「〇〇は まひじょうたいになった」等
+    # 状態異常メッセージ: 「〇〇は まひじょうたいになった」等。
+    # Champions は漢字形式（「眠ってしまった」「凍りついた」等）でも表示される。
+    # 漢字状態語の前の [ぁ-んー\s]{0,4}? は OCR 断片ノイズの挟まり対策
+    # （実機: 「ペリッパーは ねむ 眠ってしまった!」の「ねむ」で不成立だった）。
+    # ⚠️ひらがな状態語側にはノイズスキップを入れないこと:
+    # 「効果は いまひとつだ」の「(い)まひ」を拾う大量誤爆になる（実ログ53本で確認）
     _STATUS_RE = re.compile(
-        r'(.{2,12})(?:は|が)\s*(まひ|やけど|どく|もうどく|こおり|ねむり)\s*(?:じょうたい|状態)?'
+        r'(.{2,12})(?:は|が)\s*'
+        r'(?:(まひ|やけど|もうどく|どく|こおり|ねむり)'
+        r'|[ぁ-んー\s]{0,4}?(眠って|眠り|凍りつ|凍って|麻痺|猛毒|毒))'
+        r'\s*(?:じょうたい|状態)?'
     )
+    # 漢字形式 → トラッカー正規形（ひらがな）への変換
+    _STATUS_KANJI_MAP = {
+        "眠って": "ねむり", "眠り": "ねむり",
+        "凍りつ": "こおり", "凍って": "こおり",
+        "麻痺": "まひ", "猛毒": "もうどく", "毒": "どく",
+    }
 
     def __init__(self, clock=None) -> None:
         self._seen: dict[tuple[str, str], float] = {}
@@ -1049,7 +1065,7 @@ class BattleMessageParser:
         m = self._STATUS_RE.search(status_text)
         if m:
             pokemon_name = m.group(1).strip().rstrip('！!」、')
-            status = m.group(2)
+            status = m.group(2) or self._STATUS_KANJI_MAP.get(m.group(3), m.group(3))
             if pokemon_name:
                 key = ("status", pokemon_name)
                 if now - self._seen.get(key, 0.0) >= self.DEDUP_TTL:
@@ -1135,6 +1151,8 @@ class BattleStateTracker:
         self._prev_opponent_alive: int | None = None  # 前ターンの相手生存数
         self._player_alive_count:  int | None = None  # 最新の自分生存数
         self._opponent_alive_count: int | None = None # 最新の相手生存数
+        # 定期OCR数値HPの確定ヒステリシス: (側, スロット番号) → (読み値, 連続観測数)
+        self._pending_ocr_hp: dict[tuple[str, int], tuple[str, int]] = {}
 
     # ── 内部ヘルパー ─────────────────────────────────────────────────────────
 
@@ -1292,6 +1310,115 @@ class BattleStateTracker:
         self._release_stale_slot_indices()
         self._assign_slot_indices(self._player,   player_name_cx,   "player")
         self._assign_slot_indices(self._opponent, opponent_name_cx, "opponent")
+
+    # 数値HP表示の実在帯（1080p実測・診断JSONL 07-00-19全数OCRより）:
+    # 自分側 X/Y 数値は cy 1000-1049 のみ（交換選択パネル等の危険帯は cy 750-799）
+    # 相手側 HP% は cy 100-151 のみ（状態パネル等の危険帯は cy 350-399）
+    _NUM_HP_PLAYER_Y_MIN = 950
+    _NUM_HP_OPP_Y_MAX = 200
+
+    def assign_hp_from_ocr(
+        self,
+        hp_player_with_xy: list[tuple[str, float, float]],
+        hp_opponent_with_xy: list[tuple[str, float, float]],
+    ) -> None:
+        """定期OCRの数値HPを位置ゲートで検証してスロットへ割り当てる（イベント外の補完）。
+        数値HPの割当は従来 update()（イベント経路）でしか行われなかったが、
+        イベント発火時のフレームはメッセージ/アニメ画面でHP数値が映らないことが
+        多く、画面に出ている正読値が毎回捨てられていた（実機で確認: 07-00-19 終盤の
+        イダイトウ 7/201 が何度も正読されていたのに、HPpx の物理限界（バー15px未満=
+        HP<6.6%は読めない）で残った古い 47%(px) が鮮度比較で勝ち続けた）。
+
+        ゲートは command_cy（トークンOCRがフレーム単位で欠落し不安定）ではなく
+        表示位置で行う: HP数値の実在帯（y）＋バー中心とのcx近接でスロットを直接
+        決定する。数値がバー位置とセットで表示される以上、画面種別に依存しない。
+
+        定期OCRはイベント経路よりサンプル数が多く、単発の数値誤読
+        （例: 「0/205」→「1/205」）が刺さるリスクが上がるため、
+        2回同じ読み値が観測された場合のみ割り当てる（幽霊登録と同じ考え方）。
+        """
+        for side, with_xy, slots in (
+                ("player",   hp_player_with_xy,   self._player),
+                ("opponent", hp_opponent_with_xy, self._opponent)):
+            centers = self._SLOT_BAR_CENTERS[side]
+            by_slot = ["", ""]
+            for hp, cx, cy in with_xy:
+                if side == "player" and cy < self._NUM_HP_PLAYER_Y_MIN:
+                    continue
+                if side == "opponent" and cy > self._NUM_HP_OPP_Y_MAX:
+                    continue
+                idx = 0 if abs(cx - centers[0]) <= abs(cx - centers[1]) else 1
+                if abs(cx - centers[idx]) > self._SLOT_CX_TOLERANCE:
+                    continue
+                if not by_slot[idx]:
+                    by_slot[idx] = hp
+            confirmed = self._confirm_ocr_hp(side, by_slot)
+            for s in slots:
+                i = s.slot_index
+                if not (s.on_field and i is not None
+                        and i < len(confirmed) and confirmed[i]):
+                    continue
+                # 1桁%（1-9%）はターゲット選択カーソル等のUI遮蔽で先頭桁が
+                # 隠れた誤読（72%→「2%」・conf1.0で14秒継続を実測）と区別が
+                # つかないため、既知HPがすでに低い場合のみ受け付ける
+                # （誤情報より欠落マシ。本物の低HP進行 13%→2% 等は通る）
+                m_pct = re.fullmatch(r'([1-9])%', confirmed[i])
+                if m_pct and not self._known_hp_is_low(s):
+                    log.info("[数値HP] %s の1桁%%読み %s を保留（既知HPが高く先頭桁欠け疑い）",
+                             s.name, confirmed[i])
+                    confirmed[i] = ""
+                    continue
+                # 0/X・0% は _assign_hp_by_slot が誤気絶防止のため
+                # 割り当てない → 実際に代入される値のみログする
+                if (confirmed[i] != s.hp
+                        and not confirmed[i].startswith("0/")
+                        and confirmed[i] != "0%"):
+                    log.info("[数値HP] %s → %s（定期OCR確定）",
+                             s.name, confirmed[i])
+            self._assign_hp_by_slot(slots, confirmed)
+
+    @staticmethod
+    def _known_hp_is_low(s: FieldPokemon, threshold: float = 0.25) -> bool:
+        """既知のHP（数値・pxのいずれか）が threshold 以下なら True。
+        どちらも不明なら False（=1桁%は棄却される側に倒す）。"""
+        if s.hp_pct_pixel is not None and s.hp_pct_pixel <= threshold:
+            return True
+        if s.hp:
+            m = re.match(r'^(\d+)/(\d+)$', s.hp)
+            if m and int(m.group(2)) > 0:
+                return int(m.group(1)) / int(m.group(2)) <= threshold
+            if s.hp.endswith("%"):
+                try:
+                    return int(s.hp[:-1]) / 100 <= threshold
+                except ValueError:
+                    return False
+        return False
+
+    # %形式は1トークン内の桁欠け誤読（72%→2%）が同一画面で連続しやすく、
+    # 2回一致では貫通した実例があるため3回一致を要求する。
+    # X/Y形式はスラッシュ＋分母の構造で頑健なため2回のまま
+    _OCR_HP_CONFIRM_XY = 2
+    _OCR_HP_CONFIRM_PCT = 3
+
+    def _confirm_ocr_hp(self, side: str, hp_by_slot: list[str]) -> list[str]:
+        """同じ読み値が規定回数連続で観測されたスロットのみ通す（誤読の除去）。
+        未読（空）のサイクルでは保留値を消さない: コマンド画面中は
+        HP数値が読めないフレーム（技の説明パネル等）が頻繁に挟まり、
+        消してしまうと連続一致が実機で事実上成立しない
+        （実機 07-00-19 で確認: 7/201→空→7/201 の交互列で一度も確定しなかった）。"""
+        confirmed: list[str] = []
+        for i, hp in enumerate(hp_by_slot):
+            key = (side, i)
+            if not hp:
+                confirmed.append("")
+                continue  # 未読は矛盾情報ではない → 保留を保持
+            prev_val, prev_cnt = self._pending_ocr_hp.get(key, (None, 0))
+            cnt = prev_cnt + 1 if prev_val == hp else 1
+            self._pending_ocr_hp[key] = (hp, cnt)
+            need = (self._OCR_HP_CONFIRM_PCT if hp.endswith("%")
+                    else self._OCR_HP_CONFIRM_XY)
+            confirmed.append(hp if cnt >= need else "")
+        return confirmed
 
     def _release_stale_slot_indices(self) -> None:
         """場を離れたポケモン（交代・気絶・不検出降ろし）の slot_index を解放する。
@@ -1690,7 +1817,14 @@ class BattleStateTracker:
                         break  # 占有者交代を検知 → 今サイクルの値は前任者のものなのでスキップ
                     old = p.hp_pct_pixel
                     p.hp_pct_pixel = pct
-                    p.hp_px_turn = self.turn
+                    # 鮮度スタンプは値が変わった時のみ更新する。
+                    # アナライザーは読めないフレームで最後の確定値を返し続けるため
+                    # （_apply_stabilizer の raw=None 分岐）、無条件に再スタンプすると
+                    # 古い保持値が「常に最新」となり、HPpx物理限界（バー15px未満）で
+                    # px が止まった後の数値OCR正読（イダイトウ 7/201）を鮮度比較で
+                    # 覆い隠し続ける（実機 07-00-19 で確認）。
+                    if old is None or pct != old:
+                        p.hp_px_turn = self.turn
                     # HPバーが物理スロットで読めている＝そのポケモンが確実に場にいる証拠。
                     # 名前OCRでの独立再検出頻度が低い個体（実機: 07-00-19のオオニューラ）が
                     # _ON_FIELD_MISS_THRESHOLD で誤って場から降ろされるのを防ぐ。
@@ -1717,8 +1851,10 @@ class BattleStateTracker:
                     log.info("[スロット早期割] %s → スロット%d (HPpxフォールバック)", p.name, slot_idx)
                     if self._claim_slot(key, p.name):
                         continue  # 占有者交代 → 前任者の値はスキップ（次サイクル以降の新確定値を待つ）
+                    old = p.hp_pct_pixel
                     p.hp_pct_pixel = pct
-                    p.hp_px_turn = self.turn
+                    if old is None or pct != old:  # 保持値の再読では鮮度を偽装しない（パス1と同様）
+                        p.hp_px_turn = self.turn
                     p.last_seen_turn = self.game_turn  # HPバー実測＝場にいる証拠（上のパス1と同様）
                     log.info("[HPpx] %s %s → %.1f%%", key, p.name, pct * 100)
 
@@ -2473,6 +2609,14 @@ class Pipeline:
                                 _periodic_gs.get("name_player_with_cx", []),
                                 _periodic_gs.get("name_opponent_with_cx", []),
                                 _periodic_gs.get("command_cy"))
+                            # 数値HPの補完割当（イベント時フレームはHP数値が
+                            # 映らないことが多く、画面の正読値はここでしか拾えない。
+                            # HPpxが物理限界で読めない低HP帯の生命線）。
+                            # ゲートは位置ベース（y帯＋バー中心cx近接）で
+                            # assign_hp_from_ocr 内で行う
+                            self._battle_tracker.assign_hp_from_ocr(
+                                _periodic_gs.get("hp_player_with_xy", []),
+                                _periodic_gs.get("hp_opponent_with_xy", []))
 
                     # ── 技使用・交代メッセージの検出（バトル中は常時監視）──────
                     if self._battle_active:
