@@ -201,9 +201,11 @@ class TestClassify:
         result = clf.classify("エルフーン")
         assert result.canonical_ja == "エルフーン"
 
-    def test_canonical_en_is_populated(self, clf):
+    def test_result_is_frozen(self, clf):
+        """ClassifyResult は frozen（_UNKNOWN シングルトン共有のため書き換え禁止）。"""
         result = clf.classify("ピカチュウ")
-        assert result.canonical_en == "Pikachu"
+        with pytest.raises(Exception):
+            result.canonical_ja = "書き換え"
 
     def test_score_is_float(self, clf):
         result = clf.classify("ピカチュウ")
@@ -276,9 +278,9 @@ class TestGetPokemonInfo:
         assert info is None
 
     def test_info_contains_required_keys(self, clf):
+        # 英語名は日本語名のみ設計への移行で廃止（name_en は返らない）
         info = clf.get_pokemon_info("ピカチュウ")
         assert "name_ja" in info
-        assert "name_en" in info
         assert "type" in info
         assert "abilities" in info
         assert "moves" in info
@@ -320,9 +322,9 @@ class TestGetPokemonInfo:
         # スコア次第なので None でも受け入れる（エラーにならないことを確認）
         # assert info is not None or info is None  # 常に真（クラッシュしないことを確認）
 
-    def test_name_en_matches_expected(self, clf):
+    def test_name_ja_matches_expected(self, clf):
         info = clf.get_pokemon_info("エルフーン")
-        assert info["name_en"] == "Whimsicott"
+        assert info["name_ja"] == "エルフーン"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -363,7 +365,6 @@ class TestClassifyResult:
         r = ClassifyResult(
             category=CATEGORY_POKEMON,
             canonical_ja="ピカチュウ",
-            canonical_en="Pikachu",
             score=95.0,
             confident=True,
         )

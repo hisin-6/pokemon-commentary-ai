@@ -2452,6 +2452,22 @@ class Pipeline:
         """
         return self._video_now if self._video_now is not None else time.time()
 
+    def _reset_battle_state(self) -> None:
+        """バトル開始時の状態リセット＆アクティブ化。
+        battle_start と遅延起動（battle_start 取り逃しフォールバック）の共通処理。
+        トラッカー・アナライザー・実況履歴・技ログ等、前試合の残骸を全て捨てる。"""
+        self._battle_tracker = BattleStateTracker()
+        self._battle_tracker.slot_reset_cb = self._hpbar_analyzer.reset_slot
+        # アナライザーの確定値も前試合・試合前画面の値が残るためリセット
+        self._hpbar_analyzer.reset()
+        self._battle_active = True
+        self._battle_active_since = self._now()
+        self._end_screen_count = 0
+        self._commentary_history = []
+        self._move_log = []
+        self._last_ball_yolo = None   # バトル開始時にボール情報をリセット
+        self._last_ability_msg = {}   # バトル開始時に特性・道具メッセージをリセット
+
     def run(self) -> None:
         _is_video = self._video_path is not None
         cap = cv2.VideoCapture(self._video_path if _is_video else self._camera_index)
@@ -2906,17 +2922,7 @@ class Pipeline:
         # ── 戦況トラッカー更新 ────────────────────────────────────────────────
         if event_type == "battle_start":
             # バトル開始: トラッカーをリセットしてアクティブ化
-            self._battle_tracker = BattleStateTracker()
-            self._battle_tracker.slot_reset_cb = self._hpbar_analyzer.reset_slot
-            # アナライザーの確定値も前試合・試合前画面の値が残るためリセット
-            self._hpbar_analyzer.reset()
-            self._battle_active = True
-            self._battle_active_since = self._now()
-            self._end_screen_count = 0
-            self._commentary_history = []
-            self._move_log = []
-            self._last_ball_yolo = None   # バトル開始時にボール情報をリセット
-            self._last_ability_msg = {}   # バトル開始時に特性・道具メッセージをリセット
+            self._reset_battle_state()
             log.info("[戦況] バトル開始 → トラッカーリセット")
             # バトル開始前にキャッシュした相手ポケモンを登録
             for name in self._pre_battle_opponent:
@@ -2940,11 +2946,14 @@ class Pipeline:
             self._recent_sendouts.clear()
 
         # battle_start が OCR品質不足でスキップされた場合のフォールバック
-        # バトルイベントが来た時点でアクティブ化（トラッカーはリセットしない・既存情報を保持）
+        # バトルイベントが来た時点でアクティブ化（遅延起動）。
+        # トラッカーは battle_start と同様にリセットする: 以前は既存情報保持のまま
+        # 起動していたため、battle_end→battle_start 間の遅延起動が前試合ロスターの
+        # まま走り、新試合の繰り出しで eviction 連発していた（実機 08-15-22 で
+        # 目撃53回のフラエッテまで削除・自己修復まで約21秒の表示汚染）
         if not self._battle_active and event_type in {"move_used", "faint", "switch"}:
-            log.warning("[戦況] battle_start 未検知 → バトルをアクティブ化（遅延起動）")
-            self._battle_active = True
-            self._battle_active_since = self._now()
+            log.warning("[戦況] battle_start 未検知 → バトルをアクティブ化（遅延起動・前試合ロスターをクリア）")
+            self._reset_battle_state()
             # 事前キャッシュが残っていれば登録（battle_start スキップで未登録のケース）
             if self._pre_battle_opponent:
                 for name in self._pre_battle_opponent:

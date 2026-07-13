@@ -513,7 +513,17 @@ def _make_game_state(
         "hp_opponent_by_slot":      hp_opponent or [],
         "name_player_with_cx":      [],
         "name_opponent_with_cx":    [],
+        # OCR HP割当は行動選択画面（command_cy 300-450）のみ有効（2026-04-22導入）。
+        # テストでは行動選択画面のフレームを模す
+        "command_cy":               380.0,
     }
+
+
+def _register(tracker, gs, event="move_used"):
+    """新規名の登録ヒステリシス（低信頼経路は2サイクル連続目撃で登録・
+    2026-07-07導入）を満たすため、同じ game_state で2回 update する。"""
+    tracker.update(gs, event)
+    tracker.update(gs, event)
 
 
 class TestBattleStateTracker:
@@ -529,17 +539,17 @@ class TestBattleStateTracker:
 
     def test_update_creates_player_slot(self):
         gs = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs, "move_used")
+        _register(self.tracker, gs)
         assert any(s.name == "ピカチュウ" for s in self.tracker._player)
 
     def test_update_creates_opponent_slot(self):
         gs = _make_game_state(opponent_names=["エルフーン"])
-        self.tracker.update(gs, "move_used")
+        _register(self.tracker, gs)
         assert any(s.name == "エルフーン" for s in self.tracker._opponent)
 
     def test_pokemon_marked_on_field_when_seen(self):
         gs = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs, "move_used")
+        _register(self.tracker, gs)
         slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
         assert slot.on_field is True
 
@@ -552,22 +562,22 @@ class TestBattleStateTracker:
 
     def test_cap_on_field_max_2(self):
         """ダブルバトル制約: 場に出せるのは最大 2 匹。"""
-        gs = _make_game_state(player_names=["A", "B", "C"])
-        self.tracker.update(gs, "move_used")
+        gs = _make_game_state(player_names=["AAA", "BBB", "CCC"])
+        _register(self.tracker, gs)
         on_field = [s for s in self.tracker._player if s.on_field]
         assert len(on_field) <= 2
 
     def test_opponent_not_added_to_player_side(self):
         """相手側に登録済みのポケモンは自分側に混入しない。"""
         gs1 = _make_game_state(opponent_names=["エルフーン"])
-        self.tracker.update(gs1, "move_used")
+        _register(self.tracker, gs1)
         gs2 = _make_game_state(player_names=["エルフーン"])
-        self.tracker.update(gs2, "move_used")
+        _register(self.tracker, gs2)
         assert not any(s.name == "エルフーン" for s in self.tracker._player)
 
     def test_hp_assigned_to_on_field_player(self):
         gs1 = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs1, "move_used")
+        _register(self.tracker, gs1)
         gs2 = _make_game_state(player_names=["ピカチュウ"], hp_player=["150/176"])
         self.tracker.update(gs2, "move_used")
         slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
@@ -576,7 +586,7 @@ class TestBattleStateTracker:
     def test_faint_event_marks_pokemon_fainted(self):
         """faint イベント + HP=0 でポケモンが気絶扱いになる。"""
         gs1 = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs1, "move_used")
+        _register(self.tracker, gs1)
         gs2 = _make_game_state(player_names=["ピカチュウ"], hp_player=["0/176"])
         self.tracker.update(gs2, "faint")
         slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
@@ -586,7 +596,7 @@ class TestBattleStateTracker:
     def test_non_faint_event_does_not_faint_hp_zero(self):
         """faint イベント以外では HP=0 でも気絶しない（誤分類対策）。"""
         gs1 = _make_game_state(player_names=["ゴリランダー"])
-        self.tracker.update(gs1, "move_used")
+        _register(self.tracker, gs1)
         gs2 = _make_game_state(player_names=["ゴリランダー"], hp_player=["0/200"])
         self.tracker.update(gs2, "switch")  # faint ではない
         slot = next(s for s in self.tracker._player if s.name == "ゴリランダー")
@@ -596,19 +606,19 @@ class TestBattleStateTracker:
         """各サイド最大 4 スロット。超えた分は無視される。"""
         for i in range(6):
             gs = _make_game_state(player_names=[f"ポケモン{i}"])
-            self.tracker.update(gs, "move_used")
+            _register(self.tracker, gs)
         assert len(self.tracker._player) <= BattleStateTracker.MAX_SLOTS
 
     def test_update_move_records_to_slot(self):
         gs = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs, "move_used")
+        _register(self.tracker, gs)
         self.tracker.update_move("ピカチュウ", "かみなり")
         slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
         assert "かみなり" in slot.moves_used
 
     def test_update_move_no_duplicate(self):
         gs = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs, "move_used")
+        _register(self.tracker, gs)
         self.tracker.update_move("ピカチュウ", "かみなり")
         self.tracker.update_move("ピカチュウ", "かみなり")
         slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
@@ -616,7 +626,7 @@ class TestBattleStateTracker:
 
     def test_update_move_max_4_moves(self):
         gs = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs, "move_used")
+        _register(self.tracker, gs)
         for move in ["技A", "技B", "技C", "技D", "技E"]:
             self.tracker.update_move("ピカチュウ", move)
         slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
@@ -624,7 +634,7 @@ class TestBattleStateTracker:
 
     def test_set_not_on_field_exact_match(self):
         gs = _make_game_state(player_names=["ゴリランダー"])
-        self.tracker.update(gs, "move_used")
+        _register(self.tracker, gs)
         result = self.tracker.set_not_on_field("ゴリランダー")
         assert result is True
         slot = next(s for s in self.tracker._player if s.name == "ゴリランダー")
@@ -633,7 +643,7 @@ class TestBattleStateTracker:
     def test_set_not_on_field_partial_match(self):
         """OCR 誤読で部分一致する場合も対応する。"""
         gs = _make_game_state(player_names=["ゴリランダー"])
-        self.tracker.update(gs, "move_used")
+        _register(self.tracker, gs)
         result = self.tracker.set_not_on_field("ゴリランダ")  # 末尾1文字欠落
         assert result is True
 
@@ -644,10 +654,12 @@ class TestBattleStateTracker:
     def test_pokemon_removed_from_field_after_miss_threshold(self):
         """_ON_FIELD_MISS_THRESHOLD ターン以上不検出なら場から降ろす。"""
         gs = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs, "move_used")
-        # 不検出状態で何ターンも進める
+        _register(self.tracker, gs)
+        # 不検出状態で実ゲームターンを進める（閾値は game_turn 基準・
+        # game_turn は PipelineRunner が turn_start で加算するためテストでは手動加算）
         gs_empty = _make_game_state()
         for _ in range(BattleStateTracker._ON_FIELD_MISS_THRESHOLD + 1):
+            self.tracker.game_turn += 1
             self.tracker.update(gs_empty, "move_used")
         slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
         assert slot.on_field is False
@@ -655,7 +667,7 @@ class TestBattleStateTracker:
     def test_to_context_shows_field_and_bench(self):
         """場のポケモンと控えが正しく分離して出力される。"""
         gs1 = _make_game_state(player_names=["ピカチュウ", "エルフーン"])
-        self.tracker.update(gs1, "move_used")
+        _register(self.tracker, gs1)
         # エルフーンを場から降ろす
         self.tracker.set_not_on_field("エルフーン")
         ctx = self.tracker.to_context()
@@ -665,7 +677,7 @@ class TestBattleStateTracker:
     def test_to_context_fainted_shown_as_hinshi(self):
         """気絶したポケモンは控えに「(ひんし)」付きで表示される。"""
         gs1 = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs1, "move_used")
+        _register(self.tracker, gs1)
         gs2 = _make_game_state(player_names=["ピカチュウ"], hp_player=["0/176"])
         self.tracker.update(gs2, "faint")
         ctx = self.tracker.to_context()
@@ -680,7 +692,7 @@ class TestBattleStateTracker:
     def test_to_context_hp_pinch_marker(self):
         """HP が 25% 以下のポケモンに★ピンチが付く。"""
         gs1 = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs1, "move_used")
+        _register(self.tracker, gs1)
         gs2 = _make_game_state(player_names=["ピカチュウ"], hp_player=["30/200"])
         self.tracker.update(gs2, "move_used")
         ctx = self.tracker.to_context()
@@ -688,7 +700,7 @@ class TestBattleStateTracker:
 
     def test_status_updated_from_game_state(self):
         gs1 = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs1, "move_used")
+        _register(self.tracker, gs1)
         gs2 = _make_game_state(player_names=["ピカチュウ"], status="まひ")
         self.tracker.update(gs2, "move_used")
         slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
@@ -697,13 +709,15 @@ class TestBattleStateTracker:
     def test_hp_fallback_uses_all_hp_values(self):
         """hp_values_player/opponent が空の場合、hp_values からフォールバックする。"""
         gs1 = _make_game_state(player_names=["ピカチュウ"])
-        self.tracker.update(gs1, "move_used")
+        _register(self.tracker, gs1)
+        # フォールバック値2件はスロット番号で割り当てられるため slot_index を確定させる
+        slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
+        slot.slot_index = 0
         gs2 = _make_game_state(
             player_names=["ピカチュウ"],
             hp_values=["100/200", "80/160"],  # フォールバック用
         )
         self.tracker.update(gs2, "move_used")
-        slot = next(s for s in self.tracker._player if s.name == "ピカチュウ")
         assert slot.hp is not None
 
 
@@ -959,6 +973,53 @@ class TestTryRegisterRosterFallback:
         events = [_ocr("ドゲザンの", y_center=800.0), _ocr("ドゲザン", y_center=800.0)]
         Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
         assert self.runner._move_log == ["T0:ドドゲザンのドゲザン"]
+
+
+class TestResetBattleState:
+    """_reset_battle_state: battle_start／遅延起動共通のリセット処理。
+    遅延起動が前試合ロスターのまま走り新試合の繰り出しで eviction 連発していた
+    （実機 08-15-22: 目撃53回のフラエッテまで削除）ため、遅延起動でも
+    battle_start と同様に前試合の残骸を全て捨てる。"""
+
+    def _make_runner(self):
+        runner = Pipeline.__new__(Pipeline)
+        runner._video_now = 100.0
+        runner._hpbar_analyzer = MagicMock()
+        old_tracker = BattleStateTracker()
+        old_tracker._player.append(FieldPokemon(name="フラエッテ", confidence=53))
+        old_tracker._opponent.append(FieldPokemon(name="スピアー"))
+        runner._battle_tracker = old_tracker
+        runner._battle_active = False
+        runner._end_screen_count = 2
+        runner._commentary_history = ["前試合の実況"]
+        runner._move_log = ["T1:スピアーのどくづき"]
+        runner._last_ball_yolo = object()
+        runner._last_ability_msg = {"opp": "あめうけざら"}
+        return runner, old_tracker
+
+    def test_clears_previous_battle_roster(self):
+        runner, old_tracker = self._make_runner()
+        runner._reset_battle_state()
+        assert runner._battle_tracker is not old_tracker
+        assert runner._battle_tracker._player == []
+        assert runner._battle_tracker._opponent == []
+
+    def test_activates_and_clears_battle_scoped_state(self):
+        runner, _ = self._make_runner()
+        runner._reset_battle_state()
+        assert runner._battle_active is True
+        assert runner._battle_active_since == 100.0
+        assert runner._end_screen_count == 0
+        assert runner._commentary_history == []
+        assert runner._move_log == []
+        assert runner._last_ball_yolo is None
+        assert runner._last_ability_msg == {}
+
+    def test_analyzer_reset_and_slot_callback_rewired(self):
+        runner, _ = self._make_runner()
+        runner._reset_battle_state()
+        runner._hpbar_analyzer.reset.assert_called_once()
+        assert runner._battle_tracker.slot_reset_cb == runner._hpbar_analyzer.reset_slot
 
 
 class TestMoveLogDisplay:

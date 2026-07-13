@@ -172,12 +172,14 @@ def _parse_commentary(text: str) -> tuple[str, str]:
 # ─── エンドポイント ──────────────────────────────────────────────────────────
 
 
-@app.get("/health")
+# @app.get/@app.post ショートカットは Flask 2.0+ 専用のため、
+# ローカル検証環境（Flask 1.x）でも動く @app.route 形式で書く
+@app.route("/health")
 def health():
     return jsonify({"status": "ok", "timestamp": _now_iso()})
 
 
-@app.post("/api/vision")
+@app.route("/api/vision", methods=["POST"])
 def vision():
     data = request.get_json(silent=True)
     if not data:
@@ -283,7 +285,7 @@ def vision():
     })
 
 
-@app.post("/api/log")
+@app.route("/api/log", methods=["POST"])
 def log_save():
     data = request.get_json(silent=True)
     if not data:
