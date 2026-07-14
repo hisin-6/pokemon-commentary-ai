@@ -23,13 +23,16 @@ Skillsはタスクに関連すると判断したときだけClaudeが自動で�
 このプロジェクトなら以下が有効です。
 ```
 .claude/skills/
-├── aws-bedrock/SKILL.md     # Bedrock呼び出しパターン・コスト管理
-├── vram-budget/SKILL.md     # VRAM配分ルールと制約
-├── pokemon-domain/SKILL.md  # ポケモン対戦の専門用語・ルール
-└── ocr-finetune/SKILL.md    # EasyOCRファインチューニングサイクル・コマンド集
+├── aws-bedrock/SKILL.md       # Bedrock呼び出しパターン・コスト管理
+├── vram-budget/SKILL.md       # VRAM配分ルールと制約
+├── pokemon-domain/SKILL.md    # ポケモン対戦の専門用語・ルール
+├── ocr-finetune/SKILL.md      # EasyOCRファインチューニングサイクル・コマンド集
+└── video-commentary/SKILL.md  # 実況動画合成（パス1→1.5→2 biim）の手順・地雷・検証
 ```
 
 OCRファインチューニング（collect_ocr_crops / fix_annotations / finetune_ocr / pokemon_g2 等）に関するタスクでは必ず `.claude/skills/ocr-finetune/SKILL.md` を参照すること。
+
+実況動画の制作・合成（--render-out / generate_gap_commentary / render_commentary_video / biim / フィラー / 戦況パネル 等）に関するタスクでは必ず `.claude/skills/video-commentary/SKILL.md` を参照すること。手順と地雷リストが揃っており、実装の内部理解なしでも安全に量産できる。
 
 「VRAM予算を確認して」と言うだけで関連Skillが自動ロードされます。
 

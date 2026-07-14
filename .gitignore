@@ -81,13 +81,12 @@ tools/deep-text-recognition-benchmark/
 # 一時ファイル
 tmp/
 
-# Claude Code 設定・メモリ
-.claude/
+# Claude Code 設定・メモリ（skills はプロジェクト知識としてGit管理する）
+.claude/*
+!.claude/skills/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Claude Code 設定・メモリ
-.claude/
 docs/manual/bedrock-haiku-4-5-migration.md
