@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -299,7 +300,155 @@ _BIIM_FONTS_DIR = "/mnt/c/Windows/Fonts"  # meiryo.ttc の場所（WSL）
 _BIIM_FONT_FILE = f"{_BIIM_FONTS_DIR}/meiryob.ttc"
 
 
-def build_ass(scheduled: list, out_path: Path) -> None:
+# ── v2b: 戦況パネル（右サイド・ASSベクター描画で時刻同期表示）──────────────
+_PANEL_TEXT_X = 1496        # パネル内側の左端
+_PANEL_RIGHT_X = 1880       # 右寄せテキストの基準X
+_PANEL_BAR_W = 300          # HPバーの幅
+_PANEL_BAR_H = 14           # HPバーの高さ
+_PANEL_MOVES_MAX = 4        # ポケモンの技スロット数（判明分を埋める・未判明は?）
+# 瞬間ログ（timeline.jsonl）の技エントリ形式: "T3:ガブリアスのドラゴンクロー"
+# 名前は最初の「の」まで（技名先頭が「の」の技=のしかかり等も正しく分離できる）
+_MOMENT_MOVE_RE = re.compile(r"^T[\d?]+:(.+?)の(.+)$")
+
+
+def load_states(render_dir: Path) -> list:
+    """states.jsonl（戦況パネル用スナップショット・任意）を読み込む。"""
+    states_path = render_dir / "states.jsonl"
+    if not states_path.exists():
+        return []
+    states = []
+    with states_path.open(encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                states.append(json.loads(line))
+    states.sort(key=lambda s: s["time"])
+    return states
+
+
+def load_timeline(render_dir: Path) -> list:
+    """timeline.jsonl（技検出の瞬間ログ・任意）を読み込む。無ければ空リスト。"""
+    timeline_path = render_dir / "timeline.jsonl"
+    if not timeline_path.exists():
+        return []
+    moments = []
+    with timeline_path.open(encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                moments.append(json.loads(line))
+    moments.sort(key=lambda m: m["time"])
+    return moments
+
+
+def _hp_bar_color(pct: int) -> str:
+    """HP%に応じたバー色（ASSのBGR表記）。ゲームのHPバー配色に準拠。"""
+    if pct > 50:
+        return "&H78C850&"   # 緑
+    if pct > 20:
+        return "&H28B4E6&"   # 黄
+    return "&H3C46E6&"       # 赤
+
+
+def _panel_bar(x: int, y: int, width: int, color: str) -> str:
+    """塗りつぶし矩形のASS描画テキスト（HPバー用）。"""
+    return (f"{{\\pos({x},{y})\\an7\\bord0\\shad0\\1c{color}\\p1}}"
+            f"m 0 0 l {width} 0 l {width} {_PANEL_BAR_H} l 0 {_PANEL_BAR_H}{{\\p0}}")
+
+
+def _moves_by_pokemon(moments: list, until: float) -> dict:
+    """瞬間ログから時刻 until までに判明した技をポケモン別に集計する。
+
+    技が画面に映った瞬間に「?」が埋まる時刻同期表示のためのデータ。
+    """
+    moves: dict = {}
+    for m in moments:
+        if float(m["time"]) > until:
+            break  # momentsは時刻昇順
+        match = _MOMENT_MOVE_RE.match(m.get("text", ""))
+        if not match:
+            continue
+        name, mv = match.groups()
+        lst = moves.setdefault(name, [])
+        if mv not in lst and len(lst) < _PANEL_MOVES_MAX:
+            lst.append(mv)
+    return moves
+
+
+def _moves_lines(known: list) -> tuple:
+    """技表示の2行（各2枠・未判明は?）を返す。例: 技:インファイト/ねこだまし"""
+    slots = list(known[:_PANEL_MOVES_MAX])
+    slots += ["?"] * (_PANEL_MOVES_MAX - len(slots))
+    return f"技:{slots[0]}/{slots[1]}", f"　　{slots[2]}/{slots[3]}"
+
+
+def _panel_dialogues(start: float, end: float, state: dict | None,
+                     moves_map: dict) -> list:
+    """1キーフレーム区間ぶんの戦況パネルDialogue行を生成する。"""
+    t0, t1 = _ass_time(start), _ass_time(end)
+    lines = []
+
+    def dlg(layer: int, text: str) -> None:
+        lines.append(f"Dialogue: {layer},{t0},{t1},Panel,,0,0,0,,{text}")
+
+    def side_block(label: str, label_color: str, entries: list, y_label: int) -> None:
+        dlg(1, f"{{\\pos({_PANEL_TEXT_X},{y_label})\\fs26\\1c{label_color}}}{label}")
+        if not entries:
+            dlg(1, f"{{\\pos({_PANEL_TEXT_X},{y_label + 36})\\fs24\\1c&H8899AA&}}情報収集中")
+            return
+        for i, p in enumerate(entries[:2]):
+            y = y_label + 36 + i * 116
+            name = _ass_escape(p["name"])
+            if p.get("status"):
+                name += f"({_ass_escape(p['status'])})"
+            dlg(1, f"{{\\pos({_PANEL_TEXT_X},{y})\\fs30\\1c&HFFFFFF&}}{name}")
+            if p.get("hp_text"):
+                dlg(1, f"{{\\pos({_PANEL_RIGHT_X},{y + 6})\\an3\\fs26\\1c&HFFFFFF&}}"
+                       f"{_ass_escape(p['hp_text'])}")
+            bar_y = y + 40
+            dlg(1, _panel_bar(_PANEL_TEXT_X, bar_y, _PANEL_BAR_W, "&H262626&"))
+            pct = p.get("hp_pct")
+            if pct is not None:
+                pct = max(0, min(100, int(pct)))
+                fill = max(1, round(_PANEL_BAR_W * pct / 100))
+                dlg(2, _panel_bar(_PANEL_TEXT_X, bar_y, fill, _hp_bar_color(pct)))
+            line1, line2 = _moves_lines(moves_map.get(p["name"], []))
+            dlg(1, f"{{\\pos({_PANEL_TEXT_X},{y + 62})\\fs22\\1c&HC8D8D8&}}{_ass_escape(line1)}")
+            dlg(1, f"{{\\pos({_PANEL_TEXT_X},{y + 88})\\fs22\\1c&HC8D8D8&}}{_ass_escape(line2)}")
+
+    if state:
+        side_block("相手の場", "&HB478FF&", state.get("opponent", []), 88)
+        side_block("自分の場", "&HFFC878&", state.get("player", []), 372)
+        dlg(1, f"{{\\pos({_PANEL_TEXT_X},660)\\fs26\\1c&HFFFFFF&}}ターン {state.get('turn', '?')}")
+    return lines
+
+
+def build_panel_events(states: list, moments: list, video_end: float) -> list:
+    """戦況スナップショットと瞬間ログから、時刻同期パネルのDialogue行を生成する。
+
+    states / moments の時刻をキーフレームとして、各区間のパネル内容を
+    まとめて描画する。技表示（技:xx/?/?/?）は瞬間ログから導出し、
+    技が画面に映った時刻で ? が埋まる。
+    """
+    if not states:
+        return []
+    times = sorted({round(float(s["time"]), 3) for s in states} |
+                   {round(float(m["time"]), 3) for m in moments})
+    dialogues = []
+    for i, t in enumerate(times):
+        end = times[i + 1] if i + 1 < len(times) else max(video_end, t + 1.0)
+        state = None
+        for s in states:
+            if s["time"] <= t:
+                state = s
+            else:
+                break
+        dialogues += _panel_dialogues(t, end, state, _moves_by_pokemon(moments, t))
+    return dialogues
+
+
+def build_ass(scheduled: list, out_path: Path,
+              panel_events: list = None) -> None:
     """スケジュール済み実況から音声シンクロの字幕（ASS）を生成する。
 
     下部の実況帯（ゲーム画面の下・右パネルを避けた領域）に表示する。
@@ -317,6 +466,7 @@ WrapStyle: 0
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Event,Meiryo,{fs},&H00FFFFFF,&H00FFFFFF,&H00101010,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,7,48,48,848,1
 Style: Filler,Meiryo,{fs},&H00E8D8B0,&H00FFFFFF,&H00101010,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,7,48,48,848,1
+Style: Panel,Meiryo,26,&H00FFFFFF,&H00FFFFFF,&H00101010,&H00000000,-1,0,0,0,100,100,0,0,1,1,0,7,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -331,6 +481,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         style = "Filler" if e["event_type"] == "filler" else "Event"
         text = _wrap_jp(_ass_escape(f"「{e['commentary']}」"))
         lines.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},{style},,0,0,0,,{text}\n")
+    for d in (panel_events or []):
+        lines.append(d + "\n")
     out_path.write_text("".join(lines), encoding="utf-8")
 
 
@@ -366,8 +518,6 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
         f"color={_BIIM_PANEL_COLOR}:t=fill,"
         f"drawtext=fontfile={_BIIM_FONT_FILE}:text='◆ 戦況':"
         f"x={panel_x + 24}:y=44:fontsize=34:fontcolor=0x66CCFF,"
-        f"drawtext=fontfile={_BIIM_FONT_FILE}:text='◆ 技ログ':"
-        f"x={panel_x + 24}:y=540:fontsize=34:fontcolor=0xFFC94D,"
         # 実況字幕（音声シンクロ）
         f"subtitles={ass_path}:fontsdir={_BIIM_FONTS_DIR}[vout]"
     )
@@ -548,8 +698,13 @@ def main(argv=None) -> int:
     if args.layout == "biim":
         suffix = "_commentary_biim.mp4"
         ass_path = render_dir / "commentary.ass"
-        build_ass(final_schedule, ass_path)
-        logger.info("実況字幕を生成: %s（%d件）", ass_path, len(final_schedule))
+        states = load_states(render_dir)
+        moments = load_timeline(render_dir)
+        panel_events = build_panel_events(states, moments,
+                                          video_dur or track_end)
+        build_ass(final_schedule, ass_path, panel_events)
+        logger.info("実況字幕を生成: %s（字幕%d件・パネル状態%d件・技ログ%d件）",
+                    ass_path, len(final_schedule), len(states), len(moments))
         out_path = Path(args.out) if args.out else render_dir / f"{render_dir.name}{suffix}"
         cmd = build_ffmpeg_command_biim(video, track_wav, out_path, ass_path,
                                         args.gain, args.duck_threshold, args.duck_ratio)

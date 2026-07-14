@@ -314,6 +314,81 @@ class TestBiimCommand:
         assert "[vout]" in joined and "[aout]" in joined
 
 
+def _panel_state(t, turn=3, player=None, opponent=None, ap=2, ao=2):
+    return {"time": t, "turn": turn,
+            "player": player if player is not None else
+            [{"name": "イダイトウ", "hp_pct": 47, "hp_text": "47%", "status": None}],
+            "opponent": opponent if opponent is not None else [],
+            "alive_player": ap, "alive_opponent": ao}
+
+
+class TestPanelEvents:
+    def test_hp_bar_color_thresholds(self):
+        assert rcv._hp_bar_color(100) == rcv._hp_bar_color(51)   # 緑
+        assert rcv._hp_bar_color(50) == rcv._hp_bar_color(21)    # 黄
+        assert rcv._hp_bar_color(20) == rcv._hp_bar_color(1)     # 赤
+        assert len({rcv._hp_bar_color(100), rcv._hp_bar_color(50),
+                    rcv._hp_bar_color(10)}) == 3
+
+    def test_bar_width_scales_with_pct(self):
+        """HPバーの塗り幅がhp_pctに比例する。"""
+        lines = rcv._panel_dialogues(10.0, 20.0, _panel_state(10.0), {})
+        fill = [l for l in lines if "l 141 0" in l]  # 300*47% = 141
+        assert len(fill) == 1
+
+    def test_state_selected_per_keyframe(self):
+        """各キーフレームで直近の状態が使われ、区間が次のキーフレームまで続く。"""
+        states = [_panel_state(100.0, turn=3), _panel_state(200.0, turn=4)]
+        dialogues = rcv.build_panel_events(states, [], video_end=300.0)
+        text = "\n".join(dialogues)
+        assert "0:01:40.00,0:03:20.00" in text  # 100→200秒の区間
+        assert "ターン 3" in text and "ターン 4" in text
+        assert "残り" not in text  # ゲーム画面と重複するため表示しない
+
+    def test_moves_revealed_at_moment_time(self):
+        """技表示は瞬間ログの時刻で?が埋まる（前は?のまま）。"""
+        states = [_panel_state(50.0)]
+        moments = [{"time": 100.0, "kind": "move", "text": "T2:イダイトウのだくりゅう"}]
+        dialogues = rcv.build_panel_events(states, moments, video_end=200.0)
+        before = [l for l in dialogues if l.startswith("Dialogue: 1,0:00:50.00")]
+        after = [l for l in dialogues if l.startswith("Dialogue: 1,0:01:40.00")]
+        assert any("技:?/?" in l for l in before)
+        assert any("技:だくりゅう/?" in l for l in after)
+
+    def test_moves_by_pokemon_caps_at_four_and_dedupes(self):
+        moments = [{"time": float(i), "kind": "move",
+                    "text": f"T1:ピカチュウの技{i % 5}"} for i in range(10)]
+        moves = rcv._moves_by_pokemon(moments, until=100.0)
+        assert len(moves["ピカチュウ"]) == 4  # 5種類あっても4枠まで・重複なし
+
+    def test_moves_lines_format(self):
+        line1, line2 = rcv._moves_lines(["インファイト", "ねこだまし", "まもる"])
+        assert line1 == "技:インファイト/ねこだまし"
+        assert line2 == "　　まもる/?"
+
+    def test_no_states_returns_empty(self):
+        """statesが無ければパネルは描画しない（技だけの表示はしない）。"""
+        moments = [{"time": 10.0, "kind": "move", "text": "T1:Aのたいあたり"}]
+        assert rcv.build_panel_events([], moments, video_end=100.0) == []
+
+    def test_empty_side_shows_placeholder(self):
+        lines = rcv._panel_dialogues(0.0, 10.0, _panel_state(0.0, opponent=[]), {})
+        assert any("情報収集中" in l for l in lines)
+
+
+class TestLoadStates:
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert rcv.load_states(tmp_path) == []
+
+    def test_sorted_by_time(self, tmp_path):
+        lines = [json.dumps(_panel_state(200.0), ensure_ascii=False),
+                 json.dumps(_panel_state(100.0), ensure_ascii=False)]
+        (tmp_path / "states.jsonl").write_text("\n".join(lines) + "\n",
+                                               encoding="utf-8")
+        states = rcv.load_states(tmp_path)
+        assert [s["time"] for s in states] == [100.0, 200.0]
+
+
 class TestLoadManifest:
     def test_sorted_by_event_time(self, tmp_path):
         """保存順が時刻順と違っても event_time 昇順で返る。"""

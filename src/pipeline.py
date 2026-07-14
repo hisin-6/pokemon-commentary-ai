@@ -2089,6 +2089,54 @@ class BattleStateTracker:
             s += f"({p.status})"
         return s
 
+    def _display_hp_pct(self, p: FieldPokemon) -> tuple[int | None, str | None]:
+        """パネル表示用のHP（％整数と表示テキスト）を返す。
+
+        鮮度比較（数値HPとHPpxの新しい方を採用）は ``_format_pokemon`` と同一。
+        """
+        px_is_fresher = (p.hp_pct_pixel is not None
+                         and (p.hp is None or p.hp_px_turn > p.hp_turn))
+        if px_is_fresher:
+            pct = round(p.hp_pct_pixel * 100)
+            return pct, f"{pct}%"
+        if p.hp:
+            m = self._HP_RE.match(p.hp)
+            if m and int(m.group(2)) > 0:
+                return round(int(m.group(1)) / int(m.group(2)) * 100), p.hp
+            if p.hp.endswith("%"):
+                try:
+                    return int(p.hp[:-1]), p.hp
+                except ValueError:
+                    pass
+        return None, None
+
+    def to_panel_state(self) -> dict:
+        """実況動画の戦況パネル（v2b）用スナップショットを返す。
+
+        場のポケモン（スロット順・最大2匹/側）の名前・HP・状態異常と、
+        ターン数・残り頭数。レンダーモードで states.jsonl に記録され、
+        パス2がASS描画で右サイドパネルに時刻同期表示する。
+        """
+        def side(slots: list[FieldPokemon]) -> list[dict]:
+            on_field = [q for q in slots if q.on_field and not q.fainted]
+            on_field.sort(key=lambda q: q.slot_index if q.slot_index is not None else 9)
+            out = []
+            for p in on_field[:self.MAX_ON_FIELD]:
+                pct, text = self._display_hp_pct(p)
+                out.append({"name": p.name, "hp_pct": pct,
+                            "hp_text": text, "status": p.status})
+            return out
+
+        known_p = len([p for p in self._player if not p.fainted])
+        known_o = len([p for p in self._opponent if not p.fainted])
+        return {
+            "turn": self.game_turn,
+            "player": side(self._player),
+            "opponent": side(self._opponent),
+            "alive_player": self._player_alive_count or known_p,
+            "alive_opponent": self._opponent_alive_count or known_o,
+        }
+
     def to_context(self) -> dict:
         """Bedrock に渡す戦況サマリーを返す。"""
         on_field_p = [p for p in self._player   if p.on_field and not p.fainted]
@@ -2648,6 +2696,8 @@ class Pipeline:
                             self._battle_tracker.assign_hp_from_ocr(
                                 _periodic_gs.get("hp_player_with_xy", []),
                                 _periodic_gs.get("hp_opponent_with_xy", []))
+                            # レンダーモード: 戦況パネル用スナップショット（v2b）
+                            self._record_panel_state()
 
                     # ── 技使用・交代メッセージの検出（バトル中は常時監視）──────
                     if self._battle_active:
@@ -2995,6 +3045,8 @@ class Pipeline:
             self._battle_tracker.update(game_state, event_type)
 
         battle_context = self._battle_tracker.to_context()
+        # レンダーモード: イベント処理後の戦況をパネル用に記録（v2b）
+        self._record_panel_state()
         log.info(
             "[戦況] T%s(G%s) 場(自)=%s | 場(相)=%s",
             self._battle_tracker.turn,
@@ -3149,6 +3201,20 @@ class Pipeline:
             self._speak_async(commentary, event_type="faint",
                               event_time=self._pending_faint_time,
                               context=self._render_context(battle_context))
+
+    def _record_panel_state(self) -> None:
+        """レンダーモード時、戦況パネル用スナップショットを states.jsonl に記録する。
+
+        イベント処理後と定期OCR後に呼ばれる。同一状態はRenderSink側で
+        デデュープされるため高頻度で呼んでも肥大しない。
+        """
+        render_sink = getattr(self, "_render_sink", None)
+        if render_sink is None or not self._battle_active:
+            return
+        try:
+            render_sink.add_state(self._now(), self._battle_tracker.to_panel_state())
+        except Exception as e:
+            log.error(f"パネル状態記録エラー: {e}")
 
     def _render_context(self, battle_context: dict | None) -> dict | None:
         """レンダリング素材のマニフェストに記録する戦況サマリーを組み立てる。

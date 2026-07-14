@@ -188,3 +188,30 @@ class TestSpeakAsyncRenderMode:
         p._player.stop.assert_called_once()
         p._player.play.assert_called_once()
         assert not (tmp_path / "manifest.jsonl").exists()
+
+
+class TestAddState:
+    def test_state_appended_with_time(self, tmp_path):
+        """スナップショットが時刻付きでstates.jsonlに追記される。"""
+        sink = RenderSink(tmp_path)
+        sink.add_state(120.5, {"turn": 3, "player": [], "opponent": [],
+                               "alive_player": 2, "alive_opponent": 2})
+        rec = json.loads((tmp_path / "states.jsonl").read_text(encoding="utf-8").strip())
+        assert rec["time"] == 120.5
+        assert rec["turn"] == 3
+
+    def test_identical_state_deduped(self, tmp_path):
+        """内容が同一なら追記されない（時刻だけ違っても書かない）。"""
+        sink = RenderSink(tmp_path)
+        state = {"turn": 3, "player": [{"name": "A", "hp_pct": 50}]}
+        sink.add_state(100.0, dict(state))
+        sink.add_state(105.0, dict(state))
+        sink.add_state(110.0, {"turn": 4, "player": [{"name": "A", "hp_pct": 50}]})
+        lines = (tmp_path / "states.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+
+    def test_rerun_clears_states(self, tmp_path):
+        sink1 = RenderSink(tmp_path)
+        sink1.add_state(10.0, {"turn": 1})
+        RenderSink(tmp_path)
+        assert not (tmp_path / "states.jsonl").exists()

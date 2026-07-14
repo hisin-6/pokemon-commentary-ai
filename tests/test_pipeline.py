@@ -1295,3 +1295,52 @@ class TestFieldPokemon:
         p2 = FieldPokemon(name="B")
         p1.moves_used.append("かみなり")
         assert "かみなり" not in p2.moves_used
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# to_panel_state（実況動画の戦況パネル用スナップショット・v2b）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestToPanelState:
+
+    def test_on_field_sorted_by_slot(self):
+        """場のポケモンがスロット順で返る（気絶・控えは含まない）。"""
+        tracker = BattleStateTracker()
+        tracker._player.append(FieldPokemon(name="オオニューラ", on_field=True, slot_index=1))
+        tracker._player.append(FieldPokemon(name="イダイトウ", on_field=True, slot_index=0))
+        tracker._player.append(FieldPokemon(name="ペリッパー", on_field=False))
+        tracker._opponent.append(FieldPokemon(name="リザードン", on_field=True, fainted=True))
+        state = tracker.to_panel_state()
+        assert [p["name"] for p in state["player"]] == ["イダイトウ", "オオニューラ"]
+        assert state["opponent"] == []
+
+    def test_hp_pct_prefers_fresher_source(self):
+        """HPは_format_pokemonと同じ鮮度比較（pxが新しければpx・数値が新しければ数値）。"""
+        tracker = BattleStateTracker()
+        px_fresh = FieldPokemon(name="A", on_field=True, slot_index=0,
+                                hp="100/200", hp_turn=1, hp_pct_pixel=0.47, hp_px_turn=2)
+        num_fresh = FieldPokemon(name="B", on_field=True, slot_index=1,
+                                 hp="7/201", hp_turn=3, hp_pct_pixel=0.47, hp_px_turn=2)
+        tracker._player += [px_fresh, num_fresh]
+        state = tracker.to_panel_state()
+        assert state["player"][0]["hp_pct"] == 47
+        assert state["player"][0]["hp_text"] == "47%"
+        assert state["player"][1]["hp_pct"] == 3   # 7/201 ≒ 3.5% → round=3
+        assert state["player"][1]["hp_text"] == "7/201"
+
+    def test_alive_counts_fall_back_to_known(self):
+        """ボール数未取得時は既知の非気絶数を残数にする。"""
+        tracker = BattleStateTracker()
+        tracker._player.append(FieldPokemon(name="A", on_field=True, slot_index=0))
+        tracker._player.append(FieldPokemon(name="B", fainted=True))
+        tracker._opponent.append(FieldPokemon(name="C", on_field=True, slot_index=0))
+        state = tracker.to_panel_state()
+        assert state["alive_player"] == 1
+        assert state["alive_opponent"] == 1
+
+    def test_status_included(self):
+        tracker = BattleStateTracker()
+        tracker._player.append(FieldPokemon(name="ペリッパー", on_field=True,
+                                            slot_index=0, status="ねむり"))
+        state = tracker.to_panel_state()
+        assert state["player"][0]["status"] == "ねむり"
