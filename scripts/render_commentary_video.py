@@ -486,16 +486,33 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     out_path.write_text("".join(lines), encoding="utf-8")
 
 
+# ── v2c: アバター合成（VMC口パク録画のクロマキーワイプ・ADR-009で方式A採用）──
+_AVATAR_WIDTH = 344          # アバターの表示幅（右下・縦横比は素材のまま）
+_AVATAR_MARGIN = 16          # 画面右端・下端からの余白
+_AVATAR_CHROMA = "0x00FF00"  # クロマキー色（グリーンバック）
+_AVATAR_SIMILARITY = 0.15    # クロマキーの類似度しきい値
+
+
 def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
                               ass_path: Path, gain: float, duck_threshold: float,
-                              duck_ratio: float) -> list:
+                              duck_ratio: float, avatar_video: Path = None,
+                              avatar_offset: float = 0.0,
+                              avatar_width: int = _AVATAR_WIDTH,
+                              avatar_chroma: str = _AVATAR_CHROMA,
+                              avatar_similarity: float = _AVATAR_SIMILARITY) -> list:
     """biim風レイアウト（案A）合成のffmpegコマンドを組み立てる。
 
     ゲーム画面を左上に縮小配置し、右サイドパネルの下地・下部実況帯を描画、
     ASS字幕（音声シンクロの実況テキスト）を焼き込む。映像は再エンコード
     （レイアウト合成のため -c:v copy 不可）。音声チェインはplainと同一。
-    戦況パネルの中身はv2b・アバターはv2cで実装予定（下地のみ確保）。
+
+    avatar_video 指定時（v2c・方式A）はVMC口パク録画をクロマキーで抜いて
+    右下に重ねる。avatar_offset は「録画開始→WAV再生開始」の秒数（頭合わせ・
+    録画側の先頭をスキップする）。アバターが動画より短い場合は最終フレームで
+    静止する（eof_action=repeat）。
     """
+    if avatar_video is not None and avatar_offset < 0:
+        raise ValueError("avatar_offset は0以上（録画をWAV再生より先に開始する運用）")
     band_y = _BIIM_GAME_Y + _BIIM_GAME_H + 12          # 実況帯の上端（字幕3行が入る高さを確保）
     band_h = 1080 - band_y - 16                        # 実況帯の高さ（=230px）
     band_w = 1920 - _BIIM_GAME_X * 2                   # 実況帯はフル幅（右パネルの下も使う）
@@ -519,8 +536,22 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
         f"drawtext=fontfile={_BIIM_FONT_FILE}:text='◆ 戦況':"
         f"x={panel_x + 24}:y=44:fontsize=34:fontcolor=0x66CCFF,"
         # 実況字幕（音声シンクロ）
-        f"subtitles={ass_path}:fontsdir={_BIIM_FONTS_DIR}[vout]"
+        f"subtitles={ass_path}:fontsdir={_BIIM_FONTS_DIR}"
     )
+    inputs = ["-i", str(video), "-i", str(track_wav)]
+    if avatar_video is not None:
+        # -ss で録画先頭（WAV再生開始前の部分）をスキップして頭を合わせる
+        inputs += ["-ss", f"{avatar_offset}", "-i", str(avatar_video)]
+        video_filter = (
+            f"{video_filter}[vsub];"
+            f"[2:v]scale={avatar_width}:-2,"
+            f"chromakey={avatar_chroma}:{avatar_similarity}:0.05[av];"
+            f"[vsub][av]overlay="
+            f"main_w-overlay_w-{_AVATAR_MARGIN}:main_h-overlay_h-{_AVATAR_MARGIN}:"
+            f"eof_action=repeat[vout]"
+        )
+    else:
+        video_filter = f"{video_filter}[vout]"
     audio_filter = (
         f"[1:a]volume={gain},aresample=48000,"
         f"aformat=channel_layouts=stereo,asplit=2[sc][cm];"
@@ -529,17 +560,16 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
         f"[duck][cm]amix=inputs=2:duration=longest:dropout_transition=0,"
         f"volume=2[aout]"
     )
-    return [
-        "ffmpeg", "-y",
-        "-i", str(video),
-        "-i", str(track_wav),
-        "-filter_complex", f"{video_filter};{audio_filter}",
-        "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
-        str(out_path),
-    ]
+    return (
+        ["ffmpeg", "-y"] + inputs + [
+            "-filter_complex", f"{video_filter};{audio_filter}",
+            "-map", "[vout]", "-map", "[aout]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            str(out_path),
+        ]
+    )
 
 
 def probe_duration(video: Path) -> float:
@@ -624,6 +654,14 @@ def main(argv=None) -> int:
                         help=f"ダッキング圧縮比（既定{_DEFAULT_DUCK_RATIO}）")
     parser.add_argument("--layout", choices=["plain", "biim"], default="plain",
                         help="plain=音声のみ合成（既定）/ biim=案A枠＋実況字幕帯（v2a）")
+    parser.add_argument("--avatar-video", default=None,
+                        help="VMC口パク録画のmp4（v2c・biim時のみ・グリーンバックをクロマキー合成）")
+    parser.add_argument("--avatar-offset", type=float, default=0.0,
+                        help="録画開始→WAV再生開始の秒数（頭合わせ・0以上）")
+    parser.add_argument("--avatar-width", type=int, default=_AVATAR_WIDTH,
+                        help=f"アバターの表示幅px（既定{_AVATAR_WIDTH}）")
+    parser.add_argument("--avatar-chroma", default=_AVATAR_CHROMA,
+                        help=f"クロマキー色（既定{_AVATAR_CHROMA}=緑）")
     parser.add_argument("--dry-run", action="store_true",
                         help="スケジュールの表示のみ（ffmpeg不要）")
     args = parser.parse_args(argv)
@@ -705,10 +743,25 @@ def main(argv=None) -> int:
         build_ass(final_schedule, ass_path, panel_events)
         logger.info("実況字幕を生成: %s（字幕%d件・パネル状態%d件・技ログ%d件）",
                     ass_path, len(final_schedule), len(states), len(moments))
+        avatar_video = None
+        if args.avatar_video:
+            avatar_video = Path(args.avatar_video)
+            if not avatar_video.exists():
+                logger.error("アバター録画が見つかりません: %s", avatar_video)
+                return 1
+            logger.info("アバター合成: %s（offset=%.2fs・幅%dpx）",
+                        avatar_video, args.avatar_offset, args.avatar_width)
         out_path = Path(args.out) if args.out else render_dir / f"{render_dir.name}{suffix}"
         cmd = build_ffmpeg_command_biim(video, track_wav, out_path, ass_path,
-                                        args.gain, args.duck_threshold, args.duck_ratio)
+                                        args.gain, args.duck_threshold, args.duck_ratio,
+                                        avatar_video=avatar_video,
+                                        avatar_offset=args.avatar_offset,
+                                        avatar_width=args.avatar_width,
+                                        avatar_chroma=args.avatar_chroma)
     else:
+        if args.avatar_video:
+            logger.error("--avatar-video は --layout biim でのみ使えます")
+            return 1
         out_path = Path(args.out) if args.out else render_dir / f"{render_dir.name}_commentary.mp4"
         cmd = build_ffmpeg_command(video, track_wav, out_path,
                                    args.gain, args.duck_threshold, args.duck_ratio)

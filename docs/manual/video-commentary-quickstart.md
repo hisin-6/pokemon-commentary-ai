@@ -51,6 +51,17 @@ python3 scripts/render_commentary_video.py renders/<動画名> --layout biim
 - 出来上がったmp4を通しで視聴（字幕・パネル・実況タイミング）
 - 気になる箇所は③のfillers.jsonl修正→④のやり直しだけで直せる（課金なし）
 
+## （任意）アバター付きにする
+
+VMCの3Dモデルをワイプ合成できる（詳細: `docs/design/v2c-avatar-design.md`）:
+
+1. ④実行後にできる `renders/<動画名>/commentary_track.wav` を用意
+2. VMC＋モデル起動（背景グリーン）・VB-CableでWAVをリップシンク入力へ
+3. **OBS録画を開始→WAVを再生**（録画開始から再生開始までの秒数をメモ）
+4. ```bash
+   python3 scripts/render_commentary_video.py renders/<動画名> --layout biim --avatar-video <録画.mp4> --avatar-offset <メモした秒数>
+   ```
+
 ## よくあるトラブル
 
 | 症状 | 原因 | 対処 |

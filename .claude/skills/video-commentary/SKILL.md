@@ -89,6 +89,17 @@ python3 scripts/render_commentary_video.py renders/<動画名> --layout biim  # 
 python3 scripts/render_commentary_video.py renders/<動画名>              # 音声のみ合成（plain・映像再エンコなし）
 ```
 
+### アバター合成（v2c・方式A=VMC録画ワイプ・任意）
+
+1. パス2を一度実行して `renders/<動画名>/commentary_track.wav` を得る
+2. Windows: VMC＋3Dモデルを起動（背景グリーン単色）。VB-Cable等でWAV再生を
+   リップシンク入力へルーティング
+3. **OBS録画を先に開始→WAVを頭から再生**（録画開始から再生開始までの秒数をメモ=offset）
+4. 合成: `python3 scripts/render_commentary_video.py renders/<動画名> --layout biim --avatar-video <録画mp4> --avatar-offset <秒>`
+   - 右下344px幅にクロマキー合成（`--avatar-width`/`--avatar-chroma`で調整可）
+   - アバター録画が動画より短い場合は最終フレームで静止（正常動作）
+   - **offsetは0以上のみ**（録画を先に始める運用で統一）。詳細: `docs/design/v2c-avatar-design.md`
+
 ## 合成後の検証チェックリスト（必ずやる）
 
 1. **スケジュール確認**: `renders/<動画名>/schedule.json` の `scheduled` を時刻順に見る。

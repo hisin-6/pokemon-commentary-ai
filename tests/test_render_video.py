@@ -376,6 +376,41 @@ class TestPanelEvents:
         assert any("情報収集中" in l for l in lines)
 
 
+class TestAvatarCommand:
+    def test_without_avatar_has_two_inputs(self, tmp_path):
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0)
+        assert cmd.count("-i") == 2
+        assert "chromakey" not in " ".join(cmd)
+
+    def test_with_avatar_adds_chromakey_overlay(self, tmp_path):
+        """アバター指定時は第3入力＋クロマキー＋右下overlay＋末尾静止。"""
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
+            avatar_video=Path("avatar.mp4"), avatar_offset=1.5)
+        joined = " ".join(cmd)
+        assert cmd.count("-i") == 3
+        # -ss がアバター入力の直前に付く（頭合わせ・並びは "-ss 1.5 -i avatar.mp4"）
+        idx = cmd.index("avatar.mp4")
+        assert cmd[idx - 3:idx] == ["-ss", "1.5", "-i"]
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        assert "chromakey=0x00FF00:0.15" in fc
+        assert "scale=344:-2" in fc
+        assert "eof_action=repeat" in fc
+        # 字幕の上にアバターが乗る（subtitles → overlay の順）
+        assert fc.index("subtitles=") < fc.index("eof_action=repeat")
+
+    def test_negative_offset_rejected(self, tmp_path):
+        """負のオフセットは非対応（録画を先に開始する運用で統一）。"""
+        with pytest.raises(ValueError, match="0以上"):
+            rcv.build_ffmpeg_command_biim(
+                Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+                gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
+                avatar_video=Path("avatar.mp4"), avatar_offset=-1.0)
+
+
 class TestLoadStates:
     def test_missing_file_returns_empty(self, tmp_path):
         assert rcv.load_states(tmp_path) == []
