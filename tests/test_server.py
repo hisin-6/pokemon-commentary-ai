@@ -384,3 +384,126 @@ class TestLogEndpoint:
             assert data["s3_image_path"] is not None
         finally:
             sv.S3_BUCKET = ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# /api/script（台本パス・ADR-009）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from src.api.server import _build_script_prompt, _parse_script_fillers
+
+
+def _valid_script_payload(**overrides):
+    payload = {
+        "events": [
+            {"time": 63.0, "event_type": "battle_start", "commentary": "開幕だ！",
+             "context": {"turn": 0, "player": "場: イダイトウ", "opponent": "場: リザードン",
+                         "move_log": ["T1:イダイトウのだくりゅう"]}},
+            {"time": 133.2, "event_type": "faint", "commentary": "イダイトウが倒れた！"},
+        ],
+        "gaps": [{"start": 0.0, "end": 61.0}, {"start": 78.0, "end": 131.0}],
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestBuildScriptPrompt:
+
+    def test_contains_timeline_and_gaps(self):
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        assert "63.0秒" in prompt
+        assert "開幕だ！" in prompt
+        assert "78.0秒 〜 131.0秒" in prompt
+
+    def test_contains_no_spoiler_rule(self):
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        assert "ネタバレ禁止" in prompt
+        assert "先取り" in prompt
+
+    def test_context_rendered_when_present(self):
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        assert "イダイトウのだくりゅう" in prompt
+        assert "T0" in prompt
+
+    def test_pre_battle_generic_talk_rule_uses_first_event_time(self):
+        """最初のイベント時刻より前は汎用トークにする指示が入る。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        assert "63秒より前" in prompt
+
+
+class TestParseScriptFillers:
+
+    def test_parses_plain_json_array(self):
+        text = '[{"time": 30.0, "text": "さあ始まるぞ"}, {"time": 100.0, "text": "考察タイム"}]'
+        fillers = _parse_script_fillers(text)
+        assert len(fillers) == 2
+        assert fillers[0] == {"time": 30.0, "text": "さあ始まるぞ"}
+
+    def test_parses_json_with_code_fence_and_preamble(self):
+        text = 'はい、生成します。\n```json\n[{"time": 30, "text": "実況"}]\n```'
+        fillers = _parse_script_fillers(text)
+        assert fillers == [{"time": 30.0, "text": "実況"}]
+
+    def test_invalid_items_skipped(self):
+        text = '[{"time": "abc", "text": "NG"}, {"time": 30, "text": ""}, {"time": 40, "text": "OK"}]'
+        fillers = _parse_script_fillers(text)
+        assert fillers == [{"time": 40.0, "text": "OK"}]
+
+    def test_no_json_returns_none(self):
+        assert _parse_script_fillers("JSONを生成できませんでした") is None
+
+    def test_broken_json_returns_none(self):
+        assert _parse_script_fillers('[{"time": 30, "text": "途中で切れ') is None
+
+
+class TestScriptEndpoint:
+
+    def test_missing_json_returns_400(self, client):
+        resp = client.post("/api/script", data="not json", content_type="text/plain")
+        assert resp.status_code == 400
+
+    def test_missing_events_returns_400(self, client):
+        resp = client.post("/api/script", json=_valid_script_payload(events=[]))
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == "missing_events"
+
+    def test_missing_gaps_returns_400(self, client):
+        resp = client.post("/api/script", json=_valid_script_payload(gaps=[]))
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == "missing_gaps"
+
+    def test_successful_script_call(self, client):
+        mock_response_body = {
+            "content": [{"text": '[{"time": 30.0, "text": "さあ試合開始が近いぞ"}]'}],
+            "usage": {"input_tokens": 500, "output_tokens": 80},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(
+                read=MagicMock(return_value=json.dumps(mock_response_body).encode())
+            )
+        }
+        with patch.object(server_module.bedrock, "invoke_model", return_value=mock_bedrock_response):
+            resp = client.post("/api/script", json=_valid_script_payload())
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["success"] is True
+        assert data["fillers"] == [{"time": 30.0, "text": "さあ試合開始が近いぞ"}]
+
+    def test_unparseable_bedrock_output_returns_502(self, client):
+        mock_response_body = {
+            "content": [{"text": "JSONではない自由文の応答"}],
+            "usage": {},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(
+                read=MagicMock(return_value=json.dumps(mock_response_body).encode())
+            )
+        }
+        with patch.object(server_module.bedrock, "invoke_model", return_value=mock_bedrock_response):
+            resp = client.post("/api/script", json=_valid_script_payload())
+        assert resp.status_code == 502
+        assert resp.get_json()["error"] == "bedrock_parse_error"

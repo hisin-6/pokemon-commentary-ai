@@ -15,6 +15,9 @@ debug/
 # パイプラインログ（pipeline.pyが自動生成）
 logs/
 
+# 実況動画レンダリング素材・出力（--render-out とパス2が生成・mp4は数GB）
+renders/
+
 # PokeAPI キャッシュ（336MB、scripts/build_pokedb.pyが生成）
 data/pokeapi_cache/
 

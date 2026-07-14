@@ -169,6 +169,102 @@ def _parse_commentary(text: str) -> tuple[str, str]:
     return analysis, commentary
 
 
+def _build_script_prompt(events: list, gaps: list) -> str:
+    """台本パス（ギャップフィラー生成）のプロンプトを組み立てる。
+
+    録画解析済みの実況タイムラインと無言区間リストを渡し、区間を埋める
+    つなぎ実況をまとめて生成させる（ADR-009 台本パス・テキストのみ1回送信）。
+    """
+    first_event_time = min(float(e.get("time", 0)) for e in events)
+
+    lines = [
+        "あなたはポケモンのダブルバトルの熱狂的な実況者です。",
+        "録画された試合の実況音声はすでに主要イベント分が収録済みです。",
+        "イベント間の「無言区間」を埋めるつなぎ実況（フィラー）を生成してください。",
+        "",
+        "【最重要ルール: ネタバレ禁止】",
+        "- 各フィラーは、その time 時点までに起きたイベントの情報だけを使うこと",
+        "- time より後のイベントや試合の勝敗を絶対に先取りして言及しないこと",
+        "- 「次に〜が来たら怖い」のような予想はOK（断定はしない・外れてもよい）",
+        f"- {first_event_time:.0f}秒より前の区間（試合開始前）は、ポケモン名などの具体情報を使わず、",
+        "  挨拶・意気込み・観戦ポイントなどの汎用トークにすること",
+        "",
+        "【フィラーの内容（バリエーションを持たせる）】",
+        "- 直前の展開の振り返り・戦況の整理（HP・残り頭数）",
+        "- タイプ相性や特性をふまえた考察",
+        "- 次の展開の予想",
+        "- 短い雑談",
+        "",
+        "【出力形式】",
+        "- JSON配列のみを出力すること（前置き・説明文・コードフェンスは書かない）",
+        '- 形式: [{"time": 秒数の数値, "text": "実況文"}, ...]',
+        "- 各無言区間に1〜2件。text は40〜80文字程度（読み上げ約8〜15秒）",
+        "- time は必ずその無言区間の範囲内の数値にすること",
+        "- 鉤括弧（「」）は使わない",
+        "",
+        "【タイムライン（時刻順・★が埋めるべき無言区間）】",
+        "※ 各★区間のフィラーには、その行より上にあるイベントの情報だけを使うこと。",
+        "※ その行より下のイベントは、その時点ではまだ起きていない（画面にも映っていない）。",
+        "※ 収録済み実況と重複しない内容にすること。",
+    ]
+    # イベントとギャップを時系列に交互に並べる（「この区間より下はまだ起きて
+    # いない」をモデルが取り違えないようにする。分離リスト形式だと後続
+    # イベントの内容がフィラーに混入した実例あり: 2026-07-14 t=100sの
+    # 「イダイトウが倒された」ネタバレ）
+    timeline = [("event", float(e.get("time", 0)), e) for e in events]
+    timeline += [("gap", float(g["start"]), g) for g in gaps]
+    timeline.sort(key=lambda item: item[1])
+    for kind, _, item in timeline:
+        if kind == "gap":
+            lines.append(f"- ★{float(item['start']):.1f}秒 〜 {float(item['end']):.1f}秒 "
+                         "= 無言区間（ここにフィラーを1〜2件）")
+            continue
+        e = item
+        lines.append(f"- {float(e['time']):.1f}秒 [{e.get('event_type', '?')}] {e.get('commentary', '')}")
+        ctx = e.get("context") or {}
+        if ctx:
+            parts = []
+            if ctx.get("turn") is not None:
+                parts.append(f"T{ctx['turn']}")
+            if ctx.get("player"):
+                parts.append(f"自分={ctx['player']}")
+            if ctx.get("opponent"):
+                parts.append(f"相手={ctx['opponent']}")
+            if ctx.get("move_log"):
+                parts.append(f"技ログ={' / '.join(ctx['move_log'])}")
+            if parts:
+                lines.append(f"    （戦況: {'・'.join(parts)}）")
+    return "\n".join(lines)
+
+
+def _parse_script_fillers(text: str):
+    """台本パスのBedrock出力からフィラーのJSON配列を抽出する。
+
+    コードフェンスや前置きが混入しても最初の ``[`` 〜 最後の ``]`` を
+    JSONとして読む。形式不正なら None を返す（要素単位では time/text を
+    持つものだけ採用）。
+    """
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        raw = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(raw, list):
+        return None
+    fillers = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        time_val = item.get("time")
+        text_val = item.get("text")
+        if isinstance(time_val, (int, float)) and isinstance(text_val, str) and text_val.strip():
+            fillers.append({"time": float(time_val), "text": text_val.strip()})
+    return fillers
+
+
 # ─── エンドポイント ──────────────────────────────────────────────────────────
 
 
@@ -277,6 +373,77 @@ def vision():
         "success": True,
         "analysis": analysis,
         "commentary": commentary,
+        "usage": {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+        },
+        "latency_ms": latency_ms,
+    })
+
+
+@app.route("/api/script", methods=["POST"])
+def script():
+    """台本パス（ADR-009）: 解析済み実況タイムラインの無言区間を埋める
+    フィラー実況をテキストのみの1回のBedrock呼び出しでまとめて生成する。"""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"success": False, "error": "invalid_json", "message": "リクエストボディがJSONではありません"}), 400
+
+    events: list = data.get("events", [])
+    gaps: list = data.get("gaps", [])
+    if not events:
+        return jsonify({"success": False, "error": "missing_events", "message": "events が必要です"}), 400
+    if not gaps:
+        return jsonify({"success": False, "error": "missing_gaps", "message": "gaps が必要です"}), 400
+
+    prompt_text = _build_script_prompt(events, gaps)
+    request_body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 2000,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": prompt_text}]}
+        ],
+    }
+
+    start_ms = time.monotonic()
+    try:
+        response = bedrock.invoke_model(
+            modelId=BEDROCK_MODEL_ID,
+            body=json.dumps(request_body),
+            contentType="application/json",
+            accept="application/json",
+        )
+    except ReadTimeoutError as e:
+        logger.warning("Bedrock 読み取りタイムアウト: %s", e)
+        return jsonify({"success": False, "error": "bedrock_timeout", "message": "Bedrock タイムアウト"}), 504
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code == "ThrottlingException":
+            logger.warning("Bedrock スロットリング: %s", e)
+            return jsonify({"success": False, "error": "bedrock_timeout", "message": f"Bedrock スロットリング: {code}"}), 504
+        logger.error("Bedrock ClientError: %s", e)
+        return jsonify({"success": False, "error": "bedrock_error", "message": "Bedrock呼び出しでエラーが発生しました"}), 502
+    except Exception as e:
+        logger.error("Bedrock 予期しないエラー: %s", e)
+        return jsonify({"success": False, "error": "bedrock_error", "message": "Bedrock呼び出しでエラーが発生しました"}), 502
+
+    latency_ms = int((time.monotonic() - start_ms) * 1000)
+
+    result = json.loads(response["body"].read())
+    raw_text = result["content"][0]["text"].strip()
+    usage = result.get("usage", {})
+
+    fillers = _parse_script_fillers(raw_text)
+    if fillers is None:
+        logger.error("台本パス: Bedrock出力のJSON解析に失敗: %s", raw_text[:200])
+        return jsonify({"success": False, "error": "bedrock_parse_error", "message": "Bedrock出力をJSONとして解析できませんでした"}), 502
+
+    logger.info("台本生成完了 latency=%dms fillers=%d tokens_in=%s tokens_out=%s",
+                latency_ms, len(fillers), usage.get("input_tokens"), usage.get("output_tokens"))
+
+    return jsonify({
+        "success": True,
+        "fillers": fillers,
         "usage": {
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),

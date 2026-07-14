@@ -48,6 +48,7 @@ from src.capture.screen_capture import DiffDetector, init_reader, run_ocr
 from src.capture.yolo_detector import BattleState, YoloDetector
 from src.commentary.phi3_client import Phi3Client
 from src.output.audio_player import AudioPlayer
+from src.output.render_sink import RenderSink
 from src.output.voicevox_client import VoicevoxClient
 from src.pokedb.classifier import CATEGORY_POKEMON, PokeClassifier
 
@@ -2364,6 +2365,7 @@ class Pipeline:
         audio_device: int | None,
         video_path: str | None = None,
         video_sample_fps: float = 2.0,
+        render_out: str | None = None,
     ):
         log.info("=== パイプライン初期化 ===")
 
@@ -2425,6 +2427,19 @@ class Pipeline:
         self._tentative_opponent_moves: list[dict] = []  # dense scan フォールバックで仮確定した相手技（後付け修正用）
         self._MAX_MOVE_LOG = 8
         self._speech_thread: threading.Thread | None = None  # 音声再生スレッド
+        # レンダリング素材出力（ADR-009 パス1）: 指定時は音声を再生せずWAV＋マニフェスト保存
+        self._render_sink: RenderSink | None = None
+        if render_out:
+            if not video_path:
+                log.warning("--render-out はライブモードでは非推奨: event_time が実時間になる")
+            self._render_sink = RenderSink(render_out)
+            self._render_sink.write_info({
+                "video": video_path,
+                "sample_fps": video_sample_fps,
+                "speaker": speaker,
+            })
+            log.info("[レンダ] 素材出力モード: %s（実況音声は再生せず保存）",
+                     self._render_sink.out_dir)
         # faint保留送信: faintイベントのBedrockを即送信せず次のmove_usedで統合する
         self._pending_faint_state: dict | None = None
         self._pending_faint_battle_context: dict | None = None
@@ -2844,6 +2859,16 @@ class Pipeline:
             log.info(f"終了します（総ターン数: {turn}）")
         finally:
             cap.release()
+            # レンダリング素材出力のサマリー（音声合成スレッドの完了を待ってから集計）
+            if self._render_sink is not None:
+                if self._speech_thread is not None:
+                    self._speech_thread.join(timeout=30)
+                saved = self._render_sink.count
+                if saved > 0:
+                    log.info("[レンダ] 素材出力完了: %d 件 → %s", saved, self._render_sink.out_dir)
+                else:
+                    log.warning("[レンダ] ⚠ 実況素材が 1 件も保存されていません。"
+                                "VOICEVOX の起動と Bedrock（--ec2-url）の設定を確認してください。")
             # self._generate_battle_template()  # 手動で scripts/generate_battle_template.py を使うため無効化
 
     # def _generate_battle_template(self) -> None:
@@ -3073,7 +3098,10 @@ class Pipeline:
             self._commentary_history.pop(0)
 
         # ── VOICEVOX 音声合成 + 再生（非同期）──────────────────────────────────
-        self._speak_async(commentary)
+        # event_time はこのハンドラが処理中のフレームの動画内時刻（同期実行なので
+        # _now() はイベント検知時点と同値）
+        self._speak_async(commentary, event_type=event_type,
+                          context=self._render_context(battle_context))
 
         # バトル終了後にアクティブフラグをリセット（Bedrock呼び出し後）
         if event_type == "battle_end":
@@ -3116,12 +3144,41 @@ class Pipeline:
             self._commentary_history.append(commentary)
             if len(self._commentary_history) > 5:
                 self._commentary_history.pop(0)
-            self._speak_async(commentary)
+            # event_time は faint 検知時点の動画内時刻（保留中に動画が進んでいるため
+            # 現在時刻ではなく保留開始時刻を使う）
+            self._speak_async(commentary, event_type="faint",
+                              event_time=self._pending_faint_time,
+                              context=self._render_context(battle_context))
 
-    def _speak_async(self, commentary: str) -> None:
+    def _render_context(self, battle_context: dict | None) -> dict | None:
+        """レンダリング素材のマニフェストに記録する戦況サマリーを組み立てる。
+
+        台本パス（ADR-009・ギャップフィラー生成）がイベント間の戦況を
+        把握できるようにするための情報。レンダーモード以外では None。
+        """
+        if self._render_sink is None:
+            return None
+        ctx: dict = {"move_log": self._move_log_display(5)}
+        if battle_context:
+            ctx["turn"] = battle_context.get("turn")
+            ctx["player"] = battle_context.get("player_pokemon")
+            ctx["opponent"] = battle_context.get("opponent_pokemon")
+        return ctx
+
+    def _speak_async(self, commentary: str, event_type: str = "unknown",
+                     event_time: float | None = None,
+                     context: dict | None = None) -> None:
         """VOICEVOX 音声合成・再生を別スレッドで実行する（メインループをブロックしない）。
         前の再生が残っていれば停止してから新しい音声を流す。
+
+        レンダリング素材出力モード（--render-out）では再生せず、WAV保存＋
+        マニフェスト追記に切り替わる。event_time はイベント検知時点の動画内時刻。
+        呼び出し元スレッドで確定させる（合成スレッド内では動画が先に進んでいるため）。
+        context はマニフェストに記録する戦況サマリー（``_render_context()``）。
         """
+        if event_time is None:
+            event_time = self._now()
+
         def _run() -> None:
             try:
                 t0 = time.perf_counter()
@@ -3132,6 +3189,17 @@ class Pipeline:
                 return
             except Exception as e:
                 log.error(f"VOICEVOX エラー: {e}")
+                return
+            # レンダリング素材出力モード: 再生せず保存して終了
+            if self._render_sink is not None:
+                try:
+                    entry = self._render_sink.add(event_time, event_type, commentary,
+                                                  wav_bytes, context=context)
+                    log.info("[レンダ] #%d %s t=%.1fs (%.1f秒) → %s",
+                             entry["seq"], event_type, entry["event_time"],
+                             entry["duration"], entry["wav"])
+                except Exception as e:
+                    log.error(f"レンダ素材保存エラー: {e}")
                 return
             # 前の再生が残っていれば停止
             self._player.stop()
@@ -3769,6 +3837,10 @@ def main() -> None:
     parser.add_argument("--video-fps", type=float, default=2.0,
                         help="動画解析時のサンプリングレート（fps、デフォルト: 2.0）"
                              " ─ 高いほど技名取りこぼしが減るがCPU負荷増")
+    parser.add_argument("--render-out", default=None,
+                        help="実況動画レンダリング素材の出力ディレクトリ（ADR-009 パス1）。"
+                             "指定時は実況音声を再生せず WAV + manifest.jsonl を保存する。"
+                             "--input（動画モード）との併用を想定。")
 
     args = parser.parse_args()
 
@@ -3785,6 +3857,7 @@ def main() -> None:
         audio_device=args.audio_device,
         video_path=args.input,
         video_sample_fps=args.video_fps,
+        render_out=args.render_out,
     )
     pipeline.run()
 
