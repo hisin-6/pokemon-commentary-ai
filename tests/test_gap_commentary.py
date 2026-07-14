@@ -50,6 +50,51 @@ class TestComputeGaps:
         assert gaps == [{"start": 22.0, "end": 98.0}]
 
 
+class TestSplitGapsByMoments:
+    def test_gap_split_at_moment_times(self):
+        """区間内の📺時刻で分割される（先読みネタバレの構造対策）。"""
+        gaps = [{"start": 76.0, "end": 131.0}]
+        moments = [{"time": 105.0, "kind": "move", "text": "A"},
+                   {"time": 111.0, "kind": "move", "text": "B"}]
+        result = ggc.split_gaps_by_moments(gaps, moments, min_len=5.0)
+        assert result == [{"start": 76.0, "end": 105.0},
+                          {"start": 105.0, "end": 111.0},
+                          {"start": 111.0, "end": 131.0}]
+
+    def test_short_fragments_dropped(self):
+        """min_len未満の断片は捨てられる（フィラー1本が収まらない）。"""
+        gaps = [{"start": 150.0, "end": 255.0}]
+        moments = [{"time": 222.3, "kind": "move", "text": "A"},
+                   {"time": 227.3, "kind": "move", "text": "B"}]
+        result = ggc.split_gaps_by_moments(gaps, moments, min_len=12.0)
+        # 222.3-227.3（5秒）は落ちる
+        assert result == [{"start": 150.0, "end": 222.3},
+                          {"start": 227.3, "end": 255.0}]
+
+    def test_no_moments_keeps_gaps(self):
+        gaps = [{"start": 0.0, "end": 61.0}]
+        assert ggc.split_gaps_by_moments(gaps, []) == gaps
+
+    def test_moment_outside_gap_ignored(self):
+        gaps = [{"start": 76.0, "end": 131.0}]
+        moments = [{"time": 140.0, "kind": "move", "text": "A"}]
+        assert ggc.split_gaps_by_moments(gaps, moments) == gaps
+
+
+class TestLoadTimeline:
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert ggc.load_timeline(tmp_path) == []
+
+    def test_sorted_by_time(self, tmp_path):
+        import json as _json
+        lines = [_json.dumps({"time": 230.0, "kind": "move", "text": "B"}),
+                 _json.dumps({"time": 90.0, "kind": "move", "text": "A"})]
+        (tmp_path / "timeline.jsonl").write_text("\n".join(lines) + "\n",
+                                                 encoding="utf-8")
+        moments = ggc.load_timeline(tmp_path)
+        assert [m["text"] for m in moments] == ["A", "B"]
+
+
 class TestClampFillersToGaps:
     _gaps = [{"start": 0.0, "end": 61.0}, {"start": 78.0, "end": 131.0}]
 

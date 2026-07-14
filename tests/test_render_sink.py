@@ -93,16 +93,30 @@ class TestRenderSink:
         assert json.loads(lines[0])["context"] == ctx
         assert "context" not in json.loads(lines[1])
 
+    def test_add_moment_appends_timeline(self, tmp_path):
+        """瞬間ログがtimeline.jsonlに時刻付きで追記される（台本パス用）。"""
+        sink = RenderSink(tmp_path)
+        sink.add_moment(200.5, "move", "T3:ガブリアスのドラゴンクロー")
+        sink.add_moment(230.0, "move", "T3:ペリッパーのぼうふう")
+
+        lines = (tmp_path / "timeline.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        first = json.loads(lines[0])
+        assert first == {"time": 200.5, "kind": "move",
+                         "text": "T3:ガブリアスのドラゴンクロー"}
+
     def test_rerun_clears_previous_materials(self, tmp_path):
-        """同じ出力先での再実行は前回のmanifest・wav・fillersをクリアする
+        """同じ出力先での再実行は前回のmanifest・wav・fillers・timelineをクリアする
         （追記のままだと新旧混在＋連番WAV同名衝突が起きる・2026-07-14実発生）。"""
         sink1 = RenderSink(tmp_path)
         sink1.add(10.0, "battle_start", "旧実況", _make_wav(0.2))
+        sink1.add_moment(20.0, "move", "T1:旧技")
         (tmp_path / "fillers.jsonl").write_text('{"seq": 1}\n', encoding="utf-8")
 
         sink2 = RenderSink(tmp_path)
         assert not (tmp_path / "manifest.jsonl").exists()
         assert not (tmp_path / "fillers.jsonl").exists()
+        assert not (tmp_path / "timeline.jsonl").exists()
         assert list((tmp_path / "wav").glob("*.wav")) == []
 
         entry = sink2.add(30.0, "switch", "新実況", _make_wav(0.2))

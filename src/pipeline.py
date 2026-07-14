@@ -3549,6 +3549,12 @@ class Pipeline:
                 if len(self._move_log) > self._MAX_MOVE_LOG:
                     self._move_log.pop(0)
                 log.info("[技ログ] 検出: %s%s", entry, "（仮確定）" if tentative else "")
+                # レンダーモード: 技が画面に映った瞬間の動画内時刻を記録
+                # （台本パスがライブ実況風の時刻アンカーとして使う）
+                # getattr: テストが部分構築のPipelineで_update_move_logを呼ぶため
+                render_sink = getattr(self, "_render_sink", None)
+                if render_sink is not None:
+                    render_sink.add_moment(self._now(), "move", entry)
                 if tentative:
                     self._tentative_opponent_moves.append({
                         "old_entry": entry,

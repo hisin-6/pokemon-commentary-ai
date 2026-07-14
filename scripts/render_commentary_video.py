@@ -235,6 +235,163 @@ def build_commentary_track(render_dir: Path, scheduled: list,
     return last_end_frame / rate
 
 
+def _ass_time(sec: float) -> str:
+    """秒を ASS の時刻表記（h:mm:ss.cc）に変換する。"""
+    cs = int(round(sec * 100))
+    h, rem = divmod(cs, 360000)
+    m, rem = divmod(rem, 6000)
+    s, c = divmod(rem, 100)
+    return f"{h}:{m:02d}:{s:02d}.{c:02d}"
+
+
+def _ass_escape(text: str) -> str:
+    """ASSのオーバーライドタグ・改行制御と衝突する文字を無害化する。"""
+    return text.replace("{", "｛").replace("}", "｝").replace("\n", "\\N")
+
+
+# 字幕フォントサイズ（スマホ視聴を考慮して帯いっぱいに大きく・太字）
+_SUBTITLE_FONT_SIZE = 48
+# 字幕の1行あたり最大文字数。ASS/libassの自動折り返しはスペース基準のため
+# 日本語（スペースなし）では効かず、帯からはみ出す（実機フレームで確認済み）。
+# 手動で\Nを挿入する。実況帯はフル幅（使用可能幅1824px ÷ フォント48px ≒ 38字）
+# （最長102字＝100字フィラー+鉤括弧で3行・帯高さ230pxに収まる）
+_SUBTITLE_WRAP_CHARS = 37
+# 折り返し位置の直前にあれば優先して切る句読点
+_WRAP_PUNCT = "。、！？!?"
+# 行頭に置かない文字（禁則・前の行にぶら下げる）
+_WRAP_NO_HEAD = "」。、！？!?）)"
+
+
+def _wrap_jp(text: str, width: int = _SUBTITLE_WRAP_CHARS) -> str:
+    """日本語テキストをwidth文字ごとに\\Nで折り返す。
+
+    句読点があればそこで切り（読みやすさ優先）、行頭に来てはいけない
+    文字（閉じ括弧・句読点）は前の行にぶら下げる（禁則処理）。
+    """
+    lines = []
+    rest = text
+    while len(rest) > width:
+        cut = width
+        # 20字目〜width字目の間の最後の句読点の直後で切る
+        for i in range(width, max(19, width - 16), -1):
+            if rest[i - 1] in _WRAP_PUNCT:
+                cut = i
+                break
+        # 次行の行頭が禁則文字ならぶら下げる（幅は+2字まで超過を許容）
+        while cut < len(rest) and rest[cut] in _WRAP_NO_HEAD and cut < width + 2:
+            cut += 1
+        lines.append(rest[:cut])
+        rest = rest[cut:]
+    if rest:
+        lines.append(rest)
+    return "\\N".join(lines)
+
+
+# 字幕の余韻: 音声終了後もこの秒数だけ表示を残す（次の実況開始でカット）
+_SUBTITLE_LINGER_SEC = 1.5
+
+# biim風レイアウトの配置（1920x1080・mockup_A_biim.png 準拠）
+_BIIM_GAME_W, _BIIM_GAME_H = 1440, 810   # ゲーム画面の縮小サイズ
+_BIIM_GAME_X, _BIIM_GAME_Y = 16, 12      # ゲーム画面の左上位置
+_BIIM_BG_COLOR = "0x121627"              # 背景（ダークネイビー）
+_BIIM_PANEL_COLOR = "0x1B2135"           # 右サイドパネルの下地
+_BIIM_FONTS_DIR = "/mnt/c/Windows/Fonts"  # meiryo.ttc の場所（WSL）
+_BIIM_FONT_FILE = f"{_BIIM_FONTS_DIR}/meiryob.ttc"
+
+
+def build_ass(scheduled: list, out_path: Path) -> None:
+    """スケジュール済み実況から音声シンクロの字幕（ASS）を生成する。
+
+    下部の実況帯（ゲーム画面の下・右パネルを避けた領域）に表示する。
+    イベント実況とフィラーはスタイルを分ける（フィラーは淡色）。
+    """
+    # 帯の上端+14pxから表示（帯の位置はbuild_ffmpeg_command_biim側の計算と対）
+    fs = _SUBTITLE_FONT_SIZE
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Event,Meiryo,{fs},&H00FFFFFF,&H00FFFFFF,&H00101010,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,7,48,48,848,1
+Style: Filler,Meiryo,{fs},&H00E8D8B0,&H00FFFFFF,&H00101010,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,7,48,48,848,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = [header]
+    ordered = sorted(scheduled, key=lambda e: e["start"])
+    for i, e in enumerate(ordered):
+        start = float(e["start"])
+        end = start + float(e["duration"]) + _SUBTITLE_LINGER_SEC
+        if i + 1 < len(ordered):
+            end = min(end, float(ordered[i + 1]["start"]) - 0.1)
+        style = "Filler" if e["event_type"] == "filler" else "Event"
+        text = _wrap_jp(_ass_escape(f"「{e['commentary']}」"))
+        lines.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},{style},,0,0,0,,{text}\n")
+    out_path.write_text("".join(lines), encoding="utf-8")
+
+
+def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
+                              ass_path: Path, gain: float, duck_threshold: float,
+                              duck_ratio: float) -> list:
+    """biim風レイアウト（案A）合成のffmpegコマンドを組み立てる。
+
+    ゲーム画面を左上に縮小配置し、右サイドパネルの下地・下部実況帯を描画、
+    ASS字幕（音声シンクロの実況テキスト）を焼き込む。映像は再エンコード
+    （レイアウト合成のため -c:v copy 不可）。音声チェインはplainと同一。
+    戦況パネルの中身はv2b・アバターはv2cで実装予定（下地のみ確保）。
+    """
+    band_y = _BIIM_GAME_Y + _BIIM_GAME_H + 12          # 実況帯の上端（字幕3行が入る高さを確保）
+    band_h = 1080 - band_y - 16                        # 実況帯の高さ（=230px）
+    band_w = 1920 - _BIIM_GAME_X * 2                   # 実況帯はフル幅（右パネルの下も使う）
+    panel_x = _BIIM_GAME_X + _BIIM_GAME_W + 16         # 右パネルの左端
+    panel_w = 1920 - panel_x - 16
+    video_filter = (
+        # ゲーム画面を縮小し、パディングで1920x1080のキャンバスに配置
+        f"[0:v]scale={_BIIM_GAME_W}:{_BIIM_GAME_H},"
+        f"pad=1920:1080:{_BIIM_GAME_X}:{_BIIM_GAME_Y}:{_BIIM_BG_COLOR},"
+        # ゲーム画面の枠線
+        f"drawbox=x={_BIIM_GAME_X - 2}:y={_BIIM_GAME_Y - 2}:"
+        f"w={_BIIM_GAME_W + 4}:h={_BIIM_GAME_H + 4}:color=0x35E0FF@0.9:t=2,"
+        # 下部実況帯（フル幅・スマホでも読める大きさの字幕領域）
+        f"drawbox=x={_BIIM_GAME_X}:y={band_y}:w={band_w}:h={band_h}:"
+        f"color=black@0.85:t=fill,"
+        f"drawbox=x={_BIIM_GAME_X}:y={band_y}:w={band_w}:h={band_h}:"
+        f"color=white@0.7:t=2,"
+        # 右サイドパネルの下地（ゲーム画面と同じ高さ・中身はv2b/v2c）
+        f"drawbox=x={panel_x}:y={_BIIM_GAME_Y}:w={panel_w}:h={_BIIM_GAME_H}:"
+        f"color={_BIIM_PANEL_COLOR}:t=fill,"
+        f"drawtext=fontfile={_BIIM_FONT_FILE}:text='◆ 戦況':"
+        f"x={panel_x + 24}:y=44:fontsize=34:fontcolor=0x66CCFF,"
+        f"drawtext=fontfile={_BIIM_FONT_FILE}:text='◆ 技ログ':"
+        f"x={panel_x + 24}:y=540:fontsize=34:fontcolor=0xFFC94D,"
+        # 実況字幕（音声シンクロ）
+        f"subtitles={ass_path}:fontsdir={_BIIM_FONTS_DIR}[vout]"
+    )
+    audio_filter = (
+        f"[1:a]volume={gain},aresample=48000,"
+        f"aformat=channel_layouts=stereo,asplit=2[sc][cm];"
+        f"[0:a][sc]sidechaincompress="
+        f"threshold={duck_threshold}:ratio={duck_ratio}:attack=20:release=400[duck];"
+        f"[duck][cm]amix=inputs=2:duration=longest:dropout_transition=0,"
+        f"volume=2[aout]"
+    )
+    return [
+        "ffmpeg", "-y",
+        "-i", str(video),
+        "-i", str(track_wav),
+        "-filter_complex", f"{video_filter};{audio_filter}",
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        str(out_path),
+    ]
+
+
 def probe_duration(video: Path) -> float:
     """ffprobeで動画長（秒）を取得。ffprobeが無ければ0を返す。"""
     ffprobe = shutil.which("ffprobe")
@@ -315,6 +472,8 @@ def main(argv=None) -> int:
                         help=f"ダッキング閾値（既定{_DEFAULT_DUCK_THRESHOLD}）")
     parser.add_argument("--duck-ratio", type=float, default=_DEFAULT_DUCK_RATIO,
                         help=f"ダッキング圧縮比（既定{_DEFAULT_DUCK_RATIO}）")
+    parser.add_argument("--layout", choices=["plain", "biim"], default="plain",
+                        help="plain=音声のみ合成（既定）/ biim=案A枠＋実況字幕帯（v2a）")
     parser.add_argument("--dry-run", action="store_true",
                         help="スケジュールの表示のみ（ffmpeg不要）")
     args = parser.parse_args(argv)
@@ -386,9 +545,18 @@ def main(argv=None) -> int:
         logger.warning("実況トラック終端 %.1fs が動画長 %.1fs を超過"
                        "（末尾の実況が映像より長く続きます）", track_end, video_dur)
 
-    out_path = Path(args.out) if args.out else render_dir / f"{render_dir.name}_commentary.mp4"
-    cmd = build_ffmpeg_command(video, track_wav, out_path,
-                               args.gain, args.duck_threshold, args.duck_ratio)
+    if args.layout == "biim":
+        suffix = "_commentary_biim.mp4"
+        ass_path = render_dir / "commentary.ass"
+        build_ass(final_schedule, ass_path)
+        logger.info("実況字幕を生成: %s（%d件）", ass_path, len(final_schedule))
+        out_path = Path(args.out) if args.out else render_dir / f"{render_dir.name}{suffix}"
+        cmd = build_ffmpeg_command_biim(video, track_wav, out_path, ass_path,
+                                        args.gain, args.duck_threshold, args.duck_ratio)
+    else:
+        out_path = Path(args.out) if args.out else render_dir / f"{render_dir.name}_commentary.mp4"
+        cmd = build_ffmpeg_command(video, track_wav, out_path,
+                                   args.gain, args.duck_threshold, args.duck_ratio)
     logger.info("ffmpeg実行: %s", " ".join(cmd))
     proc = subprocess.run(cmd)
     if proc.returncode != 0:

@@ -245,6 +245,75 @@ class TestBuildCommentaryTrack:
             rcv.build_commentary_track(tmp_path, [], tmp_path / "track.wav")
 
 
+class TestWrapJp:
+    def test_short_text_unchanged(self):
+        assert rcv._wrap_jp("短い文") == "短い文"
+
+    def test_long_text_wrapped_within_width(self):
+        """全行がwidth+2（禁則ぶら下げ許容）以内・文字の欠落なし。"""
+        text = "「インファイト、ねむりごな。相手のフシギバナがペリッパーを眠らせてきました。眠り状態は大きなハンデです。」"
+        wrapped = rcv._wrap_jp(text)
+        lines = wrapped.split("\\N")
+        assert len(lines) >= 2
+        assert all(len(l) <= rcv._SUBTITLE_WRAP_CHARS + 2 for l in lines)
+        assert "".join(lines) == text
+
+    def test_punctuation_preferred_break(self):
+        text = "あ" * 30 + "。" + "い" * 20
+        assert rcv._wrap_jp(text).split("\\N")[0].endswith("。")
+
+    def test_closing_bracket_not_at_line_head(self):
+        """閉じ括弧が行頭に来ない（禁則ぶら下げ）。"""
+        text = "あ" * (rcv._SUBTITLE_WRAP_CHARS * 2) + "」"
+        for line in rcv._wrap_jp(text).split("\\N"):
+            assert not line.startswith("」")
+
+
+class TestBuildAss:
+    def test_time_format(self):
+        assert rcv._ass_time(0.0) == "0:00:00.00"
+        assert rcv._ass_time(63.0) == "0:01:03.00"
+        assert rcv._ass_time(3723.456) == "1:02:03.46"
+
+    def test_escape_override_tags(self):
+        assert rcv._ass_escape("a{b}c\nd") == "a｛b｝c\\Nd"
+
+    def test_dialogue_lines_with_styles(self, tmp_path):
+        """イベント=Event・フィラー=Fillerスタイルで、音声区間+余韻の字幕が出る。"""
+        scheduled = [dict(_entry(63.0, duration=10.0, commentary="開幕だ"), start=63.0),
+                     dict(_filler(100.0, duration=8.0, commentary="つなぎ"), start=100.0)]
+        out = tmp_path / "c.ass"
+        rcv.build_ass(scheduled, out)
+        text = out.read_text(encoding="utf-8")
+        assert "Dialogue: 0,0:01:03.00,0:01:14.50,Event,,0,0,0,,「開幕だ」" in text
+        assert "Dialogue: 0,0:01:40.00,0:01:49.50,Filler,,0,0,0,,「つなぎ」" in text
+
+    def test_linger_capped_by_next_entry(self, tmp_path):
+        """余韻表示は次の実況開始の0.1秒前まででカットされる。"""
+        scheduled = [dict(_entry(10.0, duration=5.0), start=10.0),
+                     dict(_entry(15.5, duration=5.0), start=15.5)]
+        out = tmp_path / "c.ass"
+        rcv.build_ass(scheduled, out)
+        first = [l for l in out.read_text(encoding="utf-8").splitlines()
+                 if l.startswith("Dialogue")][0]
+        assert ",0:00:10.00,0:00:15.40," in first
+
+
+class TestBiimCommand:
+    def test_contains_layout_filters_and_encode(self, tmp_path):
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("track.wav"), Path("out.mp4"),
+            tmp_path / "c.ass", gain=1.4, duck_threshold=0.03, duck_ratio=8.0)
+        joined = " ".join(cmd)
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        assert "scale=1440:810" in fc
+        assert "pad=1920:1080:16:12" in fc
+        assert "subtitles=" in fc and "fontsdir=" in fc
+        assert "sidechaincompress" in fc  # 音声チェインはplainと同一
+        assert "-c:v libx264" in joined   # レイアウト焼き込みのため再エンコード
+        assert "[vout]" in joined and "[aout]" in joined
+
+
 class TestLoadManifest:
     def test_sorted_by_event_time(self, tmp_path):
         """保存順が時刻順と違っても event_time 昇順で返る。"""

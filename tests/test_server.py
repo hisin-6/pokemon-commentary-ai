@@ -390,7 +390,7 @@ class TestLogEndpoint:
 # /api/script（台本パス・ADR-009）
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from src.api.server import _build_script_prompt, _parse_script_fillers
+from src.api.server import _build_script_prompt, _gap_filler_count, _parse_script_fillers
 
 
 def _valid_script_payload(**overrides):
@@ -433,6 +433,36 @@ class TestBuildScriptPrompt:
         payload = _valid_script_payload()
         prompt = _build_script_prompt(payload["events"], payload["gaps"])
         assert "63秒より前" in prompt
+
+    def test_moments_interleaved_in_timeline(self):
+        """瞬間ログが📺付きで時系列に混ぜ込まれる（ライブ実況アンカー）。"""
+        payload = _valid_script_payload()
+        moments = [{"time": 90.0, "kind": "move", "text": "T1:イダイトウのだくりゅう"}]
+        prompt = _build_script_prompt(payload["events"], payload["gaps"], moments)
+        assert "📺90.0秒 画面: T1:イダイトウのだくりゅう" in prompt
+        # 63.0秒のイベントより後・133.2秒のイベントより前に並ぶ
+        assert prompt.index("63.0秒") < prompt.index("📺90.0秒") < prompt.index("133.2秒")
+
+    def test_gap_line_contains_filler_count(self):
+        """★区間の行に区間長に応じた件数指定が入る（53秒区間→2件）。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        assert "★78.0秒 〜 131.0秒 = 無言区間（ここにフィラーを2件）" in prompt
+
+    def test_live_commentary_persona(self):
+        """録画感を出さないライブ実況指示が入る。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        assert "ライブ実況" in prompt
+
+
+class TestGapFillerCount:
+
+    def test_scales_with_gap_length(self):
+        assert _gap_filler_count(0.0, 15.0) == 1     # 短い区間は最低1件
+        assert _gap_filler_count(0.0, 53.0) == 2
+        assert _gap_filler_count(0.0, 100.0) == 5
+        assert _gap_filler_count(0.0, 300.0) == 5    # 上限5件
 
 
 class TestParseScriptFillers:
@@ -486,8 +516,9 @@ class TestScriptEndpoint:
                 read=MagicMock(return_value=json.dumps(mock_response_body).encode())
             )
         }
-        with patch.object(server_module.bedrock, "invoke_model", return_value=mock_bedrock_response):
-            resp = client.post("/api/script", json=_valid_script_payload())
+        with patch.object(server_module.bedrock_script, "invoke_model", return_value=mock_bedrock_response):
+            resp = client.post("/api/script", json=_valid_script_payload(
+                moments=[{"time": 90.0, "kind": "move", "text": "T1:だくりゅう"}]))
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["success"] is True
@@ -503,7 +534,7 @@ class TestScriptEndpoint:
                 read=MagicMock(return_value=json.dumps(mock_response_body).encode())
             )
         }
-        with patch.object(server_module.bedrock, "invoke_model", return_value=mock_bedrock_response):
+        with patch.object(server_module.bedrock_script, "invoke_model", return_value=mock_bedrock_response):
             resp = client.post("/api/script", json=_valid_script_payload())
         assert resp.status_code == 502
         assert resp.get_json()["error"] == "bedrock_parse_error"

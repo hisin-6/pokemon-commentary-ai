@@ -96,9 +96,45 @@ def clamp_fillers_to_gaps(fillers: list, gaps: list) -> tuple:
     return kept, dropped
 
 
+def split_gaps_by_moments(gaps: list, moments: list,
+                          min_len: float = 12.0) -> list:
+    """ギャップを内包する瞬間ログ（📺）の時刻で分割する。
+
+    分割後の各サブ区間はプロンプトのタイムライン上で直前の📺より後に
+    並ぶため、「★区間より下の出来事は未来」ルールが区間内の📺にも
+    構造的に効く（プロンプト指示だけでは区間頭のフィラーが同区間の
+    後方📺を先読みする実例があった: 2026-07-14 t=85sがt=105〜123sの
+    技を予告）。min_len未満の断片はフィラー1本が収まらないため捨てる。
+    """
+    out = []
+    for g in gaps:
+        cuts = sorted(m["time"] for m in moments
+                      if g["start"] < m["time"] < g["end"])
+        bounds = [g["start"]] + cuts + [g["end"]]
+        for a, b in zip(bounds, bounds[1:]):
+            if b - a >= min_len:
+                out.append({"start": round(a, 1), "end": round(b, 1)})
+    return out
+
+
+def load_timeline(render_dir: Path) -> list:
+    """timeline.jsonl（技検出の瞬間ログ・任意）を読み込む。無ければ空リスト。"""
+    timeline_path = render_dir / "timeline.jsonl"
+    if not timeline_path.exists():
+        return []
+    moments = []
+    with timeline_path.open(encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                moments.append(json.loads(line))
+    moments.sort(key=lambda m: m["time"])
+    return moments
+
+
 def request_fillers(ec2_url: str, events: list, gaps: list,
-                    timeout: float = 60.0) -> list:
-    """EC2 /api/script にタイムラインとギャップを送りフィラー案を受け取る。"""
+                    moments: list = None, timeout: float = 120.0) -> list:
+    """EC2 /api/script にタイムライン・瞬間ログ・ギャップを送りフィラー案を受け取る。"""
     payload = {
         "events": [
             {
@@ -110,6 +146,7 @@ def request_fillers(ec2_url: str, events: list, gaps: list,
             for e in events
         ],
         "gaps": gaps,
+        "moments": moments or [],
     }
     resp = requests.post(f"{ec2_url.rstrip('/')}/api/script", json=payload,
                          timeout=timeout)
@@ -189,9 +226,16 @@ def main(argv=None) -> int:
         return 0
     logger.info("無言区間 %d箇所: %s", len(gaps),
                 " / ".join(f"{g['start']:.0f}〜{g['end']:.0f}s" for g in gaps))
+    moments = load_timeline(render_dir)
+    if moments:
+        logger.info("瞬間ログ %d件（timeline.jsonl・ライブ実況アンカーとして送信）", len(moments))
+        gaps = split_gaps_by_moments(gaps, moments)
+        logger.info("📺時刻でギャップを分割 → %d区間（区間内の先読みネタバレ対策）", len(gaps))
+    else:
+        logger.info("timeline.jsonl なし（パス1の再実行で技の瞬間ログが付きます）")
 
     # Bedrockでフィラー生成（テキストのみ1回）→ ギャップ範囲へクランプ
-    raw_fillers = request_fillers(args.ec2_url, kept, gaps)
+    raw_fillers = request_fillers(args.ec2_url, kept, gaps, moments)
     fillers, dropped = clamp_fillers_to_gaps(raw_fillers, gaps)
     for f in dropped:
         logger.warning("ギャップ範囲外のため破棄: t=%.1fs %s", f["time"], f["text"][:30])

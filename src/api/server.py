@@ -32,6 +32,11 @@ from flask import Flask, jsonify, request
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "ap-southeast-2")
 BEDROCK_MODEL_ID = "au.anthropic.claude-haiku-4-5-20251001-v1:0"
 BEDROCK_TIMEOUT_SEC = 5
+# 台本パス（/api/script）用の読み取りタイムアウト。テキストのみだが生成量が
+# 多く（フィラー最大4件/区間×60〜100字・max_tokens 3000）5秒では足りない。
+# オフライン処理なのでライブ用の短いタイムアウトを適用しない。
+# ⚠️ gunicornのworker timeout（既定30秒）も超える場合はsystemdユニット側の調整が必要
+BEDROCK_SCRIPT_TIMEOUT_SEC = 60
 IMAGE_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
@@ -54,6 +59,16 @@ bedrock = boto3.client(
     config=Config(
         connect_timeout=5,
         read_timeout=BEDROCK_TIMEOUT_SEC,
+        retries={"max_attempts": 0},
+    ),
+)
+# 台本パス用（読み取りタイムアウトのみ長い・他は同一設定）
+bedrock_script = boto3.client(
+    "bedrock-runtime",
+    region_name=BEDROCK_REGION,
+    config=Config(
+        connect_timeout=5,
+        read_timeout=BEDROCK_SCRIPT_TIMEOUT_SEC,
         retries={"max_attempts": 0},
     ),
 )
@@ -169,55 +184,73 @@ def _parse_commentary(text: str) -> tuple[str, str]:
     return analysis, commentary
 
 
-def _build_script_prompt(events: list, gaps: list) -> str:
+def _gap_filler_count(start: float, end: float) -> int:
+    """無言区間の長さから生成するフィラーの目安件数を決める（約18秒に1件・1〜5件）。
+
+    ユーザー要望「とてもしゃべらせたい」（2026-07-14に25秒→18秒へ増量）。
+    """
+    return max(1, min(5, int((end - start) // 18)))
+
+
+def _build_script_prompt(events: list, gaps: list, moments: list = None) -> str:
     """台本パス（ギャップフィラー生成）のプロンプトを組み立てる。
 
-    録画解析済みの実況タイムラインと無言区間リストを渡し、区間を埋める
-    つなぎ実況をまとめて生成させる（ADR-009 台本パス・テキストのみ1回送信）。
+    録画解析済みの実況タイムライン・無言区間リスト・瞬間ログ（技が画面に
+    映った動画内時刻）を渡し、区間を埋めるライブ実況風のつなぎ実況を
+    まとめて生成させる（ADR-009 台本パス・テキストのみ1回送信）。
     """
     first_event_time = min(float(e.get("time", 0)) for e in events)
 
     lines = [
         "あなたはポケモンのダブルバトルの熱狂的な実況者です。",
-        "録画された試合の実況音声はすでに主要イベント分が収録済みです。",
+        "録画された試合に後から実況を吹き込みますが、視聴者には生放送の",
+        "ライブ実況に聞こえるようにしてください（後から見返している・録画といった言い方は禁止）。",
+        "主要イベントの実況音声はすでに収録済みです。",
         "イベント間の「無言区間」を埋めるつなぎ実況（フィラー）を生成してください。",
         "",
         "【最重要ルール: ネタバレ禁止】",
-        "- 各フィラーは、その time 時点までに起きたイベントの情報だけを使うこと",
-        "- time より後のイベントや試合の勝敗を絶対に先取りして言及しないこと",
+        "- 各フィラーは、その time 時点までに起きた出来事の情報だけを使うこと",
+        "- time より後の出来事や試合の勝敗を絶対に先取りして言及しないこと",
         "- 「次に〜が来たら怖い」のような予想はOK（断定はしない・外れてもよい）",
         f"- {first_event_time:.0f}秒より前の区間（試合開始前）は、ポケモン名などの具体情報を使わず、",
         "  挨拶・意気込み・観戦ポイントなどの汎用トークにすること",
         "",
         "【フィラーの内容（バリエーションを持たせる）】",
+        "- 【最優先】直前に画面に映った技（📺印）への反応・実況。★区間の開始時刻が📺と",
+        "  ほぼ同じ場合、最初のフィラーは区間開始時刻に置き、その技への反応から始めること",
+        "  （例: 📺200.0秒 ドラゴンクロー → 200.5秒 ガブリアスのドラゴンクローが炸裂！...）",
         "- 直前の展開の振り返り・戦況の整理（HP・残り頭数）",
         "- タイプ相性や特性をふまえた考察",
         "- 次の展開の予想",
-        "- 短い雑談",
         "",
         "【出力形式】",
         "- JSON配列のみを出力すること（前置き・説明文・コードフェンスは書かない）",
         '- 形式: [{"time": 秒数の数値, "text": "実況文"}, ...]',
-        "- 各無言区間に1〜2件。text は40〜80文字程度（読み上げ約8〜15秒）",
-        "- time は必ずその無言区間の範囲内の数値にすること",
+        "- 各★区間に指定された件数を生成。text は60〜100文字程度（読み上げ約10〜18秒）",
+        "- time は必ずその無言区間の範囲内の数値にすること。同一区間内の各フィラーは20秒以上離すこと",
         "- 鉤括弧（「」）は使わない",
         "",
-        "【タイムライン（時刻順・★が埋めるべき無言区間）】",
-        "※ 各★区間のフィラーには、その行より上にあるイベントの情報だけを使うこと。",
-        "※ その行より下のイベントは、その時点ではまだ起きていない（画面にも映っていない）。",
+        "【タイムライン（時刻順・★が埋めるべき無言区間・📺は画面に技が映った瞬間）】",
+        "※ 各★区間のフィラーには、その行より上にある出来事の情報だけを使うこと。",
+        "※ その行より下の出来事は、その時点ではまだ起きていない（画面にも映っていない）。",
         "※ 収録済み実況と重複しない内容にすること。",
     ]
-    # イベントとギャップを時系列に交互に並べる（「この区間より下はまだ起きて
-    # いない」をモデルが取り違えないようにする。分離リスト形式だと後続
-    # イベントの内容がフィラーに混入した実例あり: 2026-07-14 t=100sの
+    # イベント・ギャップ・瞬間ログを時系列に交互に並べる（「この区間より下は
+    # まだ起きていない」をモデルが取り違えないようにする。分離リスト形式だと
+    # 後続イベントの内容がフィラーに混入した実例あり: 2026-07-14 t=100sの
     # 「イダイトウが倒された」ネタバレ）
     timeline = [("event", float(e.get("time", 0)), e) for e in events]
     timeline += [("gap", float(g["start"]), g) for g in gaps]
+    timeline += [("moment", float(m.get("time", 0)), m) for m in (moments or [])]
     timeline.sort(key=lambda item: item[1])
     for kind, _, item in timeline:
         if kind == "gap":
+            n = _gap_filler_count(float(item["start"]), float(item["end"]))
             lines.append(f"- ★{float(item['start']):.1f}秒 〜 {float(item['end']):.1f}秒 "
-                         "= 無言区間（ここにフィラーを1〜2件）")
+                         f"= 無言区間（ここにフィラーを{n}件）")
+            continue
+        if kind == "moment":
+            lines.append(f"- 📺{float(item['time']):.1f}秒 画面: {item.get('text', '')}")
             continue
         e = item
         lines.append(f"- {float(e['time']):.1f}秒 [{e.get('event_type', '?')}] {e.get('commentary', '')}")
@@ -391,15 +424,16 @@ def script():
 
     events: list = data.get("events", [])
     gaps: list = data.get("gaps", [])
+    moments: list = data.get("moments", [])
     if not events:
         return jsonify({"success": False, "error": "missing_events", "message": "events が必要です"}), 400
     if not gaps:
         return jsonify({"success": False, "error": "missing_gaps", "message": "gaps が必要です"}), 400
 
-    prompt_text = _build_script_prompt(events, gaps)
+    prompt_text = _build_script_prompt(events, gaps, moments)
     request_body = {
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 2000,
+        "max_tokens": 4000,
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": prompt_text}]}
         ],
@@ -407,7 +441,7 @@ def script():
 
     start_ms = time.monotonic()
     try:
-        response = bedrock.invoke_model(
+        response = bedrock_script.invoke_model(
             modelId=BEDROCK_MODEL_ID,
             body=json.dumps(request_body),
             contentType="application/json",
