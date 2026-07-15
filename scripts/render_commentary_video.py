@@ -490,7 +490,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 _AVATAR_WIDTH = 344          # アバターの表示幅（右下・縦横比は素材のまま）
 _AVATAR_MARGIN = 16          # 画面右端・下端からの余白
 _AVATAR_CHROMA = "0x00FF00"  # クロマキー色（グリーンバック）
-_AVATAR_SIMILARITY = 0.15    # クロマキーの類似度しきい値
+_AVATAR_SIMILARITY = 0.25    # クロマキーの類似度しきい値（despillとセットで緑フリンジ対策）
 
 
 def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
@@ -499,7 +499,8 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
                               avatar_offset: float = 0.0,
                               avatar_width: int = _AVATAR_WIDTH,
                               avatar_chroma: str = _AVATAR_CHROMA,
-                              avatar_similarity: float = _AVATAR_SIMILARITY) -> list:
+                              avatar_similarity: float = _AVATAR_SIMILARITY,
+                              avatar_crop: str = None) -> list:
     """biim風レイアウト（案A）合成のffmpegコマンドを組み立てる。
 
     ゲーム画面を左上に縮小配置し、右サイドパネルの下地・下部実況帯を描画、
@@ -509,7 +510,8 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
     avatar_video 指定時（v2c・方式A）はVMC口パク録画をクロマキーで抜いて
     右下に重ねる。avatar_offset は「録画開始→WAV再生開始」の秒数（頭合わせ・
     録画側の先頭をスキップする）。アバターが動画より短い場合は最終フレームで
-    静止する（eof_action=repeat）。
+    静止する（eof_action=repeat）。avatar_crop（"w:h:x:y"）指定時はスケール前に
+    クロップし、全身録画から上半身だけを抜き出して拡大表示する。
     """
     if avatar_video is not None and avatar_offset < 0:
         raise ValueError("avatar_offset は0以上（録画をWAV再生より先に開始する運用）")
@@ -542,10 +544,12 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
     if avatar_video is not None:
         # -ss で録画先頭（WAV再生開始前の部分）をスキップして頭を合わせる
         inputs += ["-ss", f"{avatar_offset}", "-i", str(avatar_video)]
+        crop_filter = f"crop={avatar_crop}," if avatar_crop else ""
         video_filter = (
             f"{video_filter}[vsub];"
-            f"[2:v]scale={avatar_width}:-2,"
-            f"chromakey={avatar_chroma}:{avatar_similarity}:0.05[av];"
+            f"[2:v]{crop_filter}scale={avatar_width}:-2,"
+            f"chromakey={avatar_chroma}:{avatar_similarity}:0.08,"
+            f"despill=type=green:mix=0.5:expand=0[av];"
             f"[vsub][av]overlay="
             f"main_w-overlay_w-{_AVATAR_MARGIN}:main_h-overlay_h-{_AVATAR_MARGIN}:"
             f"eof_action=repeat[vout]"
@@ -662,6 +666,9 @@ def main(argv=None) -> int:
                         help=f"アバターの表示幅px（既定{_AVATAR_WIDTH}）")
     parser.add_argument("--avatar-chroma", default=_AVATAR_CHROMA,
                         help=f"クロマキー色（既定{_AVATAR_CHROMA}=緑）")
+    parser.add_argument("--avatar-crop", default=None,
+                        help="スケール前に録画をクロップ（ffmpeg crop式 'w:h:x:y'）。"
+                             "全身録画から上半身だけを抜き出して拡大表示したい場合に指定")
     parser.add_argument("--dry-run", action="store_true",
                         help="スケジュールの表示のみ（ffmpeg不要）")
     args = parser.parse_args(argv)
@@ -757,7 +764,8 @@ def main(argv=None) -> int:
                                         avatar_video=avatar_video,
                                         avatar_offset=args.avatar_offset,
                                         avatar_width=args.avatar_width,
-                                        avatar_chroma=args.avatar_chroma)
+                                        avatar_chroma=args.avatar_chroma,
+                                        avatar_crop=args.avatar_crop)
     else:
         if args.avatar_video:
             logger.error("--avatar-video は --layout biim でのみ使えます")

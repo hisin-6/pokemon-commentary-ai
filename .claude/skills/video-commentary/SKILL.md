@@ -91,12 +91,23 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
 
 ### アバター合成（v2c・方式A=VMC録画ワイプ・任意）
 
+0. **【初回のみ】音声ルーティングを一度だけ設定**: wav再生専用のアプリを1つ決めて、
+   Windowsの音量ミキサー（アプリごとの出力先）でそのアプリの出力を「CABLE Input」に
+   設定する。**この設定はアプリ単位で記憶される**ため、動画ごとにフォルダが変わっても
+   毎回の切り替え・戻し作業は不要（普段使いの他アプリは既定デバイスのまま触らない）
 1. パス2を一度実行して `renders/<動画名>/commentary_track.wav` を得る
-2. Windows: VMC＋3Dモデルを起動（背景グリーン単色）。VB-Cable等でWAV再生を
-   リップシンク入力へルーティング
-3. **OBS録画を先に開始→WAVを頭から再生**（録画開始から再生開始までの秒数をメモ=offset）
-4. 合成: `python3 scripts/render_commentary_video.py renders/<動画名> --layout biim --avatar-video <録画mp4> --avatar-offset <秒>`
+2. Windows: VMC＋3Dモデルを起動（背景グリーン単色）。リップシンク入力はCABLE Output
+   （手順0で設定した仮想ケーブルの出口）を選択
+3. **OBS録画を先に開始→`scripts\play_commentary_track.bat <動画名>` でWAVを頭から再生**
+   （録画開始から再生開始までの秒数をメモ=offset。バッチはrenders配下の同名ファイルを
+   毎回自動解決するので手でフォルダを探さなくてよい）
+4. 合成: `python3 scripts/render_commentary_video.py renders/<動画名> --layout biim --avatar-video <録画mp4> --avatar-offset <秒> --avatar-crop <w:h:x:y>`
    - 右下344px幅にクロマキー合成（`--avatar-width`/`--avatar-chroma`で調整可）
+   - `--avatar-crop`（任意）: 全身録画から上半身だけを切り出してから拡大する
+     （例 `"300:480:810:230"`＝顔・肩まわり）。全身のまま縮小すると人物が極小になるため、
+     バストアップで見せたい場合は指定推奨
+   - クロマキーは類似度0.25＋`despill`（緑かぶり除去）がデフォルト。それでも縁が残る場合は
+     `--avatar-chroma`と合わせて類似度をさらに上げる
    - アバター録画が動画より短い場合は最終フレームで静止（正常動作）
    - **offsetは0以上のみ**（録画を先に始める運用で統一）。詳細: `docs/design/v2c-avatar-design.md`
 
@@ -136,6 +147,9 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | renders/のcommit | 数GBのmp4がリポジトリに入る | .gitignore済み。**外さないこと** |
 | states.jsonlが無い旧素材 | 戦況パネルが出ない | パス1の再実行が必要（timeline/statesは新パス1からのみ生成） |
 | モックアップ/日報の実フレーム | 対戦相手のトレーナー名が映る | publicリポジトリに載せてよいかはユーザー判断（2026-07-14に確認済み・現方針は許容） |
+| アバター全身録画をそのまま縮小 | 344px枠内で人物が極小・Tポーズの腕が窮屈 | `--avatar-crop`で上半身だけ切り出してから拡大する |
+| クロマキーのデフォルト設定（類似度0.15） | 輪郭に緑フリンジが残る | 類似度0.25＋`despill`をデフォルト化済み（2026-07-15）。まだ残るなら類似度をさらに上げる |
+| 音声ルーティングを毎回手動切替 | 録画前後の切替が面倒・戻し忘れ | wav再生専用アプリを1つ決めて出力先を一度だけCABLE Inputに設定（アプリ単位で記憶される）。`scripts/play_commentary_track.bat <動画名>`でフォルダ解決も自動化 |
 
 ## レイアウト調整ポイント（scripts/render_commentary_video.py の定数）
 
@@ -159,7 +173,7 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 
 ## 関連ファイル
 
-- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック）・`src/api/server.py`（`/api/script`・プロンプト）・`scripts/generate_gap_commentary.py`・`scripts/render_commentary_video.py`
+- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック）・`src/api/server.py`（`/api/script`・プロンプト）・`scripts/generate_gap_commentary.py`・`scripts/render_commentary_video.py`・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）
 - テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_server.py`（TestScript系）
 - 設計: `docs/adr/ADR-009-video-first-commentary.md`・レイアウト原案 `docs/design/frame-mockups/mockup_A_biim.png`
 - 経緯・実測値: `docs/daily/2026-07-14.md`
