@@ -2421,7 +2421,10 @@ class Pipeline:
         self._reader = init_reader(gpu=gpu)
 
         log.info("YoloDetector 初期化中...")
-        self._yolo = YoloDetector(model_path=model_path, ball_model_path=ball_model_path, end_model_path=end_model_path, conf=conf)
+        # 状態異常検出はテキストOCR（_sync_status_from_ocr_bbox）で代替済みのため、
+        # model未指定時はCOCO事前学習フォールバックを使わず無効化する（無駄な推論を防ぐ）。
+        self._yolo = YoloDetector(model_path=model_path, ball_model_path=ball_model_path, end_model_path=end_model_path, conf=conf,
+                                   enable_pretrained_fallback=False)
 
         log.info("Phi-3 クライアント初期化...")
         self._phi3 = Phi3Client()
@@ -3889,9 +3892,11 @@ def main() -> None:
     parser.add_argument("--input",   default=None,
                         help="動画ファイルのパス（指定時はカメラの代わりに動画を使用）")
     parser.add_argument("--model",   default=None,
-                        help="YOLOv8 カスタムモデルのパス（状態異常検出用・例: runs/detect/train4/weights/best.pt）")
+                        help="YOLOv8 カスタムモデルのパス（状態異常検出用・例: runs/detect/train4/weights/best.pt）。"
+                             "現在はテキストOCRで代替済みのためデフォルト無効。将来再利用する場合のみ指定")
     parser.add_argument("--ball-model", default=None,
-                        help="ボール検出専用モデルのパス（例: runs/detect/train7/weights/best.pt）")
+                        help="ボール検出専用モデルのパス（例: runs/detect/train7/weights/best.pt）。"
+                             "現在はパイプラインで未使用（デフォルト無効）。将来再利用する場合のみ指定")
     parser.add_argument("--end-model", default=None,
                         help="終了画面検出モデルのパス（例: runs/detect/train_end_screen2/weights/best.pt）")
     parser.add_argument("--interval", type=float, default=1.0,

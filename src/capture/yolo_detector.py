@@ -153,6 +153,7 @@ class YoloDetector:
         end_model_path: str | None = None,
         device: str | None = None,
         conf: float = CONFIDENCE_THRESHOLD,
+        enable_pretrained_fallback: bool = True,
     ) -> None:
         from ultralytics import YOLO
 
@@ -166,13 +167,19 @@ class YoloDetector:
             log.info(f"カスタムモデルをロード: {model_path}")
             self._model = YOLO(str(p))
             self._mode = "custom"
-        else:
+        elif enable_pretrained_fallback:
             log.warning(
                 "カスタムモデルが未指定のため yolov8n.pt（COCO事前学習済み）を使用します。"
                 "実際のアイコン検出は学習済みモデル指定後に有効になります。"
             )
             self._model = YOLO("yolov8n.pt")  # 自動DL（約6MB）
             self._mode = "pretrained_only"
+        else:
+            # 状態異常検出は現在パイプラインで無効化（テキストOCRで代替済み）。
+            # モデル自体・ロード方法は残しているので、再度有効化したい場合は
+            # model_path を指定するだけでよい。
+            self._model = None
+            self._mode = "disabled"
 
         # ボール検出専用モデル（train5 形式: 0=ball_alive / 1=ball_faint / 2=ball_status）
         self._ball_model: object | None = None
@@ -301,6 +308,8 @@ class YoloDetector:
             is_ball_roi = roi_name.endswith("_balls")
             # ボール ROI かつ専用モデルがある場合は ball_model を使う
             model = self._ball_model if (is_ball_roi and self._ball_model) else self._model
+            if model is None:
+                continue
             class_names = BALL_CLASS_NAMES if (is_ball_roi and self._ball_model) else CUSTOM_CLASS_NAMES
             results = model(crop, conf=self._conf, device=self._device, verbose=False)
             for r in results:
@@ -396,9 +405,11 @@ class YoloDetector:
 
         if self._custom_model or self._ball_model:
             all_detections = self._run_on_rois(frame)
-        else:
+        elif self._model is not None:
             raw = self._run_on_full_frame(frame)
             all_detections = self._assign_roi(frame, raw)
+        else:
+            all_detections = []
 
         state.detections = all_detections
 

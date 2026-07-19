@@ -44,11 +44,14 @@
 ```
 # ⚠️ 事前に必ず VOICEVOX を起動する（忘れると素材ゼロ・Bedrock代だけ消える）
 venv\Scripts\python.exe src/pipeline.py --input "D:\ゲーム録画\<動画>.mp4" ^
-  --model runs/detect/train4/weights/best.pt ^
-  --ball-model runs/detect/train7/weights/best.pt ^
   --end-model runs/detect/train_end_screen2/weights/best.pt ^
   --ec2-url http://<EC2のIP>:5000 --conf 0.3 --render-out renders/<動画名>
 ```
+
+（`--model`＝状態異常YOLO・`--ball-model`＝ボール数YOLOは2026-07-15より未指定がデフォルト。
+状態異常はテキストOCRで代替済み、ボール数は現在パイプライン未使用。学習済みモデル自体・
+指定方法は残っているので、必要になれば`--model runs/detect/train4/weights/best.pt`等を
+追加するだけで復活できる）
 
 成功確認: ログ末尾に `[レンダ] 素材出力完了: N 件`（0件なら失敗＝ほぼVOICEVOX未起動）。
 `renders/<動画名>/` に manifest.jsonl・timeline.jsonl・states.jsonl・wav/ ができる。

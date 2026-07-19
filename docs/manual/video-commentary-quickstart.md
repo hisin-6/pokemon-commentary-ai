@@ -10,7 +10,7 @@
 **先にVOICEVOXを起動する**（忘れると素材ゼロでBedrock代だけ消える）。
 
 ```powershell
-venv\Scripts\python.exe src/pipeline.py --input "D:\ゲーム録画\<録画ファイル名>.mp4" --model runs/detect/train4/weights/best.pt --ball-model runs/detect/train7/weights/best.pt --end-model runs/detect/train_end_screen2/weights/best.pt --ec2-url http://<EC2のIP>:5000 --conf 0.3 --render-out renders/<動画名>
+venv\Scripts\python.exe src/pipeline.py --input "D:\ゲーム録画\<録画ファイル名>.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --ec2-url http://<EC2のIP>:5000 --conf 0.3 --render-out renders/<動画名>
 ```
 
 ✅ ログ末尾が `[レンダ] 素材出力完了: N 件`（N≧5くらい）ならOK。0件ならVOICEVOX未起動。

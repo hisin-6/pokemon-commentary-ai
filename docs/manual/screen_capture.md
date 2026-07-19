@@ -24,11 +24,13 @@
 
 ```powershell
 # カメラ（ライブ・OBS仮想カメラ経由）
-venv\Scripts\python.exe src/pipeline.py --model runs/detect/train4/weights/best.pt --ball-model runs/detect/train7/weights/best.pt --end-model runs/detect/train_end_screen2/weights/best.pt --ec2-url http://<EC2-IP>:5000 --conf 0.3
+venv\Scripts\python.exe src/pipeline.py --end-model runs/detect/train_end_screen2/weights/best.pt --ec2-url http://<EC2-IP>:5000 --conf 0.3
 
 # 動画ファイル（検証用）
-venv\Scripts\python.exe src/pipeline.py --input "D:\ゲーム録画\battle.mp4" --model runs/detect/train4/weights/best.pt --ball-model runs/detect/train7/weights/best.pt --end-model runs/detect/train_end_screen2/weights/best.pt --ec2-url http://<EC2-IP>:5000 --conf 0.3
+venv\Scripts\python.exe src/pipeline.py --input "D:\ゲーム録画\battle.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --ec2-url http://<EC2-IP>:5000 --conf 0.3
 ```
+
+（`--model`＝状態異常YOLO・`--ball-model`＝ボール数YOLOは2026-07-15より未指定がデフォルト。状態異常はテキストOCRで代替済み、ボール数は現在未使用。再度使いたい場合のみ`--model runs/detect/train4/weights/best.pt`等を追加する）
 
 OCRの生データだけを動画から確認したい場合は `scripts/ocr_logger.py`（フィルタなし・全フレームOCR診断ロガー）や `scripts/test_ocr_areas.py`（定義済みROIごとの確認）を使う。どちらも `init_reader`/`run_ocr` をこのファイルから import している。
 
