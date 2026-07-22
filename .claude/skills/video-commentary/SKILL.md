@@ -12,7 +12,9 @@
   ↓ renders/<名前>/ … manifest.jsonl（イベント実況+WAV）・timeline.jsonl（技の瞬間ログ）
                      ・states.jsonl（戦況スナップショット）・render_info.json
 パス1.5 [Windows]  scripts/generate_gap_commentary.py
-        無言区間を埋めるライブ風フィラーを生成（Bedrockテキスト1回 約1円）
+        無言区間を埋めるライブ風フィラーを生成（無言区間ごとに個別にBedrock呼び出し・
+        1試合あたり数円程度。2026-07-22〜: ネタバレ防止のため区間より未来の情報は
+        プロンプトに含めない設計に変更・区間数だけ呼び出し回数が増える）
   ↓ fillers.jsonl ＋ wav/fNNNN_filler.wav
 パス2   [WSL]      scripts/render_commentary_video.py --layout biim
         枠・字幕・戦況パネル・音声を一発合成（課金なし・何度でもやり直し可）
@@ -143,7 +145,7 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 |------|------|-----------|
 | VOICEVOX未起動でパス1/1.5 | 素材0件（Bedrock代だけ消える） | 実行前に必ず起動。パス1はログ末尾のレンダサマリーで検知 |
 | server.py変更後の未デプロイ/未再起動 | `/api/script` 404 | WinSCPで転送→`sudo systemctl restart pokemon-api`（gunicornは自動リロードしない） |
-| Bedrock read_timeout | `/api/script` 504 | vision=5秒/script=60秒に分離済み（`bedrock_script`）。scriptを重くしたら`BEDROCK_SCRIPT_TIMEOUT_SEC`を見直す。gunicorn worker timeout（30秒）も注意 |
+| Bedrock read_timeout | `/api/script` 504 | vision=5秒/script=60秒に分離済み（`bedrock_script`）。scriptを重くしたら`BEDROCK_SCRIPT_TIMEOUT_SEC`を見直す。2026-07-22〜: `/api/script`は無言区間1つ分だけを処理する設計になり1リクエストあたりの生成量が減ったため、gunicorn worker timeout（30秒）に抵触するリスクはむしろ下がった |
 | ffmpeg 4.2（WSL）のamix | `Option 'normalize' not found` | normalize不使用の互換実装済み（1/2スケールをvolume=2補償＋トラック同尺パディング）。**この構造を変えないこと** |
 | ASSの日本語折り返し | 字幕が帯からはみ出す | libassはスペース基準で日本語に効かない→`_wrap_jp`が手動\N挿入（禁則処理付き）。フォントサイズ変更時は`_SUBTITLE_WRAP_CHARS`も連動して変えること |
 | 日本語フォント | 字幕が豆腐/英字 | WSLにフォント不要。`fontsdir=/mnt/c/Windows/Fonts`のmeiryoを参照している |

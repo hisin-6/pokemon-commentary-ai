@@ -122,3 +122,51 @@ class TestClampFillersToGaps:
             [{"time": 100.0, "text": "後"}, {"time": 30.0, "text": "先"}],
             self._gaps)
         assert [f["text"] for f in kept] == ["先", "後"]
+
+
+class TestRequestFillers:
+    """gapごとに1回ずつ /api/script を呼び、結果を集約する（2026-07-22・ネタバレ抑制の根本強化）。"""
+
+    _events = [{"event_time": 63.0, "event_type": "battle_start", "commentary": "開幕だ！"}]
+    _gaps = [{"start": 0.0, "end": 61.0}, {"start": 78.0, "end": 131.0}]
+
+    def test_calls_once_per_gap_with_matching_gap_payload(self, monkeypatch):
+        calls = []
+
+        def fake_post(url, json=None, timeout=None):
+            calls.append(json)
+            gap = json["gap"]
+            resp = MockResponse({
+                "success": True,
+                "fillers": [{"time": gap["start"] + 1, "text": f"filler-{gap['start']}"}],
+                "usage": {},
+            })
+            return resp
+
+        monkeypatch.setattr(ggc.requests, "post", fake_post)
+        fillers = ggc.request_fillers("http://ec2", self._events, self._gaps)
+
+        assert len(calls) == 2
+        assert [c["gap"] for c in calls] == self._gaps
+        assert len(fillers) == 2
+        assert fillers[0]["text"] == "filler-0.0"
+        assert fillers[1]["text"] == "filler-78.0"
+
+    def test_raises_on_api_failure(self, monkeypatch):
+        def fake_post(url, json=None, timeout=None):
+            return MockResponse({"success": False, "error": "bedrock_error", "message": "NG"})
+
+        monkeypatch.setattr(ggc.requests, "post", fake_post)
+        with pytest.raises(RuntimeError):
+            ggc.request_fillers("http://ec2", self._events, self._gaps)
+
+
+class MockResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload

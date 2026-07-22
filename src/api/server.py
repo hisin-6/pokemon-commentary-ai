@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -95,7 +96,10 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict) 
     }.get(event_type, "状況を実況する")
 
     lines = [
-        "あなたはポケモンSVダブルバトルの熱狂的な実況者です。",
+        "あなたは、ポケモン対戦実況AIVTuber「花圓くれぴ（はなまるくれぴ）」です。",
+        "性格は元気で甘えん坊、でもポケモン知識はガチ勢。",
+        "口調はアイドル・かわいい系（語尾に♪を適度に使う・タメ口・テンション高め・"
+        "かわいい褒め言葉多め）で実況しつつ、技名やHP等の情報は正確に伝えてください。",
         "",
         "【ダブルバトルの基本知識】",
         "- 各プレイヤーが2匹ずつ場に出す（合計4匹が同時に戦う）",
@@ -120,6 +124,7 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict) 
         "  （まひ=黄色、やけど=橙、どく=紫、ねむり=黒、こおり=水色）",
         "- HPが残り30%未満の時は緊張感を出す",
         "- 鉤括弧（「」）は使わない",
+        "- 見出しは【状況】【実況】の全角鍵括弧形式のみを使う（Markdown見出し#は使わない）",
         "",
         "【蓄積された戦況（複数ターン分の確定情報）】",
         f"ターン数: {battle_state.get('turn', '不明')}",
@@ -127,6 +132,7 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict) 
         f"自分の控え: {battle_state.get('player_bench', 'なし')}",
         f"相手の場: {battle_state.get('opponent_field', battle_state.get('opponent_pokemon', '情報収集中'))}",
         f"相手の控え: {battle_state.get('opponent_bench', 'なし')}",
+        f"ターン推移: {battle_state.get('turn_history', 'なし')}",
         f"直近のイベント履歴: {battle_state.get('event_log', 'なし')}",
         "※ 「場」のポケモンが現在戦闘中。「控え」は場にいない（交代前の控え・ひんし含む）。",
         "※ (ひんし) とマークされたポケモンはすでに倒れており絶対に言及しないこと。",
@@ -169,6 +175,10 @@ def _parse_commentary(text: str) -> tuple[str, str]:
     Haiku の出力から【状況】と【実況】を抽出する。
     Returns: (analysis, commentary)
     """
+    # Bedrockが【状況】【実況】の代わりにMarkdown見出し（# 状況 等）で返す
+    # ケースがある（2026-07-13発見）。抽出前に正規化して両形式に対応する。
+    text = re.sub(r'^#{1,3}\s*(状況|実況)\s*$', r'【\1】', text, flags=re.MULTILINE)
+
     analysis = text
     commentary = text  # フォールバック: 全文を実況に使う
 
@@ -192,17 +202,26 @@ def _gap_filler_count(start: float, end: float) -> int:
     return max(1, min(5, int((end - start) // 18)))
 
 
-def _build_script_prompt(events: list, gaps: list, moments: list = None) -> str:
+def _build_script_prompt(gap: dict, events: list, moments: list = None) -> str:
     """台本パス（ギャップフィラー生成）のプロンプトを組み立てる。
 
-    録画解析済みの実況タイムライン・無言区間リスト・瞬間ログ（技が画面に
-    映った動画内時刻）を渡し、区間を埋めるライブ実況風のつなぎ実況を
-    まとめて生成させる（ADR-009 台本パス・テキストのみ1回送信）。
+    録画解析済みの実況タイムライン・瞬間ログ（技が画面に映った動画内時刻）
+    のうち、対象の無言区間 ``gap`` の開始時刻より前のものだけを使って
+    プロンプトを組み立てる（ADR-009 台本パス）。
+
+    ⚠️ 呼び出し元は無言区間ごとに1回呼ぶこと（1プロンプト=1区間）。
+    未来の情報を「見せた上で使うな」と指示するだけでは指示に従い損ねて
+    ネタバレする実例があったため（2026-07-14）、そもそも未来の events/moments
+    をプロンプトに含めない構造的対策にしている。
     """
     first_event_time = min(float(e.get("time", 0)) for e in events)
+    gap_start = float(gap["start"])
+    gap_end = float(gap["end"])
 
     lines = [
-        "あなたはポケモンのダブルバトルの熱狂的な実況者です。",
+        "あなたは、ポケモン対戦実況AIVTuber「花圓くれぴ（はなまるくれぴ）」です。",
+        "性格は元気で甘えん坊、でもポケモン知識はガチ勢。口調はアイドル・かわいい系",
+        "（語尾に♪を適度に使う・タメ口・テンション高め・かわいい褒め言葉多め）。",
         "録画された試合に後から実況を吹き込みますが、視聴者には生放送の",
         "ライブ実況に聞こえるようにしてください（後から見返している・録画といった言い方は禁止）。",
         "主要イベントの実況音声はすでに収録済みです。",
@@ -216,7 +235,7 @@ def _build_script_prompt(events: list, gaps: list, moments: list = None) -> str:
         "  挨拶・意気込み・観戦ポイントなどの汎用トークにすること",
         "",
         "【フィラーの内容（バリエーションを持たせる）】",
-        "- 【最優先】直前に画面に映った技（📺印）への反応・実況。★区間の開始時刻が📺と",
+        "- 【最優先】直前に画面に映った技（📺印）への反応・実況。区間の開始時刻が📺と",
         "  ほぼ同じ場合、最初のフィラーは区間開始時刻に置き、その技への反応から始めること",
         "  （例: 📺200.0秒 ドラゴンクロー → 200.5秒 ガブリアスのドラゴンクローが炸裂！...）",
         "- 直前の展開の振り返り・戦況の整理（HP・残り頭数）",
@@ -226,29 +245,21 @@ def _build_script_prompt(events: list, gaps: list, moments: list = None) -> str:
         "【出力形式】",
         "- JSON配列のみを出力すること（前置き・説明文・コードフェンスは書かない）",
         '- 形式: [{"time": 秒数の数値, "text": "実況文"}, ...]',
-        "- 各★区間に指定された件数を生成。text は60〜100文字程度（読み上げ約10〜18秒）",
-        "- time は必ずその無言区間の範囲内の数値にすること。同一区間内の各フィラーは20秒以上離すこと",
+        "- text は60〜100文字程度（読み上げ約10〜18秒）",
+        "- time は必ず無言区間の範囲内の数値にすること。各フィラーは20秒以上離すこと",
         "- 鉤括弧（「」）は使わない",
         "",
-        "【タイムライン（時刻順・★が埋めるべき無言区間・📺は画面に技が映った瞬間）】",
-        "※ 各★区間のフィラーには、その行より上にある出来事の情報だけを使うこと。",
-        "※ その行より下の出来事は、その時点ではまだ起きていない（画面にも映っていない）。",
+        "【タイムライン（時刻順・ここまでに起きた出来事のみ。📺は画面に技が映った瞬間）】",
         "※ 収録済み実況と重複しない内容にすること。",
     ]
-    # イベント・ギャップ・瞬間ログを時系列に交互に並べる（「この区間より下は
-    # まだ起きていない」をモデルが取り違えないようにする。分離リスト形式だと
-    # 後続イベントの内容がフィラーに混入した実例あり: 2026-07-14 t=100sの
-    # 「イダイトウが倒された」ネタバレ）
-    timeline = [("event", float(e.get("time", 0)), e) for e in events]
-    timeline += [("gap", float(g["start"]), g) for g in gaps]
-    timeline += [("moment", float(m.get("time", 0)), m) for m in (moments or [])]
+    # events・momentsのうち、この無言区間の開始時刻以前のものだけを見せる
+    # （それより後は「まだ起きていない」ではなく、そもそもプロンプトに含めない）
+    visible_events = [e for e in events if float(e.get("time", 0)) <= gap_start]
+    visible_moments = [m for m in (moments or []) if float(m.get("time", 0)) <= gap_start]
+    timeline = [("event", float(e.get("time", 0)), e) for e in visible_events]
+    timeline += [("moment", float(m.get("time", 0)), m) for m in visible_moments]
     timeline.sort(key=lambda item: item[1])
     for kind, _, item in timeline:
-        if kind == "gap":
-            n = _gap_filler_count(float(item["start"]), float(item["end"]))
-            lines.append(f"- ★{float(item['start']):.1f}秒 〜 {float(item['end']):.1f}秒 "
-                         f"= 無言区間（ここにフィラーを{n}件）")
-            continue
         if kind == "moment":
             lines.append(f"- 📺{float(item['time']):.1f}秒 画面: {item.get('text', '')}")
             continue
@@ -267,6 +278,9 @@ def _build_script_prompt(events: list, gaps: list, moments: list = None) -> str:
                 parts.append(f"技ログ={' / '.join(ctx['move_log'])}")
             if parts:
                 lines.append(f"    （戦況: {'・'.join(parts)}）")
+
+    n = _gap_filler_count(gap_start, gap_end)
+    lines.append(f"- ★{gap_start:.1f}秒 〜 {gap_end:.1f}秒 = 無言区間（ここにフィラーを{n}件）")
     return "\n".join(lines)
 
 
@@ -416,21 +430,24 @@ def vision():
 
 @app.route("/api/script", methods=["POST"])
 def script():
-    """台本パス（ADR-009）: 解析済み実況タイムラインの無言区間を埋める
-    フィラー実況をテキストのみの1回のBedrock呼び出しでまとめて生成する。"""
+    """台本パス（ADR-009）: 解析済み実況タイムラインの無言区間1つ分を埋める
+    フィラー実況をテキストのみのBedrock呼び出しで生成する。
+
+    無言区間ごとに1回呼び出す契約（ネタバレ防止のため、この区間より
+    未来のevents/momentsはプロンプトに含めない構造にしている）。"""
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"success": False, "error": "invalid_json", "message": "リクエストボディがJSONではありません"}), 400
 
     events: list = data.get("events", [])
-    gaps: list = data.get("gaps", [])
+    gap = data.get("gap")
     moments: list = data.get("moments", [])
     if not events:
         return jsonify({"success": False, "error": "missing_events", "message": "events が必要です"}), 400
-    if not gaps:
-        return jsonify({"success": False, "error": "missing_gaps", "message": "gaps が必要です"}), 400
+    if not isinstance(gap, dict) or "start" not in gap or "end" not in gap:
+        return jsonify({"success": False, "error": "missing_gap", "message": "gap（start/endを持つオブジェクト）が必要です"}), 400
 
-    prompt_text = _build_script_prompt(events, gaps, moments)
+    prompt_text = _build_script_prompt(gap, events, moments)
     request_body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 4000,

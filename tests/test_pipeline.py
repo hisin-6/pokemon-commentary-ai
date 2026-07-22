@@ -689,6 +689,27 @@ class TestBattleStateTracker:
         ctx = self.tracker.to_context()
         assert "T1:move_used" in ctx["event_log"]
 
+    def test_to_context_turn_history_default_nashi(self):
+        ctx = self.tracker.to_context()
+        assert ctx["turn_history"] == "なし"
+
+    def test_record_turn_snapshot_appends_field_state(self):
+        gs = _make_game_state(player_names=["ピカチュウ"], hp_player=["80/100"])
+        _register(self.tracker, gs)
+        self.tracker.game_turn = 2
+        self.tracker.record_turn_snapshot()
+        ctx = self.tracker.to_context()
+        assert "T2" in ctx["turn_history"]
+        assert "ピカチュウ" in ctx["turn_history"]
+
+    def test_record_turn_snapshot_trims_to_max_history(self):
+        for i in range(BattleStateTracker.MAX_TURN_HISTORY + 3):
+            self.tracker.game_turn = i
+            self.tracker.record_turn_snapshot()
+        assert len(self.tracker._turn_history) == BattleStateTracker.MAX_TURN_HISTORY
+        # 古い方から捨てられ、最新のターンが残っている
+        assert f"T{BattleStateTracker.MAX_TURN_HISTORY + 2}" in self.tracker._turn_history[-1]
+
     def test_to_context_hp_pinch_marker(self):
         """HP が 25% 以下のポケモンに★ピンチが付く。"""
         gs1 = _make_game_state(player_names=["ピカチュウ"])

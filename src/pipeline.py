@@ -1108,6 +1108,7 @@ class BattleStateTracker:
     MAX_SLOTS       = 4    # 試合全体での最大登録数（4匹パーティ）
     MAX_ON_FIELD    = 2    # ダブルバトル: 同時に場に出せる最大数
     MAX_EVENTS      = 8
+    MAX_TURN_HISTORY = 8   # ターン毎スナップショットの保持数（turn_history送信用）
     # on_field=True でこの「ゲームターン数」以上不検出なら場にいないと判断。
     # ⚠️ last_seen_turn は self.game_turn（実ターン数）で管理すること。
     # 内部イベントカウンター self.turn を使うと、メガシンカ・道具発動・毒ダメージ等
@@ -1142,6 +1143,7 @@ class BattleStateTracker:
         self._player:   list[FieldPokemon] = []  # 自分の最大4匹
         self._opponent: list[FieldPokemon] = []  # 相手の最大4匹
         self._event_log: list[str] = []
+        self._turn_history: list[str] = []  # ターン毎の場の状態スナップショット（turn_history送信用）
         # 低信頼経路（定期OCR）の新規登録ヒステリシス: (側, 名前) → (目撃数, 最終目撃turn)
         self._pending_new: dict[tuple[str, str], tuple[int, int]] = {}
         # スロット占有者の追跡（key例: "player_0"）と交代時コールバック
@@ -2110,6 +2112,23 @@ class BattleStateTracker:
                     pass
         return None, None
 
+    def record_turn_snapshot(self) -> None:
+        """ターン開始時点の場の状態を turn_history に記録する（Bedrockへの
+        turn_history送信用）。MAX_TURN_HISTORY 件を超えたら古い方から捨てる。
+        """
+        def side(slots: list[FieldPokemon]) -> str:
+            on_field = [q for q in slots if q.on_field and not q.fainted]
+            parts = []
+            for p in on_field:
+                pct, _ = self._display_hp_pct(p)
+                parts.append(f"{p.name}{pct}%" if pct is not None else p.name)
+            return "/".join(parts) if parts else "不明"
+
+        snapshot = f"T{self.game_turn}: 自分={side(self._player)} / 相手={side(self._opponent)}"
+        self._turn_history.append(snapshot)
+        if len(self._turn_history) > self.MAX_TURN_HISTORY:
+            self._turn_history.pop(0)
+
     def to_panel_state(self) -> dict:
         """実況動画の戦況パネル（v2b）用スナップショットを返す。
 
@@ -2173,6 +2192,7 @@ class BattleStateTracker:
             "opponent_field":   opponent_field_str,
             "opponent_bench":   opponent_bench_str,
             "event_log":        " | ".join(self._event_log[-5:]),
+            "turn_history":     " | ".join(self._turn_history) or "なし",
             # server.py 互換フィールド（player_pokemon / opponent_pokemon）
             "player_pokemon":   f"場: {player_field_str} / 控え: {player_bench_str}",
             "opponent_pokemon": f"場: {opponent_field_str} / 控え: {opponent_bench_str}",
@@ -2963,6 +2983,7 @@ class Pipeline:
                 self._skip_next_turn_start = False
             else:
                 self._battle_tracker.game_turn += 1
+                self._battle_tracker.record_turn_snapshot()
                 log.info(f"[ターン] T{self._battle_tracker.game_turn} 開始")
             # 保留中のfaintがタイムアウトしていれば単独Bedrock送信でフラッシュ
             if (self._pending_faint_state is not None

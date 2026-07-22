@@ -396,7 +396,7 @@ class TestAvatarCommand:
         idx = cmd.index("avatar.mp4")
         assert cmd[idx - 3:idx] == ["-ss", "1.5", "-i"]
         fc = cmd[cmd.index("-filter_complex") + 1]
-        assert "chromakey=0x00FF00:0.15" in fc
+        assert "chromakey=0x00FF00:0.25" in fc
         assert "scale=344:-2" in fc
         assert "eof_action=repeat" in fc
         # 字幕の上にアバターが乗る（subtitles → overlay の順）

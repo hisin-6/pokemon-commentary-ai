@@ -79,6 +79,19 @@ class TestParseCommentary:
         assert analysis == ""
         assert commentary == ""
 
+    def test_markdown_heading_normalized_to_brackets(self):
+        """Bedrockが【】の代わりに# 見出しで返すケース（2026-07-13発見バグ）。"""
+        text = "# 状況\n両者HPが減っている\n# 実況\nピカチュウが技を放った！"
+        analysis, commentary = _parse_commentary(text)
+        assert "ピカチュウが技を放った" in commentary
+        assert "#" not in commentary
+        assert "状況" not in commentary
+
+    def test_markdown_heading_with_hash_levels(self):
+        text = "## 状況\n説明\n### 実況\n実況テキスト"
+        _, commentary = _parse_commentary(text)
+        assert commentary == "実況テキスト"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # _build_vision_prompt
@@ -164,6 +177,21 @@ class TestBuildVisionPrompt:
         )
         assert "ピカチュウ" in prompt
         assert "エースバーン" in prompt
+
+    def test_prompt_contains_kurepi_persona(self):
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "くれぴ" in prompt
+
+    def test_prompt_contains_turn_history_when_present(self):
+        prompt = _build_vision_prompt(
+            self._context(), [],
+            self._battle_state(turn_history="T1: 自分=ピカチュウ80% / 相手=リザードン65%"),
+        )
+        assert "ピカチュウ80%" in prompt
+
+    def test_prompt_turn_history_defaults_to_nashi(self):
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "ターン推移: なし" in prompt
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -401,7 +429,7 @@ def _valid_script_payload(**overrides):
                          "move_log": ["T1:イダイトウのだくりゅう"]}},
             {"time": 133.2, "event_type": "faint", "commentary": "イダイトウが倒れた！"},
         ],
-        "gaps": [{"start": 0.0, "end": 61.0}, {"start": 78.0, "end": 131.0}],
+        "gap": {"start": 78.0, "end": 131.0},
     }
     payload.update(overrides)
     return payload
@@ -409,51 +437,82 @@ def _valid_script_payload(**overrides):
 
 class TestBuildScriptPrompt:
 
-    def test_contains_timeline_and_gaps(self):
+    def test_contains_visible_timeline_and_gap(self):
         payload = _valid_script_payload()
-        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
         assert "63.0秒" in prompt
         assert "開幕だ！" in prompt
-        assert "78.0秒 〜 131.0秒" in prompt
+        assert "★78.0秒 〜 131.0秒" in prompt
 
     def test_contains_no_spoiler_rule(self):
         payload = _valid_script_payload()
-        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
         assert "ネタバレ禁止" in prompt
         assert "先取り" in prompt
 
     def test_context_rendered_when_present(self):
         payload = _valid_script_payload()
-        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
         assert "イダイトウのだくりゅう" in prompt
         assert "T0" in prompt
 
     def test_pre_battle_generic_talk_rule_uses_first_event_time(self):
         """最初のイベント時刻より前は汎用トークにする指示が入る。"""
         payload = _valid_script_payload()
-        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
         assert "63秒より前" in prompt
 
     def test_moments_interleaved_in_timeline(self):
-        """瞬間ログが📺付きで時系列に混ぜ込まれる（ライブ実況アンカー）。"""
+        """区間開始以前の瞬間ログが📺付きで時系列に混ぜ込まれる（ライブ実況アンカー）。"""
         payload = _valid_script_payload()
-        moments = [{"time": 90.0, "kind": "move", "text": "T1:イダイトウのだくりゅう"}]
-        prompt = _build_script_prompt(payload["events"], payload["gaps"], moments)
-        assert "📺90.0秒 画面: T1:イダイトウのだくりゅう" in prompt
-        # 63.0秒のイベントより後・133.2秒のイベントより前に並ぶ
-        assert prompt.index("63.0秒") < prompt.index("📺90.0秒") < prompt.index("133.2秒")
+        moments = [{"time": 70.0, "kind": "move", "text": "T1:イダイトウのだくりゅう"}]
+        prompt = _build_script_prompt(payload["gap"], payload["events"], moments)
+        assert "📺70.0秒 画面: T1:イダイトウのだくりゅう" in prompt
+        assert prompt.index("63.0秒") < prompt.index("📺70.0秒")
 
     def test_gap_line_contains_filler_count(self):
         """★区間の行に区間長に応じた件数指定が入る（53秒区間→2件）。"""
         payload = _valid_script_payload()
-        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
         assert "★78.0秒 〜 131.0秒 = 無言区間（ここにフィラーを2件）" in prompt
 
     def test_live_commentary_persona(self):
         """録画感を出さないライブ実況指示が入る。"""
         payload = _valid_script_payload()
-        prompt = _build_script_prompt(payload["events"], payload["gaps"])
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
         assert "ライブ実況" in prompt
+
+    def test_contains_kurepi_persona(self):
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "くれぴ" in prompt
+
+    def test_future_events_excluded_from_prompt(self):
+        """区間より未来のeventsはプロンプトに一切含まれない（ネタバレ構造対策・最重要）。"""
+        payload = _valid_script_payload()  # gap=78〜131 / battle_start@63(過去) / faint@133.2(未来)
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "開幕だ" in prompt
+        assert "倒れた" not in prompt
+        assert "133.2" not in prompt
+
+    def test_future_moments_excluded_from_prompt(self):
+        """区間より未来の瞬間ログ（📺）もプロンプトに一切含まれない。"""
+        payload = _valid_script_payload()
+        moments = [
+            {"time": 70.0, "kind": "move", "text": "T1:過去の技"},
+            {"time": 90.0, "kind": "move", "text": "T2:未来の技"},
+        ]
+        prompt = _build_script_prompt(payload["gap"], payload["events"], moments)
+        assert "過去の技" in prompt
+        assert "未来の技" not in prompt
+
+    def test_first_gap_has_no_visible_events(self):
+        """試合開始前の区間はvisible eventsが空でも壊れない。"""
+        payload = _valid_script_payload(gap={"start": 0.0, "end": 61.0})
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "開幕だ" not in prompt
+        assert "倒れた" not in prompt
+        assert "★0.0秒 〜 61.0秒" in prompt
 
 
 class TestGapFillerCount:
@@ -501,10 +560,15 @@ class TestScriptEndpoint:
         assert resp.status_code == 400
         assert resp.get_json()["error"] == "missing_events"
 
-    def test_missing_gaps_returns_400(self, client):
-        resp = client.post("/api/script", json=_valid_script_payload(gaps=[]))
+    def test_missing_gap_returns_400(self, client):
+        resp = client.post("/api/script", json=_valid_script_payload(gap=None))
         assert resp.status_code == 400
-        assert resp.get_json()["error"] == "missing_gaps"
+        assert resp.get_json()["error"] == "missing_gap"
+
+    def test_malformed_gap_returns_400(self, client):
+        resp = client.post("/api/script", json=_valid_script_payload(gap={"start": 0.0}))
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == "missing_gap"
 
     def test_successful_script_call(self, client):
         mock_response_body = {

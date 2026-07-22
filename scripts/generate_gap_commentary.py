@@ -134,31 +134,43 @@ def load_timeline(render_dir: Path) -> list:
 
 def request_fillers(ec2_url: str, events: list, gaps: list,
                     moments: list = None, timeout: float = 120.0) -> list:
-    """EC2 /api/script にタイムライン・瞬間ログ・ギャップを送りフィラー案を受け取る。"""
-    payload = {
-        "events": [
-            {
-                "time": e["event_time"],
-                "event_type": e["event_type"],
-                "commentary": e["commentary"],
-                "context": e.get("context"),
-            }
-            for e in events
-        ],
-        "gaps": gaps,
-        "moments": moments or [],
-    }
-    resp = requests.post(f"{ec2_url.rstrip('/')}/api/script", json=payload,
-                         timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"/api/script 失敗: {data.get('error')} {data.get('message')}")
-    usage = data.get("usage", {})
-    logger.info("フィラー生成: %d件 (tokens_in=%s tokens_out=%s latency=%sms)",
-                len(data["fillers"]), usage.get("input_tokens"),
-                usage.get("output_tokens"), data.get("latency_ms"))
-    return data["fillers"]
+    """EC2 /api/script に無言区間ごとに1回ずつ送りフィラー案を集約して受け取る。
+
+    ネタバレ防止のため、gapごとに個別のBedrock呼び出しにして、その区間より
+    未来のevents/momentsを一切見せない設計にしている（2026-07-22・従来の
+    「全区間一括送信＋指示でネタバレ抑制」は指示に従い損ねる実例があった）。
+    """
+    events_payload = [
+        {
+            "time": e["event_time"],
+            "event_type": e["event_type"],
+            "commentary": e["commentary"],
+            "context": e.get("context"),
+        }
+        for e in events
+    ]
+    moments_payload = moments or []
+
+    fillers: list = []
+    for gap in gaps:
+        payload = {
+            "events": events_payload,
+            "gap": gap,
+            "moments": moments_payload,
+        }
+        resp = requests.post(f"{ec2_url.rstrip('/')}/api/script", json=payload,
+                             timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success"):
+            raise RuntimeError(f"/api/script 失敗: {data.get('error')} {data.get('message')}")
+        usage = data.get("usage", {})
+        logger.info("フィラー生成 %.0f〜%.0fs: %d件 (tokens_in=%s tokens_out=%s latency=%sms)",
+                    gap["start"], gap["end"], len(data["fillers"]),
+                    usage.get("input_tokens"), usage.get("output_tokens"),
+                    data.get("latency_ms"))
+        fillers.extend(data["fillers"])
+    return fillers
 
 
 def synthesize_fillers(render_dir: Path, fillers: list, voicevox_url: str,
