@@ -12,7 +12,7 @@ import requests
 
 
 VOICEVOX_URL = "http://localhost:50021"
-DEFAULT_SPEAKER = 1  # ずんだもん（ノーマル）
+DEFAULT_SPEAKER = 2  # 四国めたん（ノーマル）
 # 話者一覧は GET /speakers で確認できる
 
 

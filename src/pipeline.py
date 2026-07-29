@@ -2316,6 +2316,80 @@ def _clean_commentary(text: str) -> str:
 
 # ─── Bedrock Vision 呼び出し（EC2 API 経由・オプション） ─────────────────────
 
+def _build_bedrock_context(
+    game_state: dict,
+    event_type: str,
+    battle_context: dict | None,
+    classifier,
+    move_log: list[str] | None,
+) -> dict:
+    """Bedrock に送る context 辞書を組み立てる（画像に依存しない部分）。
+
+    ``_call_bedrock_vision``（ライブ・画像あり）と ``_call_bedrock_text``
+    （動画モードの後付け生成・画像なし）で共通利用する。
+    """
+    # server.py の /api/vision は context.event_type でバリデーションする
+    status_parts = (game_state.get("status", "") or "").split(" / 相手: ")
+    status_player   = status_parts[0] if status_parts[0] != "なし" else "なし"
+    status_opponent = status_parts[1] if len(status_parts) > 1 else "なし"
+
+    balls = game_state.get("balls_remaining", [])
+    hp_values = game_state.get("hp_values", [])
+    names_player   = game_state.get("name_candidates_player", [])
+    names_opponent = game_state.get("name_candidates_opponent", [])
+
+    # RAG: 蓄積済みポケモン名（battle_context）を優先、なければ現フレームの候補を使用
+    # battle_context には複数ターン分の蓄積があり現フレームより信頼度が高い
+    rag_names: list[str] = []
+    if battle_context:
+        rag_names += battle_context.get("player_names", [])
+        rag_names += battle_context.get("opponent_names", [])
+    if not rag_names:
+        rag_names = names_player + names_opponent  # フォールバック
+
+    rag_info: list[str] = []
+    if classifier:
+        seen: set[str] = set()
+        for name in rag_names:
+            if name in seen:
+                continue
+            seen.add(name)
+            info = classifier.get_pokemon_info(name)
+            if info:
+                abilities_str = " / ".join(info["abilities"]) if info["abilities"] else "不明"
+                # 代表技は渡さない（Bedrockが「使った技」として創作するのを防ぐため）
+                rag_info.append(
+                    f"{info['name_ja']}: タイプ={info['type']} / 特性={abilities_str}"
+                )
+
+    return {
+        "status_player":            status_player,
+        "status_opponent":          status_opponent,
+        "balls_remaining_player":   balls[0] if len(balls) > 0 else "?",
+        "balls_remaining_opponent": balls[1] if len(balls) > 1 else "?",
+        "event_type":               event_type,
+        "ocr_text":                 game_state.get("ocr_text", ""),
+        "hp_values":                " / ".join(hp_values) if hp_values else "不明",
+        "name_candidates_player":   " / ".join(names_player)   if names_player   else "不明",
+        "name_candidates_opponent": " / ".join(names_opponent) if names_opponent else "不明",
+        "rag_pokemon_info":         rag_info,
+        "detected_moves":           " / ".join(move_log) if move_log else "なし",
+        "faint_context":            game_state.get("faint_context", ""),  # 直前のfaint情報（統合時のみ）
+    }
+
+
+def _log_bedrock_send(context: dict, battle_state: dict) -> None:
+    log.info(
+        "[Bedrock送信] event=%s | 自分=%s | 相手=%s | HP=%s | 技ログ=%s | RAG=%s",
+        context["event_type"],
+        battle_state.get("player_pokemon", "不明"),
+        battle_state.get("opponent_pokemon", "不明"),
+        context["hp_values"],
+        context["detected_moves"],
+        " / ".join(context["rag_pokemon_info"]) if context["rag_pokemon_info"] else "なし",
+    )
+
+
 def _call_bedrock_vision(
     ec2_url: str,
     frame: np.ndarray,
@@ -2327,7 +2401,7 @@ def _call_bedrock_vision(
     move_log: list[str] | None = None,
 ) -> str | None:
     """
-    EC2 API に画像と状況を送り、Bedrock Vision 分析結果を受け取る。
+    EC2 API に画像と状況を送り、Bedrock Vision 分析結果を受け取る（ライブ経路）。
     失敗してもパイプラインを止めない（None を返す）。
     """
     try:
@@ -2340,70 +2414,14 @@ def _call_bedrock_vision(
         _, buf = cv2.imencode(".png", small)
         image_b64 = base64.b64encode(buf.tobytes()).decode()
 
-        # server.py の /api/vision は context.event_type でバリデーションする
-        status_parts = (game_state.get("status", "") or "").split(" / 相手: ")
-        status_player   = status_parts[0] if status_parts[0] != "なし" else "なし"
-        status_opponent = status_parts[1] if len(status_parts) > 1 else "なし"
-
-        balls = game_state.get("balls_remaining", [])
-        hp_values = game_state.get("hp_values", [])
-        names_player   = game_state.get("name_candidates_player", [])
-        names_opponent = game_state.get("name_candidates_opponent", [])
-
-        # RAG: 蓄積済みポケモン名（battle_context）を優先、なければ現フレームの候補を使用
-        # battle_context には複数ターン分の蓄積があり現フレームより信頼度が高い
-        rag_names: list[str] = []
-        if battle_context:
-            rag_names += battle_context.get("player_names", [])
-            rag_names += battle_context.get("opponent_names", [])
-        if not rag_names:
-            rag_names = names_player + names_opponent  # フォールバック
-
-        rag_info: list[str] = []
-        if classifier:
-            seen: set[str] = set()
-            for name in rag_names:
-                if name in seen:
-                    continue
-                seen.add(name)
-                info = classifier.get_pokemon_info(name)
-                if info:
-                    abilities_str = " / ".join(info["abilities"]) if info["abilities"] else "不明"
-                    # 代表技は渡さない（Bedrockが「使った技」として創作するのを防ぐため）
-                    rag_info.append(
-                        f"{info['name_ja']}: タイプ={info['type']} / 特性={abilities_str}"
-                    )
-
+        context = _build_bedrock_context(game_state, event_type, battle_context, classifier, move_log)
         payload = {
             "image_base64": image_b64,
-            "context": {
-                "status_player":            status_player,
-                "status_opponent":          status_opponent,
-                "balls_remaining_player":   balls[0] if len(balls) > 0 else "?",
-                "balls_remaining_opponent": balls[1] if len(balls) > 1 else "?",
-                "event_type":               event_type,
-                "ocr_text":                 game_state.get("ocr_text", ""),
-                "hp_values":                " / ".join(hp_values) if hp_values else "不明",
-                "name_candidates_player":   " / ".join(names_player)   if names_player   else "不明",
-                "name_candidates_opponent": " / ".join(names_opponent) if names_opponent else "不明",
-                "rag_pokemon_info":         rag_info,
-                "detected_moves":           " / ".join(move_log) if move_log else "なし",
-                "faint_context":            game_state.get("faint_context", ""),  # 直前のfaint情報（統合時のみ）
-            },
+            "context": context,
             "history": commentary_history[-3:],
             "battle_state": battle_context or {},
         }
-        ctx = payload["context"]
-        bs  = payload.get("battle_state", {})
-        log.info(
-            "[Bedrock送信] event=%s | 自分=%s | 相手=%s | HP=%s | 技ログ=%s | RAG=%s",
-            ctx["event_type"],
-            bs.get("player_pokemon", "不明"),
-            bs.get("opponent_pokemon", "不明"),
-            ctx["hp_values"],
-            ctx["detected_moves"],
-            " / ".join(ctx["rag_pokemon_info"]) if ctx["rag_pokemon_info"] else "なし",
-        )
+        _log_bedrock_send(context, payload["battle_state"])
         resp = requests.post(f"{ec2_url}/api/vision", json=payload, timeout=15)
         resp.raise_for_status()
         data = resp.json()
@@ -2413,6 +2431,40 @@ def _call_bedrock_vision(
         return data.get("commentary"), data.get("analysis")
     except Exception as e:
         log.warning(f"Bedrock Vision 呼び出しスキップ: {e}")
+        return None, None
+
+
+def _call_bedrock_text(
+    ec2_url: str,
+    game_state: dict,
+    event_type: str,
+    commentary_history: list[str],
+    battle_context: dict | None = None,
+    classifier=None,
+    move_log: list[str] | None = None,
+) -> str | None:
+    """
+    EC2 API に画像なし・構造化データのみを送り、Bedrockの実況文を受け取る
+    （動画モードの後付け生成専用・ADR-009追記）。
+    蓄積済みの戦況追跡（OCR・HPバー解析）を正確な事実として扱わせるため、
+    単フレーム画像からの再判定はさせない。失敗してもパイプラインを止めない（None を返す）。
+    """
+    try:
+        context = _build_bedrock_context(game_state, event_type, battle_context, classifier, move_log)
+        payload = {
+            "context": context,
+            "history": commentary_history[-3:],
+            "battle_state": battle_context or {},
+        }
+        _log_bedrock_send(context, payload["battle_state"])
+        resp = requests.post(f"{ec2_url}/api/vision", json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("success"):
+            log.debug(f"Bedrock tokens: in={data.get('usage',{}).get('input_tokens')} out={data.get('usage',{}).get('output_tokens')} latency={data.get('latency_ms')}ms")
+        return data.get("commentary"), data.get("analysis")
+    except Exception as e:
+        log.warning(f"Bedrock Text 呼び出しスキップ: {e}")
         return None, None
 
 
@@ -2511,6 +2563,10 @@ class Pipeline:
             })
             log.info("[レンダ] 素材出力モード: %s（実況音声は再生せず保存）",
                      self._render_sink.out_dir)
+        # 動画モード＋素材出力時のみ: 実況生成をスキャン完了後に後付けで行う（ADR-009追記）。
+        # ライブモードは即時Bedrock Vision経路を維持するため対象外。
+        self._posthoc_mode: bool = self._render_sink is not None and video_path is not None
+        self._pending_render_events: list[dict] = []
         # faint保留送信: faintイベントのBedrockを即送信せず次のmove_usedで統合する
         self._pending_faint_state: dict | None = None
         self._pending_faint_battle_context: dict | None = None
@@ -2932,6 +2988,10 @@ class Pipeline:
             log.info(f"終了します（総ターン数: {turn}）")
         finally:
             cap.release()
+            # 動画モードの後付け実況生成（ADR-009追記）: スキャン完了後にまとめて
+            # 実況文を生成する。画像は使わず、スキャン中に蓄積した構造化データのみを根拠にする。
+            if self._posthoc_mode and self._pending_render_events:
+                self._generate_posthoc_commentary()
             # レンダリング素材出力のサマリー（音声合成スレッドの完了を待ってから集計）
             if self._render_sink is not None:
                 if self._speech_thread is not None:
@@ -3086,9 +3146,8 @@ class Pipeline:
 
         # ── Bedrock Vision（バトル中のみ・対象イベントのみ・EC2 URL が設定されている場合）──
         # _battle_active = False の間（選出画面等）は Bedrock を呼ばない
-        bedrock_commentary: str | None = None
-        bedrock_analysis: str | None = None
-        if self._ec2_url and event_type in BEDROCK_EVENTS and self._battle_active:
+        attempt_bedrock = bool(self._ec2_url and event_type in BEDROCK_EVENTS and self._battle_active)
+        if attempt_bedrock:
             # ── faint保留: 即送信せず次のmove_usedと統合するため保留する ──
             if event_type == "faint":
                 log.info("[faint保留] Bedrock送信を保留（次のmove_usedで統合予定）")
@@ -3132,19 +3191,67 @@ class Pipeline:
                 self._pending_faint_battle_context = None
                 self._pending_faint_frame = None
 
+        # ── 実況文の生成・再生（ライブ）／後付け生成用バッファへの追加（動画モード）──
+        # event_time はこのハンドラが処理中のフレームの動画内時刻（同期実行なので
+        # _now() はイベント検知時点と同値）
+        self._dispatch_commentary(event_type, frame, game_state, battle_context,
+                                   self._move_log_display(5), attempt_bedrock)
+
+        # バトル終了後にアクティブフラグをリセット（Bedrock呼び出し後）
+        if event_type == "battle_end":
+            self._battle_active = False
+            self._last_battle_end_time = self._now()
+            self._pre_battle_opponent.clear()
+            self._pre_battle_player.clear()
+            self._recent_sendouts.clear()  # 前試合の繰り出しを次試合に引き継がない
+            log.info("[戦況] バトル終了 → トラッカー非アクティブ化")
+
+        # デバッグ用スクリーンショット保存
+        debug_dir = Path("debug")
+        debug_dir.mkdir(exist_ok=True)
+        cv2.imwrite(str(debug_dir / f"pipeline_turn_{turn:03d}.png"), frame)
+
+    def _dispatch_commentary(
+        self,
+        event_type: str,
+        frame: "np.ndarray | None",
+        game_state: dict,
+        battle_context: dict | None,
+        move_log: list[str],
+        attempt_bedrock: bool,
+        event_time: float | None = None,
+    ) -> None:
+        """実況文を決定して再生する（ライブ）か、後付け生成用にバッファする（動画モード）。
+
+        動画モード＋素材出力時（``self._posthoc_mode``）は、Bedrock/Phi-3の呼び出しを
+        一切ここでは行わず、``run()``完了後にまとめて生成する（ADR-009追記）。
+        ライブモードでは従来どおりこの場でBedrock Visionを呼び、即座に再生する。
+        """
+        if self._posthoc_mode:
+            self._pending_render_events.append({
+                "event_time": event_time if event_time is not None else self._now(),
+                "event_type": event_type,
+                "game_state": game_state,
+                "battle_context": battle_context,
+                "move_log": move_log,
+                "render_context": self._render_context(battle_context),
+            })
+            return
+
+        bedrock_commentary: str | None = None
+        bedrock_analysis: str | None = None
+        if attempt_bedrock:
             log.debug("Bedrock Vision 呼び出し中...")
             if self._move_log:
                 log.debug(f"[技ログ] {' / '.join(self._move_log[-5:])}")
             t0 = time.perf_counter()
             bedrock_commentary, bedrock_analysis = _call_bedrock_vision(
                 self._ec2_url, frame, game_state, event_type,
-                self._commentary_history, battle_context, self._classifier,
-                self._move_log_display(5),
+                self._commentary_history, battle_context, self._classifier, move_log,
             )
             if bedrock_commentary:
                 log.info(f"Bedrock 完了 ({time.perf_counter()-t0:.2f}s): 「{bedrock_commentary}」")
 
-        # ── 実況文の決定 ──────────────────────────────────────────────────────
         # Bedrock が実況文を返してくれた場合はそれを優先（Phi-3 スキップ）
         if bedrock_commentary:
             commentary = _clean_commentary(bedrock_commentary)
@@ -3173,25 +3280,8 @@ class Pipeline:
         if len(self._commentary_history) > 5:
             self._commentary_history.pop(0)
 
-        # ── VOICEVOX 音声合成 + 再生（非同期）──────────────────────────────────
-        # event_time はこのハンドラが処理中のフレームの動画内時刻（同期実行なので
-        # _now() はイベント検知時点と同値）
-        self._speak_async(commentary, event_type=event_type,
+        self._speak_async(commentary, event_type=event_type, event_time=event_time,
                           context=self._render_context(battle_context))
-
-        # バトル終了後にアクティブフラグをリセット（Bedrock呼び出し後）
-        if event_type == "battle_end":
-            self._battle_active = False
-            self._last_battle_end_time = self._now()
-            self._pre_battle_opponent.clear()
-            self._pre_battle_player.clear()
-            self._recent_sendouts.clear()  # 前試合の繰り出しを次試合に引き継がない
-            log.info("[戦況] バトル終了 → トラッカー非アクティブ化")
-
-        # デバッグ用スクリーンショット保存
-        debug_dir = Path("debug")
-        debug_dir.mkdir(exist_ok=True)
-        cv2.imwrite(str(debug_dir / f"pipeline_turn_{turn:03d}.png"), frame)
 
     def _flush_pending_faint(self) -> None:
         """タイムアウトした保留faintを単独でBedrock送信して実況する。"""
@@ -3200,6 +3290,7 @@ class Pipeline:
         game_state      = self._pending_faint_state
         battle_context  = self._pending_faint_battle_context
         frame           = self._pending_faint_frame
+        pending_time    = self._pending_faint_time
         self._pending_faint_state          = None
         self._pending_faint_battle_context = None
         self._pending_faint_frame          = None
@@ -3207,24 +3298,60 @@ class Pipeline:
         if not (self._ec2_url and self._battle_active):
             return
 
-        t0 = time.perf_counter()
-        bedrock_commentary, _ = _call_bedrock_vision(
-            self._ec2_url, frame, game_state, "faint",
-            self._commentary_history, battle_context, self._classifier,
-            self._move_log_display(5),
+        # event_time は faint 検知時点の動画内時刻（保留中に動画が進んでいるため
+        # 現在時刻ではなく保留開始時刻を使う）
+        self._dispatch_commentary(
+            "faint", frame, game_state, battle_context,
+            self._move_log_display(5), attempt_bedrock=True,
+            event_time=pending_time,
         )
-        if bedrock_commentary:
-            commentary = _clean_commentary(bedrock_commentary)
-            log.info("[faintフラッシュ] Bedrock完了 (%.2fs): 「%s」",
-                     time.perf_counter() - t0, commentary)
-            self._commentary_history.append(commentary)
-            if len(self._commentary_history) > 5:
-                self._commentary_history.pop(0)
-            # event_time は faint 検知時点の動画内時刻（保留中に動画が進んでいるため
-            # 現在時刻ではなく保留開始時刻を使う）
-            self._speak_async(commentary, event_type="faint",
-                              event_time=self._pending_faint_time,
-                              context=self._render_context(battle_context))
+
+    def _generate_posthoc_commentary(self) -> None:
+        """動画モードの後付け実況生成（ADR-009追記）。
+
+        `run()` の動画スキャンが完了した後に呼ばれる。バッファ済みの各イベントに
+        ついて、画像なし・構造化データのみで Bedrock（失敗時は Phi-3）に実況文を
+        生成させ、VOICEVOXで音声合成して `render_sink` に追記する。
+
+        イベントは検知順（＝動画内時刻順）にバッファされているため、順番に処理
+        することで `history`（直前の実況の繰り返し防止）がライブ経路と同じように
+        機能する。各イベントのcontext/battle_stateはスキャン中に捕捉した時点の
+        値のままなので、未来の情報が混ざることはない（スポイラー安全性の担保）。
+        """
+        history: list[str] = []
+        for ev in self._pending_render_events:
+            bedrock_commentary, bedrock_analysis = _call_bedrock_text(
+                self._ec2_url, ev["game_state"], ev["event_type"], history,
+                ev["battle_context"], self._classifier, ev["move_log"],
+            )
+            if bedrock_commentary:
+                commentary = _clean_commentary(bedrock_commentary)
+            else:
+                phi3_context = bedrock_analysis or ev["game_state"]["ocr_text"]
+                try:
+                    commentary = _clean_commentary(
+                        self._phi3.generate_commentary(ev["game_state"], bedrock_analysis=phi3_context))
+                except Exception as e:
+                    log.error(f"Phi-3 エラー（後付け）: {e}")
+                    continue
+            if not commentary:
+                continue
+
+            history.append(commentary)
+            if len(history) > 5:
+                history.pop(0)
+
+            try:
+                wav_bytes = self._voicevox.generate_wav(commentary)
+            except Exception as e:
+                log.error(f"VOICEVOX エラー（後付け）: {e}")
+                continue
+
+            entry = self._render_sink.add(ev["event_time"], ev["event_type"], commentary,
+                                          wav_bytes, context=ev["render_context"])
+            log.info("[レンダ][後付け] #%d %s t=%.1fs (%.1f秒) → %s",
+                     entry["seq"], ev["event_type"], entry["event_time"],
+                     entry["duration"], entry["wav"])
 
     def _record_panel_state(self) -> None:
         """レンダーモード時、戦況パネル用スナップショットを states.jsonl に記録する。
@@ -3922,8 +4049,8 @@ def main() -> None:
                         help="終了画面検出モデルのパス（例: runs/detect/train_end_screen2/weights/best.pt）")
     parser.add_argument("--interval", type=float, default=1.0,
                         help="キャプチャ間隔（秒、デフォルト: 1.0）")
-    parser.add_argument("--speaker", type=int,   default=1,
-                        help="VOICEVOX 話者 ID（デフォルト: 1 = ずんだもん）")
+    parser.add_argument("--speaker", type=int,   default=2,
+                        help="VOICEVOX 話者 ID（デフォルト: 2 = 四国めたん）")
     parser.add_argument("--cpu",     action="store_true",
                         help="EasyOCR を CPU モードで実行（GPU 無効）")
     parser.add_argument("--conf",    type=float, default=0.5,

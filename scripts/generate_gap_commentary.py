@@ -224,7 +224,7 @@ def main(argv=None) -> int:
 
     with (render_dir / "render_info.json").open(encoding="utf-8") as fp:
         info = json.load(fp)
-    speaker = args.speaker if args.speaker is not None else int(info.get("speaker", 1))
+    speaker = args.speaker if args.speaker is not None else int(info.get("speaker", 2))
 
     # イベント実況の確定スケジュール（パス2と同じ手順）からギャップを検出
     entries = load_manifest(render_dir)

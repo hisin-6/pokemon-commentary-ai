@@ -153,8 +153,7 @@ AWS S3 → 実況ログ・スクリーンショット保存
 - [ ] AWS Bedrock Fine-tuning も候補（コスト要調査）
 
 ### Sprint 9: キャラクター強化（将来）
-- [ ] **VOICEVOX 話者変更**: 現在ずんだもん（speaker=1）→ 別キャラクターに変更
-  - 変更箇所: `--speaker` 引数（pipeline.py）/ VOICEVOX アプリで話者番号確認
+- [x] **VOICEVOX 話者変更**: 四国めたん（speaker=2）に変更済み（2026-07-23、デフォルト値を書き換え）
 - [ ] **3Dモデル口パク連携の動作確認**:
   - バーチャルモーションキャプチャー + VB-Audio Virtual Cable の連携が未確認
   - 音声出力を CABLE Input に向けると自動でリップシンクする設計（ADR-006）

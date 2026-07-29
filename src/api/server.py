@@ -82,8 +82,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _build_vision_prompt(context: dict, history: list[str], battle_state: dict) -> str:
-    """Bedrock に送るプロンプトを組み立てる"""
+def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
+                          has_image: bool = True) -> str:
+    """Bedrock に送るプロンプトを組み立てる。
+
+    has_image=False の場合（動画モードの後付け生成・ADR-009追記）は画像を渡さないため、
+    画像依存の指示（HPバー位置の目視判断・画像からの技名読み取り等）を、構造化データを
+    正確な事実として扱わせる指示に差し替える。
+    """
 
     # イベント別の実況指示
     event_type = context.get("event_type", "")
@@ -113,15 +119,31 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict) 
         f"- 今回のイベント: {event_type} → {event_hint}",
         "- 【実況】に実況文を1〜2文で書く",
         "- 必ず下記の情報にあるポケモン名・HP のみを使う（創作禁止）",
-        "- 技名は必ず画像のバトルメッセージ（〜のXXを使った！等）から直接読み取ること",
-        "- OCRテキストに変な表記（例: すいゆゆうれんだ）があっても無視すること。技名は画像から正確に読み取ること",
-        "- 画像のバトルメッセージで技名が確認できない場合は、絶対に技名を実況しないこと（ポケモンの知識から推測した技名も使用禁止）",
-        "- 画像を直接見て、HPバーの位置から自分と相手のポケモンを判断すること",
-        "  （画面左上/左下のHPバー＝相手のポケモン、画面右下/右上のHPバー＝自分のポケモン）",
-        "- 【蓄積された戦況】の「自分のポケモン」「相手のポケモン」リストを最優先で参照すること",
-        "  （このリストは複数ターン分の情報で正確。OCR名前候補より信頼度が高い）",
-        "- 画像に状態異常アイコンが見えたら必ず言及すること",
-        "  （まひ=黄色、やけど=橙、どく=紫、ねむり=黒、こおり=水色）",
+    ]
+    if has_image:
+        lines += [
+            "- 技名は必ず画像のバトルメッセージ（〜のXXを使った！等）から直接読み取ること",
+            "- OCRテキストに変な表記（例: すいゆゆうれんだ）があっても無視すること。技名は画像から正確に読み取ること",
+            "- 画像のバトルメッセージで技名が確認できない場合は、絶対に技名を実況しないこと（ポケモンの知識から推測した技名も使用禁止）",
+            "- 画像を直接見て、HPバーの位置から自分と相手のポケモンを判断すること",
+            "  （画面左上/左下のHPバー＝相手のポケモン、画面右下/右上のHPバー＝自分のポケモン）",
+            "- 【蓄積された戦況】の「自分のポケモン」「相手のポケモン」リストを最優先で参照すること",
+            "  （このリストは複数ターン分の情報で正確。OCR名前候補より信頼度が高い）",
+            "- 画像に状態異常アイコンが見えたら必ず言及すること",
+            "  （まひ=黄色、やけど=橙、どく=紫、ねむり=黒、こおり=水色）",
+        ]
+    else:
+        lines += [
+            "- 画像は渡されていない。以下の【蓄積された戦況】【現在フレームのOCR情報】に書かれた情報のみを"
+            "正確な事実として扱うこと（画像で確認・上書きすることはできない）",
+            "- 技名は必ず【OCRで検出した使用技】の情報のみを根拠にすること。記載がない技は絶対に実況しないこと"
+            "（ポケモンの知識から推測した技名も使用禁止）",
+            "- 【蓄積された戦況】の「自分のポケモン」「相手のポケモン」リストを最優先で参照すること",
+            "  （このリストは複数ターン分の情報で正確。OCR名前候補より信頼度が高い）",
+            "- 自分の状態異常／相手の状態異常に記載があれば必ず言及すること",
+            "  （まひ=黄色、やけど=橙、どく=紫、ねむり=黒、こおり=水色）",
+        ]
+    lines += [
         "- HPが残り30%未満の時は緊張感を出す",
         "- 鉤括弧（「」）は使わない",
         "- 見出しは【状況】【実況】の全角鍵括弧形式のみを使う（Markdown見出し#は使わない）",
@@ -136,9 +158,13 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict) 
         f"直近のイベント履歴: {battle_state.get('event_log', 'なし')}",
         "※ 「場」のポケモンが現在戦闘中。「控え」は場にいない（交代前の控え・ひんし含む）。",
         "※ (ひんし) とマークされたポケモンはすでに倒れており絶対に言及しないこと。",
+        "※ 「控え」のポケモンに言及する場合は必ず「控えの」等を付けて控えだと分かる言い方にすること。"
+        "「場」にいるかのような表現（現在戦っている前提の言い回し）をしてはいけない。",
         "",
-        "【現在フレームのOCR情報（ヒント・画像と矛盾する場合は画像優先）】",
-        "※ 名前候補はy座標の仮分類で、技名・選出画面の手持ち・OCR誤読が混入する。画像のHPバーで必ず確認すること。",
+        "【現在フレームのOCR情報（ヒント・画像と矛盾する場合は画像優先）】" if has_image
+        else "【現在フレームのOCR情報（蓄積された戦況を優先し、矛盾する場合はそちらを信じること）】",
+        "※ 名前候補はy座標の仮分類で、技名・選出画面の手持ち・OCR誤読が混入する。画像のHPバーで必ず確認すること。" if has_image
+        else "※ 名前候補はy座標の仮分類で、技名・選出画面の手持ち・OCR誤読が混入する。【蓄積された戦況】を優先すること。",
         f"画面テキスト: {context.get('ocr_text', '不明')}",
         f"HP値: {context.get('hp_values', '不明')}",
         f"自分側のポケモン名候補（不正確・参考のみ）: {context.get('name_candidates_player', '不明')}",
@@ -329,12 +355,10 @@ def vision():
         return jsonify({"success": False, "error": "invalid_json", "message": "リクエストボディがJSONではありません"}), 400
 
     # バリデーション
+    # image_base64 は任意（動画モードの後付け生成・ADR-009追記では画像を渡さない）
     image_b64: str = data.get("image_base64", "")
     context: dict = data.get("context", {})
     history: list = data.get("history", [])
-
-    if not image_b64:
-        return jsonify({"success": False, "error": "missing_image", "message": "image_base64 が必要です"}), 400
 
     if not context:
         return jsonify({"success": False, "error": "missing_context", "message": "context が必要です"}), 400
@@ -347,38 +371,41 @@ def vision():
             "message": f"event_type は {VALID_EVENT_TYPES} のいずれかにしてください",
         }), 400
 
-    # 画像サイズチェック（Base64デコード前に文字数で概算）
-    if len(image_b64) > IMAGE_MAX_BYTES * 4 // 3 + 100:
-        return jsonify({"success": False, "error": "image_too_large", "message": "画像サイズが上限（5MB）を超えています"}), 400
+    image_bytes: bytes | None = None
+    if image_b64:
+        # 画像サイズチェック（Base64デコード前に文字数で概算）
+        if len(image_b64) > IMAGE_MAX_BYTES * 4 // 3 + 100:
+            return jsonify({"success": False, "error": "image_too_large", "message": "画像サイズが上限（5MB）を超えています"}), 400
 
-    try:
-        image_bytes = base64.b64decode(image_b64)
-    except Exception:
-        return jsonify({"success": False, "error": "invalid_image", "message": "Base64デコードに失敗しました"}), 400
+        try:
+            image_bytes = base64.b64decode(image_b64)
+        except Exception:
+            return jsonify({"success": False, "error": "invalid_image", "message": "Base64デコードに失敗しました"}), 400
 
-    if len(image_bytes) > IMAGE_MAX_BYTES:
-        return jsonify({"success": False, "error": "image_too_large", "message": "画像サイズが上限（5MB）を超えています"}), 400
+        if len(image_bytes) > IMAGE_MAX_BYTES:
+            return jsonify({"success": False, "error": "image_too_large", "message": "画像サイズが上限（5MB）を超えています"}), 400
 
     # Bedrock 呼び出し
     battle_state: dict = data.get("battle_state", {})
-    prompt_text = _build_vision_prompt(context, history, battle_state)
+    prompt_text = _build_vision_prompt(context, history, battle_state, has_image=image_bytes is not None)
+    content: list = []
+    if image_bytes is not None:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": image_b64,
+            },
+        })
+    content.append({"type": "text", "text": prompt_text})
     request_body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 256,
         "messages": [
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": image_b64,
-                        },
-                    },
-                    {"type": "text", "text": prompt_text},
-                ],
+                "content": content,
             }
         ],
     }

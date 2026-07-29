@@ -193,6 +193,25 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context(), [], self._battle_state())
         assert "ターン推移: なし" in prompt
 
+    def test_has_image_false_omits_image_dependent_instructions(self):
+        """動画モードの後付け生成（画像なし・ADR-009追記）では、画像の目視判断を
+        求める指示（HPバー位置・画像からの技名読み取り等）を含めてはいけない。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state(), has_image=False)
+        assert "画像を直接見て" not in prompt
+        assert "画像のバトルメッセージ" not in prompt
+        assert "画像に状態異常アイコンが見えたら" not in prompt
+
+    def test_has_image_true_keeps_image_dependent_instructions(self):
+        """デフォルト（has_image省略時）はライブ経路の従来プロンプトのまま。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "画像を直接見て、HPバーの位置から自分と相手のポケモンを判断すること" in prompt
+
+    def test_has_image_false_still_references_ocr_detected_moves(self):
+        prompt = _build_vision_prompt(
+            self._context(), [], self._battle_state(), has_image=False,
+        )
+        assert "OCRで検出した使用技" in prompt
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GET /health
@@ -239,12 +258,28 @@ class TestVisionEndpoint:
         resp = client.post("/api/vision", data="not json", content_type="text/plain")
         assert resp.status_code == 400
 
-    def test_missing_image_returns_400(self, client):
+    def test_missing_image_calls_bedrock_without_image_block(self, client):
+        """image_base64 は任意（動画モードの後付け生成・ADR-009追記）。
+        画像なしでも200で応答し、Bedrockへは画像ブロックを含めずテキストのみ送る。"""
         payload = _valid_vision_payload(image_base64="")
-        resp = client.post("/api/vision", json=payload)
-        assert resp.status_code == 400
-        data = resp.get_json()
-        assert data["error"] == "missing_image"
+        mock_response_body = {
+            "content": [{"text": "【実況】テスト実況"}],
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(read=MagicMock(return_value=json.dumps(mock_response_body).encode())),
+        }
+
+        with patch.object(server_module.bedrock, "invoke_model",
+                           return_value=mock_bedrock_response) as mock_invoke:
+            resp = client.post("/api/vision", json=payload)
+
+        assert resp.status_code == 200
+        assert resp.get_json()["success"] is True
+        sent_body = json.loads(mock_invoke.call_args.kwargs["body"])
+        content = sent_body["messages"][0]["content"]
+        assert all(block["type"] != "image" for block in content)
+        assert any(block["type"] == "text" for block in content)
 
     def test_missing_context_returns_400(self, client):
         payload = _valid_vision_payload(context={})

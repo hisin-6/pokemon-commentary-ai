@@ -2,8 +2,10 @@
 render_sink.py（実況動画レンダリング素材出力・ADR-009 パス1）の単体テスト
 
 テスト対象:
-  - RenderSink            WAV保存・マニフェストJSONL追記・メタ情報
-  - Pipeline._speak_async レンダリングモード分岐（保存して再生しない）
+  - RenderSink                        WAV保存・マニフェストJSONL追記・メタ情報
+  - Pipeline._speak_async             レンダリングモード分岐（保存して再生しない）
+  - Pipeline._dispatch_commentary     後付け生成バッファ／ライブ経路の分岐（ADR-009追記）
+  - Pipeline._generate_posthoc_commentary  動画モードの後付け実況生成（ADR-009追記）
 """
 
 import io
@@ -20,6 +22,7 @@ _ROOT = str(Path(__file__).parent.parent)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+import src.pipeline as pipeline_module
 from src.output.render_sink import RenderSink
 from src.pipeline import Pipeline
 
@@ -215,3 +218,197 @@ class TestAddState:
         sink1.add_state(10.0, {"turn": 1})
         RenderSink(tmp_path)
         assert not (tmp_path / "states.jsonl").exists()
+
+
+def _make_posthoc_pipeline(tmp_path) -> Pipeline:
+    """__init__ を通さずに _dispatch_commentary に必要な属性だけ持つ Pipeline を作る
+    （posthoc_mode=True・動画モードの後付け生成経路）。"""
+    p = Pipeline.__new__(Pipeline)
+    p._posthoc_mode = True
+    p._pending_render_events = []
+    p._render_sink = RenderSink(tmp_path)
+    p._commentary_history = []
+    p._video_now = 10.0
+    return p
+
+
+class TestDispatchCommentaryPosthocMode:
+    """posthoc_mode=True では Bedrock/VOICEVOX を呼ばずバッファに積むだけ（ADR-009追記）。"""
+
+    def test_buffers_event_without_network_or_synthesis(self, tmp_path, monkeypatch):
+        p = _make_posthoc_pipeline(tmp_path)
+        p._voicevox = MagicMock()
+        p._render_context = MagicMock(return_value={"turn": 1, "move_log": []})
+        bedrock_called = MagicMock()
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_vision", bedrock_called)
+
+        game_state = {"ocr_text": "テスト"}
+        battle_context = {"player_pokemon": "ガブリアス"}
+        p._dispatch_commentary("move_used", None, game_state, battle_context,
+                                ["T1:じしん"], attempt_bedrock=True, event_time=12.3)
+
+        assert len(p._pending_render_events) == 1
+        ev = p._pending_render_events[0]
+        assert ev == {
+            "event_time": 12.3,
+            "event_type": "move_used",
+            "game_state": game_state,
+            "battle_context": battle_context,
+            "move_log": ["T1:じしん"],
+            "render_context": {"turn": 1, "move_log": []},
+        }
+        bedrock_called.assert_not_called()
+        p._voicevox.generate_wav.assert_not_called()
+        # マニフェストにはまだ何も書かれない（生成は run() 完了後）
+        assert not (tmp_path / "manifest.jsonl").exists()
+
+    def test_event_time_defaults_to_now_when_omitted(self, tmp_path):
+        p = _make_posthoc_pipeline(tmp_path)
+        p._render_context = MagicMock(return_value=None)
+
+        p._dispatch_commentary("battle_start", None, {"ocr_text": ""}, {}, [],
+                                attempt_bedrock=True)
+
+        assert p._pending_render_events[0]["event_time"] == 10.0  # p._video_now
+
+
+class TestDispatchCommentaryLiveMode:
+    """posthoc_mode=False（ライブ経路）は従来どおり即座にBedrock/Phi-3→再生する
+    （既存の即時実況経路は無変更・リグレッションガード）。"""
+
+    def _make_pipeline(self):
+        p = Pipeline.__new__(Pipeline)
+        p._posthoc_mode = False
+        p._render_sink = None
+        p._commentary_history = []
+        p._video_now = 5.0
+        p._ec2_url = "http://ec2.example"
+        p._classifier = None
+        p._move_log = []
+        p._phi3 = MagicMock()
+        p._voicevox = MagicMock()
+        p._voicevox.generate_wav.return_value = _make_wav(0.3)
+        p._player = MagicMock()
+        p._speech_thread = None
+        p._render_context = MagicMock(return_value=None)
+        return p
+
+    def test_uses_bedrock_result_and_speaks(self, monkeypatch):
+        p = self._make_pipeline()
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_vision",
+                             lambda *a, **k: ("ガブリアスのじしん炸裂！", "状況説明"))
+
+        p._dispatch_commentary("move_used", None, {"ocr_text": ""}, {}, [], attempt_bedrock=True)
+        p._speech_thread.join(timeout=5)
+
+        assert p._commentary_history == ["ガブリアスのじしん炸裂！"]
+        p._player.play.assert_called_once()
+
+    def test_falls_back_to_phi3_when_bedrock_returns_none(self, monkeypatch):
+        p = self._make_pipeline()
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_vision", lambda *a, **k: (None, None))
+        p._phi3.generate_commentary.return_value = "フォールバック実況！"
+
+        p._dispatch_commentary("move_used", None, {"ocr_text": "hint"}, {}, [], attempt_bedrock=True)
+        p._speech_thread.join(timeout=5)
+
+        assert p._commentary_history == ["フォールバック実況！"]
+        p._player.play.assert_called_once()
+
+    def test_attempt_bedrock_false_skips_bedrock_call(self, monkeypatch):
+        p = self._make_pipeline()
+        bedrock_called = MagicMock()
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_vision", bedrock_called)
+        p._phi3.generate_commentary.return_value = "フォールバックのみ！"
+
+        p._dispatch_commentary("move_used", None, {"ocr_text": "hint"}, {}, [], attempt_bedrock=False)
+        p._speech_thread.join(timeout=5)
+
+        bedrock_called.assert_not_called()
+        assert p._commentary_history == ["フォールバックのみ！"]
+
+
+class TestGeneratePosthocCommentary:
+    """run() 完了後にバッファから実況を一括生成する処理（ADR-009追記）。"""
+
+    def _make_pipeline(self, tmp_path):
+        p = Pipeline.__new__(Pipeline)
+        p._render_sink = RenderSink(tmp_path)
+        p._ec2_url = "http://ec2.example"
+        p._classifier = None
+        p._phi3 = MagicMock()
+        p._voicevox = MagicMock()
+        p._voicevox.generate_wav.return_value = _make_wav(0.3)
+        p._pending_render_events = []
+        return p
+
+    def test_generates_manifest_entries_in_event_time_order(self, tmp_path, monkeypatch):
+        p = self._make_pipeline(tmp_path)
+        p._pending_render_events = [
+            {"event_time": 1.0, "event_type": "battle_start", "game_state": {"ocr_text": ""},
+             "battle_context": {}, "move_log": [], "render_context": None},
+            {"event_time": 30.0, "event_type": "move_used", "game_state": {"ocr_text": ""},
+             "battle_context": {}, "move_log": ["T1:じしん"], "render_context": None},
+        ]
+        responses = iter([("バトル開始だよ！", "a"), ("じしんが炸裂！", "b")])
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text",
+                             lambda *a, **k: next(responses))
+
+        p._generate_posthoc_commentary()
+
+        lines = (tmp_path / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        entries = [json.loads(line) for line in lines]
+        assert entries[0]["commentary"] == "バトル開始だよ！"
+        assert entries[0]["event_time"] == 1.0
+        assert entries[1]["commentary"] == "じしんが炸裂！"
+        assert entries[1]["event_time"] == 30.0
+
+    def test_history_grows_sequentially(self, tmp_path, monkeypatch):
+        """直前の実況の繰り返し防止用historyが、ライブ経路と同様に発生順に蓄積される。"""
+        p = self._make_pipeline(tmp_path)
+        p._pending_render_events = [
+            {"event_time": 1.0, "event_type": "battle_start", "game_state": {"ocr_text": ""},
+             "battle_context": {}, "move_log": [], "render_context": None},
+            {"event_time": 2.0, "event_type": "move_used", "game_state": {"ocr_text": ""},
+             "battle_context": {}, "move_log": [], "render_context": None},
+        ]
+        seen_histories = []
+
+        def fake_call(ec2_url, game_state, event_type, history, battle_context, classifier, move_log):
+            seen_histories.append(list(history))
+            return (f"実況{len(seen_histories)}", "a")
+
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", fake_call)
+
+        p._generate_posthoc_commentary()
+
+        assert seen_histories[0] == []
+        assert seen_histories[1] == ["実況1"]
+
+    def test_falls_back_to_phi3_on_bedrock_failure(self, tmp_path, monkeypatch):
+        p = self._make_pipeline(tmp_path)
+        p._pending_render_events = [
+            {"event_time": 5.0, "event_type": "faint", "game_state": {"ocr_text": "倒れた"},
+             "battle_context": {}, "move_log": [], "render_context": None},
+        ]
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", lambda *a, **k: (None, None))
+        p._phi3.generate_commentary.return_value = "フォールバック実況！"
+
+        p._generate_posthoc_commentary()
+
+        entry = json.loads((tmp_path / "manifest.jsonl").read_text(encoding="utf-8"))
+        assert entry["commentary"] == "フォールバック実況！"
+
+    def test_skips_event_on_voicevox_error_without_raising(self, tmp_path, monkeypatch):
+        p = self._make_pipeline(tmp_path)
+        p._pending_render_events = [
+            {"event_time": 1.0, "event_type": "battle_start", "game_state": {"ocr_text": ""},
+             "battle_context": {}, "move_log": [], "render_context": None},
+        ]
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", lambda *a, **k: ("実況", "a"))
+        p._voicevox.generate_wav.side_effect = Exception("voicevox down")
+
+        p._generate_posthoc_commentary()  # 例外を投げずにスキップすること
+
+        assert not (tmp_path / "manifest.jsonl").exists()
