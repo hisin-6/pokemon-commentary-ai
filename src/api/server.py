@@ -106,6 +106,11 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
         "性格は元気で甘えん坊、でもポケモン知識はガチ勢。",
         "口調はアイドル・かわいい系（語尾に♪を適度に使う・タメ口・テンション高め・"
         "かわいい褒め言葉多め）で実況しつつ、技名やHP等の情報は正確に伝えてください。",
+        "自称は「くれぴ」（ひらがな）。「花圓」という漢字表記は実況文に書かないこと"
+        "（音声合成が正しく読めないため）。",
+        "あなたは「自分」側（プレイヤー側）の視点で、自分側を応援する立場で実況します。"
+        "「自分の」「相手の」の帰属は下記の戦況リストに厳密に従い、"
+        "相手のポケモンを自分のもののように（またはその逆に）語らないこと。",
         "",
         "【ダブルバトルの基本知識】",
         "- 各プレイヤーが2匹ずつ場に出す（合計4匹が同時に戦う）",
@@ -119,7 +124,15 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
         f"- 今回のイベント: {event_type} → {event_hint}",
         "- 【実況】に実況文を1〜2文で書く",
         "- 必ず下記の情報にあるポケモン名・HP のみを使う（創作禁止）",
+        "- 実況は「今この瞬間に起きたこと」を最優先。数十秒前・過去のターンの出来事を"
+        "今起きたかのように振り返らないこと",
     ]
+    battle_result = context.get("battle_result", "")
+    if battle_result:
+        lines += [
+            f"- この試合の勝敗は「自分の{battle_result}」で確定している。"
+            "締めの実況で必ず勝敗に触れること（勝ちなら喜び・負けなら悔しさ＋前向きな一言）",
+        ]
     if has_image:
         lines += [
             "- 技名は必ず画像のバトルメッセージ（〜のXXを使った！等）から直接読み取ること",
@@ -221,11 +234,12 @@ def _parse_commentary(text: str) -> tuple[str, str]:
 
 
 def _gap_filler_count(start: float, end: float) -> int:
-    """無言区間の長さから生成するフィラーの目安件数を決める（約18秒に1件・1〜5件）。
+    """無言区間の長さから生成するフィラーの目安件数を決める（約30秒に1件・1〜3件）。
 
-    ユーザー要望「とてもしゃべらせたい」（2026-07-14に25秒→18秒へ増量）。
+    2026-07-14に「とてもしゃべらせたい」で25秒→18秒へ増量したが、
+    2026-07-30の視聴フィードバック「フィラーが多い」で30秒/件・上限3へ減量。
     """
-    return max(1, min(5, int((end - start) // 18)))
+    return max(1, min(3, int((end - start) // 30)))
 
 
 def _build_script_prompt(gap: dict, events: list, moments: list = None) -> str:
@@ -248,6 +262,12 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None) -> str:
         "あなたは、ポケモン対戦実況AIVTuber「花圓くれぴ（はなまるくれぴ）」です。",
         "性格は元気で甘えん坊、でもポケモン知識はガチ勢。口調はアイドル・かわいい系",
         "（語尾に♪を適度に使う・タメ口・テンション高め・かわいい褒め言葉多め）。",
+        "自称は「くれぴ」（ひらがな）。「花圓」という漢字表記は実況文に書かないこと"
+        "（音声合成が正しく読めないため）。",
+        "あなたは「自分」側（プレイヤー側）の視点で、自分側を応援する立場で実況します。",
+        "ポケモンの「自分の」「相手の」の帰属はタイムラインの記載（【自分側】【相手側】タグ・",
+        "戦況の場/控え情報）に厳密に従い、タグや記載がなく判別できない場合は",
+        "「自分の/相手の」を付けずにポケモン名だけで実況すること（推測で断定しない）。",
         "録画された試合に後から実況を吹き込みますが、視聴者には生放送の",
         "ライブ実況に聞こえるようにしてください（後から見返している・録画といった言い方は禁止）。",
         "主要イベントの実況音声はすでに収録済みです。",
@@ -287,7 +307,10 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None) -> str:
     timeline.sort(key=lambda item: item[1])
     for kind, _, item in timeline:
         if kind == "moment":
-            lines.append(f"- 📺{float(item['time']):.1f}秒 画面: {item.get('text', '')}")
+            # 陣営タグ（2026-07-30〜のtimelineに付与・同名ミラーの視点誤りを防ぐ）
+            side = item.get("side")
+            side_txt = f"【{side}側】" if side else ""
+            lines.append(f"- 📺{float(item['time']):.1f}秒 画面: {side_txt}{item.get('text', '')}")
             continue
         e = item
         lines.append(f"- {float(e['time']):.1f}秒 [{e.get('event_type', '?')}] {e.get('commentary', '')}")

@@ -313,6 +313,26 @@ class TestBiimCommand:
         assert "-c:v libx264" in joined   # レイアウト焼き込みのため再エンコード
         assert "[vout]" in joined and "[aout]" in joined
 
+    def test_tail_pad_inserts_tpad_before_scale(self, tmp_path):
+        """末尾実況が動画終端をまたぐ場合の映像延長（tpad）。字幕・パネル描画の
+        前段に入ること（後段だと延長区間で字幕が最終フレームごと固まる）。"""
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("track.wav"), Path("out.mp4"),
+            tmp_path / "c.ass", gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
+            tail_pad=6.563)
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        assert "tpad=stop_mode=clone:stop_duration=6.563" in fc
+        assert fc.index("tpad=") < fc.index("scale=1440:810")
+
+    def test_tail_pad_zero_omits_tpad(self, tmp_path):
+        """tail_pad=0（既定）ではtpadを挿入しない（従来コマンドと同一）。"""
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("track.wav"), Path("out.mp4"),
+            tmp_path / "c.ass", gain=1.4, duck_threshold=0.03, duck_ratio=8.0)
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        # 注: "tpad" 単体だとtmp_pathのテスト名（..._tpad0）に誤マッチする
+        assert "tpad=" not in fc
+
 
 def _panel_state(t, turn=3, player=None, opponent=None, ap=2, ao=2):
     return {"time": t, "turn": turn,
@@ -355,11 +375,25 @@ class TestPanelEvents:
         assert any("技:?/?" in l for l in before)
         assert any("技:だくりゅう/?" in l for l in after)
 
-    def test_moves_by_pokemon_caps_at_four_and_dedupes(self):
+    def test_moves_by_pokemon_dedupes(self):
         moments = [{"time": float(i), "kind": "move",
                     "text": f"T1:ピカチュウの技{i % 5}"} for i in range(10)]
         moves = rcv._moves_by_pokemon(moments, until=100.0)
-        assert len(moves["ピカチュウ"]) == 4  # 5種類あっても4枠まで・重複なし
+        # 重複なしで(技名, 陣営)を保持。表示4枠キャップは_moves_for_side側
+        assert [mv for mv, _ in moves["ピカチュウ"]] == ["技0", "技1", "技2", "技3", "技4"]
+        assert rcv._moves_for_side(moves, "ピカチュウ", "自分") == ["技0", "技1", "技2", "技3"]
+
+    def test_moves_for_side_filters_mirror_moves(self):
+        """陣営タグ付きは一致側のみ・タグ無し（旧データ）は両側に出る
+        （同名ミラーで両陣営の技が同じ欄に混ざる問題の対策・2026-07-30）。"""
+        moments = [
+            {"time": 1.0, "kind": "move", "text": "T1:イダイトウのだくりゅう", "side": "自分"},
+            {"time": 2.0, "kind": "move", "text": "T1:イダイトウのおはかまいり", "side": "相手"},
+            {"time": 3.0, "kind": "move", "text": "T2:イダイトウのこごえるかぜ"},  # 旧形式
+        ]
+        moves = rcv._moves_by_pokemon(moments, until=100.0)
+        assert rcv._moves_for_side(moves, "イダイトウ", "自分") == ["だくりゅう", "こごえるかぜ"]
+        assert rcv._moves_for_side(moves, "イダイトウ", "相手") == ["おはかまいり", "こごえるかぜ"]
 
     def test_moves_lines_format(self):
         line1, line2 = rcv._moves_lines(["インファイト", "ねこだまし", "まもる"])

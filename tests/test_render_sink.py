@@ -108,6 +108,17 @@ class TestRenderSink:
         assert first == {"time": 200.5, "kind": "move",
                          "text": "T3:ガブリアスのドラゴンクロー"}
 
+    def test_moment_side_field(self, tmp_path):
+        """陣営タグ（2026-07-30・同名ミラー対策）。side=Noneならフィールド自体を
+        書かない（旧形式と同一＝後方互換の検証を兼ねる）。"""
+        sink = RenderSink(tmp_path)
+        sink.add_moment(10.0, "move", "T1:イダイトウのだくりゅう", side="自分")
+        sink.add_moment(20.0, "move", "T1:イダイトウのおはかまいり", side=None)
+
+        lines = (tmp_path / "timeline.jsonl").read_text(encoding="utf-8").splitlines()
+        assert json.loads(lines[0])["side"] == "自分"
+        assert "side" not in json.loads(lines[1])
+
     def test_rerun_clears_previous_materials(self, tmp_path):
         """同じ出力先での再実行は前回のmanifest・wav・fillers・timelineをクリアする
         （追記のままだと新旧混在＋連番WAV同名衝突が起きる・2026-07-14実発生）。"""

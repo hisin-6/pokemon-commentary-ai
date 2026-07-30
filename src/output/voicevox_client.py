@@ -15,6 +15,19 @@ VOICEVOX_URL = "http://localhost:50021"
 DEFAULT_SPEAKER = 2  # 四国めたん（ノーマル）
 # 話者一覧は GET /speakers で確認できる
 
+# 読み置換辞書: VOICEVOXが誤読する固有名詞を、合成時だけ読み仮名に置き換える。
+# 字幕・manifestには元のテキストがそのまま使われる（置換は音声にしか影響しない）。
+TTS_READINGS = {
+    "花圓": "はなまる",  # AIVTuber名「花圓くれぴ」。素のVOICEVOXは「はなえん」と誤読する
+}
+
+
+def apply_tts_readings(text: str) -> str:
+    """読み置換辞書を適用したテキストを返す（音声合成専用）。"""
+    for surface, reading in TTS_READINGS.items():
+        text = text.replace(surface, reading)
+    return text
+
 
 class VoicevoxClient:
     def __init__(
@@ -37,7 +50,7 @@ class VoicevoxClient:
         Returns:
             WAV 形式の音声データ（bytes）
         """
-        audio_query = self._create_audio_query(text)
+        audio_query = self._create_audio_query(apply_tts_readings(text))
         return self._synthesize(audio_query)
 
     def save_wav(self, text: str, path: str) -> str:

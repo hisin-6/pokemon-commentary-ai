@@ -24,7 +24,9 @@ if _ROOT not in sys.path:
 
 # conftest.py で重いモジュールがモック済みなのでここで安全にインポートできる
 from src.pipeline import (
+    _build_bedrock_context,
     _clean_commentary,
+    _detect_battle_result,
     _detect_glitch_cause,
     _extract_structured_info,
     _is_battle_screen,
@@ -117,6 +119,39 @@ class TestCleanCommentary:
         text = "エルフーンがおいかぜを使った！ゴリランダーに追い風が吹く！"
         result = _clean_commentary(text)
         assert "エルフーン" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 勝敗検出（battle_end実況の勝敗明言・2026-07-30視聴fb#4）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDetectBattleResult:
+
+    def test_win(self):
+        assert _detect_battle_result("勝負に勝った!") == "勝ち"
+
+    def test_lose(self):
+        assert _detect_battle_result("勝負に負けた!") == "負け"
+
+    def test_ocr_split_with_spaces(self):
+        """OCRが「勝負に」と「負けた!」に分割してスペース結合されるケース。"""
+        assert _detect_battle_result("〇〇は 勝負に 負けた!") == "負け"
+
+    def test_unknown_returns_none(self):
+        assert _detect_battle_result("降参が選ばれました") is None
+        assert _detect_battle_result("") is None
+
+    def test_context_passthrough(self):
+        """game_stateのbattle_resultが_build_bedrock_contextに乗る（battle_endのみ
+        注入されるため通常イベントでは空文字）。"""
+        gs = {"ocr_text": "", "hp_values": [], "balls_remaining": [],
+              "name_candidates_player": [], "name_candidates_opponent": [],
+              "status": "なし", "battle_result": "勝ち"}
+        ctx = _build_bedrock_context(gs, "battle_end", None, None, [])
+        assert ctx["battle_result"] == "勝ち"
+        gs2 = dict(gs)
+        del gs2["battle_result"]
+        assert _build_bedrock_context(gs2, "move_used", None, None, [])["battle_result"] == ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -909,6 +944,41 @@ class TestMarkBenchBySide:
         assert self.tracker.mark_bench_by_name("オオニューラ", side="player") is True
         assert self.mine.on_field is False
         assert self.theirs.on_field is True
+
+
+class TestMoveUserSide:
+    """瞬間ログの陣営タグ判定（timeline.jsonl side・2026-07-30）。
+    20-14-17の同名ミラー戦（相手もイダイトウ）でフィラーが陣営を推測で
+    外した問題への対策。誤タグよりタグ無し（None）が安全という方針。"""
+
+    def setup_method(self):
+        self.tracker = BattleStateTracker()
+
+    def test_player_only_name(self):
+        self.tracker._player.append(FieldPokemon(name="オオニューラ", on_field=True))
+        assert self.tracker.move_user_side("オオニューラ") == "自分"
+
+    def test_opponent_only_name(self):
+        self.tracker._opponent.append(FieldPokemon(name="キラフロル", on_field=True))
+        assert self.tracker.move_user_side("キラフロル") == "相手"
+
+    def test_is_opponent_flag_wins(self):
+        assert self.tracker.move_user_side("ガブリアス", is_opponent=True) == "相手"
+
+    def test_unknown_name_returns_none(self):
+        assert self.tracker.move_user_side("ミュウツー") is None
+
+    def test_mirror_prefers_on_field_side(self):
+        """同名ミラー: 場に出ている側を使い手と判定（自分イダイトウがベンチ・
+        相手イダイトウが場、のときの技は相手側）。"""
+        self.tracker._player.append(FieldPokemon(name="イダイトウ", on_field=False))
+        self.tracker._opponent.append(FieldPokemon(name="イダイトウ", on_field=True))
+        assert self.tracker.move_user_side("イダイトウ") == "相手"
+
+    def test_mirror_both_on_field_is_ambiguous(self):
+        self.tracker._player.append(FieldPokemon(name="イダイトウ", on_field=True))
+        self.tracker._opponent.append(FieldPokemon(name="イダイトウ", on_field=True))
+        assert self.tracker.move_user_side("イダイトウ") is None
 
 
 class TestOnFieldMissThresholdUsesGameTurn:

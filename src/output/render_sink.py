@@ -82,7 +82,8 @@ class RenderSink:
             rate = w.getframerate()
             return w.getnframes() / rate if rate else 0.0
 
-    def add_moment(self, time: float, kind: str, text: str) -> None:
+    def add_moment(self, time: float, kind: str, text: str,
+                   side: str = None) -> None:
         """画面上の出来事の「瞬間ログ」を timeline.jsonl に追記する。
 
         技検出など、実況イベントにならなかった出来事も動画内時刻付きで
@@ -93,9 +94,13 @@ class RenderSink:
             time: 検出時点の動画内時刻（秒）
             kind: 出来事の種別（move 等）
             text: 出来事の内容（例: "T3:ガブリアスのドラゴンクロー"）
+            side: 出来事の主体の陣営（"自分"/"相手"・不明ならNone）。
+                text の形式は既存パーサー互換のため変えず、別フィールドで持つ。
         """
-        line = json.dumps({"time": round(float(time), 3), "kind": kind,
-                           "text": text}, ensure_ascii=False)
+        record = {"time": round(float(time), 3), "kind": kind, "text": text}
+        if side is not None:
+            record["side"] = side
+        line = json.dumps(record, ensure_ascii=False)
         with self._lock:
             with self._timeline_path.open("a", encoding="utf-8") as fp:
                 fp.write(line + "\n")

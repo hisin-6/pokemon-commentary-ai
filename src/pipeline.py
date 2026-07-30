@@ -1891,6 +1891,28 @@ class BattleStateTracker:
                             slot.moves_used.pop(0)
                     return
 
+    def move_user_side(self, pokemon_name: str, is_opponent: bool = False) -> str | None:
+        """技の使い手がどちらの陣営かを返す（"自分"/"相手"・判定不能はNone）。
+
+        瞬間ログ（timeline.jsonl）の陣営タグ用。同名ミラー（両陣営に同名がいる）
+        の場合は場に出ている側を優先し、両方場に出ている・どちらも出ていない
+        場合は判定不能として None を返す（誤タグよりタグ無しの方が安全）。
+        """
+        if is_opponent:
+            return "相手"
+        p_slots = [s for s in self._player if s.name == pokemon_name]
+        o_slots = [s for s in self._opponent if s.name == pokemon_name]
+        if p_slots and not o_slots:
+            return "自分"
+        if o_slots and not p_slots:
+            return "相手"
+        if p_slots and o_slots:
+            p_on = any(s.on_field for s in p_slots)
+            o_on = any(s.on_field for s in o_slots)
+            if p_on != o_on:
+                return "自分" if p_on else "相手"
+        return None
+
     def set_not_on_field(self, pokemon_name: str) -> bool:
         """指定ポケモンを場から降ろす（交代・とんぼがえり検出時に呼ぶ）。
         見つかった場合は True を返す。
@@ -2315,6 +2337,20 @@ def _clean_commentary(text: str) -> str:
     return text
 
 
+def _detect_battle_result(text: str) -> str | None:
+    """OCRテキストから勝敗を判定する（battle_end画面の「勝負に勝った/負けた」）。
+
+    OCRの分割・スペース混入（「勝負に 勝った!」等）を吸収するため
+    スペース除去後に部分一致で判定する。判定不能（降参・通信エラー等）は None。
+    """
+    joined = text.replace(" ", "")
+    if "勝負に勝" in joined:
+        return "勝ち"
+    if "勝負に負" in joined:
+        return "負け"
+    return None
+
+
 # ─── AIグリッチ差し替え（Bedrock保留・困惑応答対策） ─────────────────────────
 
 # Bedrockがデータ矛盾等で実況を保留・困惑する応答（「データが矛盾していて
@@ -2423,6 +2459,7 @@ def _build_bedrock_context(
         "rag_pokemon_info":         rag_info,
         "detected_moves":           " / ".join(move_log) if move_log else "なし",
         "faint_context":            game_state.get("faint_context", ""),  # 直前のfaint情報（統合時のみ）
+        "battle_result":            game_state.get("battle_result", ""),  # 勝敗（battle_endのみ・"勝ち"/"負け"）
     }
 
 
@@ -2583,6 +2620,7 @@ class Pipeline:
         self._prev_yolo: BattleState | None = None
         self._last_ball_yolo: BattleState | None = None  # ボールが見えたフレームの最新 YOLO 結果
         self._last_ability_msg: dict[str, str] = {}     # 最後に検出した特性・道具発動メッセージ
+        self._battle_result: str | None = None  # 「勝負に勝った/負けた」検出結果（"勝ち"/"負け"）
         self._pre_battle_opponent: list[str] = []  # battle_start前に検出した相手ポケモン名キャッシュ
         self._pre_battle_player: list[str] = []    # battle_start前に検出した自分ポケモン名キャッシュ（ゆけっ！検出）
         # メッセージ由来の繰り出し履歴 (時刻, side, 名前)。繰り出し演出は
@@ -2657,6 +2695,7 @@ class Pipeline:
         self._move_log = []
         self._last_ball_yolo = None   # バトル開始時にボール情報をリセット
         self._last_ability_msg = {}   # バトル開始時に特性・道具メッセージをリセット
+        self._battle_result = None    # 前試合の勝敗をリセット（連戦動画対策）
 
     def run(self) -> None:
         _is_video = self._video_path is not None
@@ -2752,6 +2791,10 @@ class Pipeline:
                                 self._end_screen_count = 0
                             else:
                                 log.info(f"[YOLO] 終了画面を{self._end_screen_count}回連続検出 + OCR確認済 → battle_end")
+                                # YOLO経路のbattle_endはocr_results=[]で発行するため
+                                # 確認用OCRテキストからここで勝敗を拾っておく
+                                if self._battle_result is None:
+                                    self._battle_result = _detect_battle_result(_end_joined)
                                 self._end_screen_count = 0
                                 turn += 1
                                 self._phase_classifier.set_processing(True)
@@ -3238,6 +3281,19 @@ class Pipeline:
                 self._pending_faint_state = None
                 self._pending_faint_battle_context = None
                 self._pending_faint_frame = None
+
+        # ── 勝敗検出（battle_endのみ）─────────────────────────────────────────
+        # OCRテキストから「勝負に勝った/負けた」を拾い、battle_endイベントの
+        # game_stateにのみ注入する（それ以前のイベントに混ぜるとネタバレになる）。
+        # 後付け生成はこのgame_stateをそのままバッファするため、ライブ・動画
+        # モード共通でこの1箇所で済む。
+        if event_type == "battle_end":
+            if self._battle_result is None:
+                self._battle_result = _detect_battle_result(game_state.get("ocr_text", ""))
+            if self._battle_result:
+                game_state = dict(game_state)
+                game_state["battle_result"] = self._battle_result
+                log.info("[戦況] 勝敗検出: %s", self._battle_result)
 
         # ── 実況文の生成・再生（ライブ）／後付け生成用バッファへの追加（動画モード）──
         # event_time はこのハンドラが処理中のフレームの動画内時刻（同期実行なので
@@ -3826,7 +3882,10 @@ class Pipeline:
                 # getattr: テストが部分構築のPipelineで_update_move_logを呼ぶため
                 render_sink = getattr(self, "_render_sink", None)
                 if render_sink is not None:
-                    render_sink.add_moment(self._now(), "move", entry)
+                    render_sink.add_moment(
+                        self._now(), "move", entry,
+                        side=self._battle_tracker.move_user_side(
+                            pokemon_name, is_opponent=is_opponent))
                 if tentative:
                     self._tentative_opponent_moves.append({
                         "old_entry": entry,

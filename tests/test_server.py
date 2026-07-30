@@ -137,6 +137,24 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context(ocr_text="ピカチュウのかみなり"), [], self._battle_state())
         assert "ピカチュウのかみなり" in prompt
 
+    def test_battle_result_rule_when_present(self):
+        """battle_endで勝敗が確定していれば明言指示を出す（2026-07-30視聴fb#4）。"""
+        prompt = _build_vision_prompt(
+            self._context("battle_end", battle_result="勝ち"), [], self._battle_state())
+        assert "自分の勝ち" in prompt
+        assert "勝敗に触れること" in prompt
+
+    def test_no_battle_result_rule_when_absent(self):
+        prompt = _build_vision_prompt(self._context("battle_end"), [], self._battle_state())
+        assert "勝敗に触れること" not in prompt
+
+    def test_persona_self_name_and_perspective(self):
+        """自称くれぴ（花圓の誤読対策）と自分側視点の固定（2026-07-30視聴fb#1・#3）。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "「花圓」という漢字表記は実況文に書かないこと" in prompt
+        assert "自分側を応援する立場" in prompt
+        assert "今この瞬間に起きたこと" in prompt  # 視聴fb#5: 過去振り返り抑制
+
     def test_prompt_contains_turn_info(self):
         prompt = _build_vision_prompt(self._context(), [], self._battle_state(turn=5))
         assert "5" in prompt
@@ -472,6 +490,27 @@ def _valid_script_payload(**overrides):
 
 class TestBuildScriptPrompt:
 
+    def test_script_persona_self_name_and_perspective(self):
+        """台本パスにも自称くれぴ・視点固定が入る（2026-07-30視聴fb#1・#3）。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "「花圓」という漢字表記は実況文に書かないこと" in prompt
+        assert "自分側を応援する立場" in prompt
+        assert "推測で断定しない" in prompt
+
+    def test_moment_side_tag_rendered(self):
+        """瞬間ログのsideフィールドは📺行に【〜側】タグとして描画される
+        （同名ミラーの視点誤り対策・2026-07-30）。無い場合はタグなし（後方互換）。"""
+        payload = _valid_script_payload()
+        moments = [
+            {"time": 40.0, "kind": "move", "text": "T1:イダイトウのおはかまいり",
+             "side": "相手"},
+            {"time": 50.0, "kind": "move", "text": "T1:オオニューラのまもる"},
+        ]
+        prompt = _build_script_prompt(payload["gap"], payload["events"], moments)
+        assert "📺40.0秒 画面: 【相手側】T1:イダイトウのおはかまいり" in prompt
+        assert "📺50.0秒 画面: T1:オオニューラのまもる" in prompt
+
     def test_contains_visible_timeline_and_gap(self):
         payload = _valid_script_payload()
         prompt = _build_script_prompt(payload["gap"], payload["events"])
@@ -509,7 +548,7 @@ class TestBuildScriptPrompt:
         """★区間の行に区間長に応じた件数指定が入る（53秒区間→2件）。"""
         payload = _valid_script_payload()
         prompt = _build_script_prompt(payload["gap"], payload["events"])
-        assert "★78.0秒 〜 131.0秒 = 無言区間（ここにフィラーを2件）" in prompt
+        assert "★78.0秒 〜 131.0秒 = 無言区間（ここにフィラーを1件）" in prompt  # 53秒÷30秒/件
 
     def test_live_commentary_persona(self):
         """録画感を出さないライブ実況指示が入る。"""
@@ -553,10 +592,11 @@ class TestBuildScriptPrompt:
 class TestGapFillerCount:
 
     def test_scales_with_gap_length(self):
+        # 2026-07-30視聴fb「フィラーが多い」で30秒/件・上限3に減量
         assert _gap_filler_count(0.0, 15.0) == 1     # 短い区間は最低1件
-        assert _gap_filler_count(0.0, 53.0) == 2
-        assert _gap_filler_count(0.0, 100.0) == 5
-        assert _gap_filler_count(0.0, 300.0) == 5    # 上限5件
+        assert _gap_filler_count(0.0, 65.0) == 2
+        assert _gap_filler_count(0.0, 100.0) == 3
+        assert _gap_filler_count(0.0, 300.0) == 3    # 上限3件
 
 
 class TestParseScriptFillers:

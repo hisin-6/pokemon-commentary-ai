@@ -360,6 +360,8 @@ def _moves_by_pokemon(moments: list, until: float) -> dict:
     """瞬間ログから時刻 until までに判明した技をポケモン別に集計する。
 
     技が画面に映った瞬間に「?」が埋まる時刻同期表示のためのデータ。
+    値は (技名, 陣営) のリスト。陣営は瞬間ログの side フィールド
+    （"自分"/"相手"・2026-07-30〜）で、無い旧データは None。
     """
     moves: dict = {}
     for m in moments:
@@ -370,9 +372,19 @@ def _moves_by_pokemon(moments: list, until: float) -> dict:
             continue
         name, mv = match.groups()
         lst = moves.setdefault(name, [])
-        if mv not in lst and len(lst) < _PANEL_MOVES_MAX:
-            lst.append(mv)
+        if all(mv != known for known, _ in lst):
+            lst.append((mv, m.get("side")))
     return moves
+
+
+def _moves_for_side(moves_map: dict, name: str, side: str) -> list:
+    """パネルの陣営ブロック用に技リストを絞り込む。
+
+    陣営タグ付きの技は一致する側にのみ表示（同名ミラーの技混ざり対策）。
+    タグ無し（旧timeline・判定不能）は従来どおり両側に表示する。
+    """
+    return [mv for mv, s in moves_map.get(name, [])
+            if s is None or s == side][:_PANEL_MOVES_MAX]
 
 
 def _moves_lines(known: list) -> tuple:
@@ -391,7 +403,8 @@ def _panel_dialogues(start: float, end: float, state: dict | None,
     def dlg(layer: int, text: str) -> None:
         lines.append(f"Dialogue: {layer},{t0},{t1},Panel,,0,0,0,,{text}")
 
-    def side_block(label: str, label_color: str, entries: list, y_label: int) -> None:
+    def side_block(label: str, label_color: str, entries: list, y_label: int,
+                   side: str) -> None:
         dlg(1, f"{{\\pos({_PANEL_TEXT_X},{y_label})\\fs26\\1c{label_color}}}{label}")
         if not entries:
             dlg(1, f"{{\\pos({_PANEL_TEXT_X},{y_label + 36})\\fs24\\1c&H8899AA&}}情報収集中")
@@ -412,13 +425,13 @@ def _panel_dialogues(start: float, end: float, state: dict | None,
                 pct = max(0, min(100, int(pct)))
                 fill = max(1, round(_PANEL_BAR_W * pct / 100))
                 dlg(2, _panel_bar(_PANEL_TEXT_X, bar_y, fill, _hp_bar_color(pct)))
-            line1, line2 = _moves_lines(moves_map.get(p["name"], []))
+            line1, line2 = _moves_lines(_moves_for_side(moves_map, p["name"], side))
             dlg(1, f"{{\\pos({_PANEL_TEXT_X},{y + 62})\\fs22\\1c&HC8D8D8&}}{_ass_escape(line1)}")
             dlg(1, f"{{\\pos({_PANEL_TEXT_X},{y + 88})\\fs22\\1c&HC8D8D8&}}{_ass_escape(line2)}")
 
     if state:
-        side_block("相手の場", "&HB478FF&", state.get("opponent", []), 88)
-        side_block("自分の場", "&HFFC878&", state.get("player", []), 372)
+        side_block("相手の場", "&HB478FF&", state.get("opponent", []), 88, side="相手")
+        side_block("自分の場", "&HFFC878&", state.get("player", []), 372, side="自分")
         dlg(1, f"{{\\pos({_PANEL_TEXT_X},660)\\fs26\\1c&HFFFFFF&}}ターン {state.get('turn', '?')}")
     return lines
 
@@ -500,7 +513,8 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
                               avatar_width: int = _AVATAR_WIDTH,
                               avatar_chroma: str = _AVATAR_CHROMA,
                               avatar_similarity: float = _AVATAR_SIMILARITY,
-                              avatar_crop: str = None) -> list:
+                              avatar_crop: str = None,
+                              tail_pad: float = 0.0) -> list:
     """biim風レイアウト（案A）合成のffmpegコマンドを組み立てる。
 
     ゲーム画面を左上に縮小配置し、右サイドパネルの下地・下部実況帯を描画、
@@ -512,6 +526,11 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
     録画側の先頭をスキップする）。アバターが動画より短い場合は最終フレームで
     静止する（eof_action=repeat）。avatar_crop（"w:h:x:y"）指定時はスケール前に
     クロップし、全身録画から上半身だけを抜き出して拡大表示する。
+
+    tail_pad > 0 のとき、元動画の末尾を最終フレームの静止で tail_pad 秒延長する
+    （tpad=stop_mode=clone）。末尾の実況が動画終端をまたぐ場合に映像なしで音声
+    だけ流れるのを防ぐ。tpadはフィルタチェーン先頭（字幕・パネル描画の前段）に
+    置くため、延長区間でも字幕は時刻通りに表示・消滅する。
     """
     if avatar_video is not None and avatar_offset < 0:
         raise ValueError("avatar_offset は0以上（録画をWAV再生より先に開始する運用）")
@@ -520,9 +539,11 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
     band_w = 1920 - _BIIM_GAME_X * 2                   # 実況帯はフル幅（右パネルの下も使う）
     panel_x = _BIIM_GAME_X + _BIIM_GAME_W + 16         # 右パネルの左端
     panel_w = 1920 - panel_x - 16
+    tpad_part = (f"tpad=stop_mode=clone:stop_duration={tail_pad:.3f},"
+                 if tail_pad > 0 else "")
     video_filter = (
         # ゲーム画面を縮小し、パディングで1920x1080のキャンバスに配置
-        f"[0:v]scale={_BIIM_GAME_W}:{_BIIM_GAME_H},"
+        f"[0:v]{tpad_part}scale={_BIIM_GAME_W}:{_BIIM_GAME_H},"
         f"pad=1920:1080:{_BIIM_GAME_X}:{_BIIM_GAME_Y}:{_BIIM_BG_COLOR},"
         # ゲーム画面の枠線
         f"drawbox=x={_BIIM_GAME_X - 2}:y={_BIIM_GAME_Y - 2}:"
@@ -736,9 +757,17 @@ def main(argv=None) -> int:
                                        min_duration=video_dur)
     logger.info("実況トラック生成: %s（%.1f秒・動画長 %.1f秒）",
                 track_wav, track_end, video_dur)
-    if video_dur and track_end > video_dur:
-        logger.warning("実況トラック終端 %.1fs が動画長 %.1fs を超過"
-                       "（末尾の実況が映像より長く続きます）", track_end, video_dur)
+    tail_pad = max(0.0, track_end - video_dur) if video_dur else 0.0
+    if tail_pad > 0:
+        if args.layout == "biim":
+            logger.info("実況トラック終端 %.1fs が動画長 %.1fs を超過"
+                        "→末尾を最終フレーム静止で %.1f 秒延長します",
+                        track_end, video_dur, tail_pad)
+        else:
+            logger.warning("実況トラック終端 %.1fs が動画長 %.1fs を超過"
+                           "（plainは映像コピーのため延長不可・末尾の実況が"
+                           "映像より長く続きます。--layout biim なら延長されます）",
+                           track_end, video_dur)
 
     if args.layout == "biim":
         suffix = "_commentary_biim.mp4"
@@ -765,7 +794,8 @@ def main(argv=None) -> int:
                                         avatar_offset=args.avatar_offset,
                                         avatar_width=args.avatar_width,
                                         avatar_chroma=args.avatar_chroma,
-                                        avatar_crop=args.avatar_crop)
+                                        avatar_crop=args.avatar_crop,
+                                        tail_pad=tail_pad)
     else:
         if args.avatar_video:
             logger.error("--avatar-video は --layout biim でのみ使えます")
