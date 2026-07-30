@@ -409,6 +409,25 @@ class TestGetPokemonInfo:
         assert len(hidden) == 1
         assert "かえんほう" in hidden[0]
 
+
+class TestIsMoveLearnable:
+    """is_move_learnable: 技帰属の断片一致幽霊技対策で使う学習可能技チェック。"""
+
+    def test_true_for_learnable_move(self, clf):
+        assert clf.is_move_learnable("ピカチュウ", "かみなり") is True
+
+    def test_false_for_unlearnable_move(self, clf):
+        # ピカチュウは「ムーンフォース」を覚えない（エルフーンの技）
+        assert clf.is_move_learnable("ピカチュウ", "ムーンフォース") is False
+
+    def test_true_when_pokemon_unknown(self, clf):
+        """判定不能（ポケモン名が解決できない）時は誤ってtentative化しないよう True 側に倒す。"""
+        assert clf.is_move_learnable("存在しないポケモン12345", "かみなり") is True
+
+    def test_true_when_pokemon_has_no_move_data(self, clf):
+        """pokemon_movesにエントリが無いポケモン（テストDBのゴリランダー）でも True 側に倒す。"""
+        assert clf.is_move_learnable("ゴリランダー", "かみなり") is True
+
     def test_moves_list_populated(self, clf):
         info = clf.get_pokemon_info("ピカチュウ")
         assert len(info["moves"]) >= 1

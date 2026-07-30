@@ -1151,7 +1151,13 @@ class TestTryRegisterRosterFallback:
         assert self.runner._move_log == []
 
     def test_truncated_roster_name_is_corrected_via_suffix_match(self):
-        """既知ロスター「ドドゲザン」への見切れ断片「ドゲザン」はロスター名に補正して登録される。"""
+        """既知ロスター「ドドゲザン」への見切れ断片「ドゲザン」はロスター名に補正して登録される。
+
+        ただし断片一致幽霊技対策（2026-07-30）により、ロスター名前方一致救済を経由した
+        登録は tentative（「推定」）扱いになる——「ドドゲザンのドゲザン」は個別には
+        正当に見えても、OCR断片が偶然どちらも実在名として通ってしまった可能性を
+        否定できないため。
+        """
         self.runner._battle_tracker._opponent.append(
             FieldPokemon(name="ドドゲザン", on_field=True)
         )
@@ -1159,6 +1165,35 @@ class TestTryRegisterRosterFallback:
         events = [_ocr("ドゲザンの", y_center=800.0), _ocr("ドゲザン", y_center=800.0)]
         Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
         assert self.runner._move_log == ["T0:ドドゲザンのドゲザン"]
+        assert len(self.runner._tentative_opponent_moves) == 1
+        assert self.runner._tentative_opponent_moves[0]["fallback_pokemon"] == "ドドゲザン"
+
+    def test_direct_match_with_unlearnable_move_becomes_tentative(self):
+        """ロスター前方一致救済を経由せず直接分類できた場合でも、そのポケモンが
+        学習できない技だと判明したら tentative 扱いにする（断片一致幽霊技対策の
+        もう一方の柱: pokemon_moves による学習可能技チェック）。"""
+        self.runner._battle_tracker._opponent.append(
+            FieldPokemon(name="ガブリアス", on_field=True)
+        )
+        self._set_classifier(moves={"ハイドロポンプ"}, pokemon={"ガブリアス": "ガブリアス"})
+        self.runner._classifier.is_move_learnable.return_value = False
+        events = [_ocr("ガブリアスの", y_center=800.0), _ocr("ハイドロポンプ", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+        assert self.runner._move_log == ["T0:ガブリアスのハイドロポンプ"]
+        assert len(self.runner._tentative_opponent_moves) == 1
+
+    def test_direct_match_with_learnable_move_is_not_tentative(self):
+        """直接分類できて学習可能技リストにも合致する通常ケースは tentative 扱いにしない
+        （回帰ガード: 断片一致幽霊技対策が普通の登録まで過剰にtentative化しないこと）。"""
+        self.runner._battle_tracker._opponent.append(
+            FieldPokemon(name="ガブリアス", on_field=True)
+        )
+        self._set_classifier(moves={"じだんだ"}, pokemon={"ガブリアス": "ガブリアス"})
+        self.runner._classifier.is_move_learnable.return_value = True
+        events = [_ocr("ガブリアスの", y_center=800.0), _ocr("じだんだ", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+        assert self.runner._move_log == ["T0:ガブリアスのじだんだ"]
+        assert self.runner._tentative_opponent_moves == []
 
     def test_opponent_move_from_unregistered_pokemon_calibrates_roster(self):
         """技ログにだけ記録されロスター未登録の相手ポケモンは、技検出と同時に

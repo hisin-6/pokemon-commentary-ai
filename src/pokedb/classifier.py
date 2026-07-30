@@ -312,6 +312,36 @@ class PokeClassifier:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def is_move_learnable(self, pokemon_name_ja: str, move_name_ja: str) -> bool:
+        """指定ポケモンが指定の技を pokemon_moves（学習可能技の全件データ）上で
+        習得可能か判定する。`get_pokemon_info`の代表技（RAG用に上位技のみ）とは
+        異なり、全件を対象にする。
+
+        技ログの技帰属（`src/pipeline.py`の`_try_register`）で、OCR断片同士が
+        偶然どちらも実在名として通ってしまう「幽霊技」（例: 「ドドゲザンのドゲザン」
+        ——断片「ドゲザン」がポケモン名の見切れとしても技名としても実在するケース）
+        を検出する追加シグナルとして使う。
+
+        ポケモン名が解決できない場合、または該当ポケモンの学習可能技データが
+        そもそも1件も無い（DBの取得漏れ等でデータ自体が欠けている）場合は True を
+        返す（判定不能を「学習可能」寄りに倒し、誤って過剰にtentative化しない
+        ための安全側）。
+        """
+        row = self._pokemon_rows.get(pokemon_name_ja)
+        if not row:
+            return True
+        has_any_moves = self._conn.execute(
+            "SELECT 1 FROM pokemon_moves WHERE pokemon_id = ? LIMIT 1", (row["id"],)
+        ).fetchone()
+        if not has_any_moves:
+            return True
+        result = self._conn.execute(
+            "SELECT 1 FROM pokemon_moves pm JOIN moves m ON pm.move_id = m.id "
+            "WHERE pm.pokemon_id = ? AND m.name_ja = ?",
+            (row["id"], move_name_ja),
+        ).fetchone()
+        return result is not None
+
     # ── ユーティリティ ────────────────────────────────────────────────────────
 
     def is_pokemon(self, text: str) -> bool:

@@ -3817,7 +3817,9 @@ class Pipeline:
         def _try_register(pokemon_name: str, move_candidate: str, is_opponent: bool = False, tentative: bool = False) -> bool:
             """ポケモン名+技名候補を検証して _move_log に登録。登録したら True を返す。
             is_opponent=True の場合は update_move で相手チームのみを検索する。
-            tentative=True の場合は後付け修正の対象として _tentative_opponent_moves に記録する。
+            tentative=True（呼び出し元指定、またはロスター名前方一致救済経由／学習不可能技
+            だった場合に内部で昇格）の場合は「（推定）」表示＋後付け修正の対象として
+            _tentative_opponent_moves に記録する。
             """
             pokemon_name = pokemon_name.strip().rstrip("！!」、")
             move_candidate = move_candidate.strip().rstrip("！!」、")
@@ -3825,6 +3827,12 @@ class Pipeline:
                 return False
             if not move_candidate or len(move_candidate) < 3:
                 return False
+            # ロスター名前方一致救済（下記）を経由した場合や、解決したポケモンの
+            # 学習可能技リストに無い技だった場合は tentative 扱いにする
+            # （断片一致幽霊技対策: 「ドドゲザンのドゲザン」のように、OCR断片が
+            # ポケモン名の見切れとしても技名としても偶然どちらも実在名として通って
+            # しまうケースは、個別の検証だけでは正当な登録と区別できないため）
+            via_roster_fallback = False
             if self._classifier:
                 # ポケモン名を正規化（OCR揺らぎ補正: 例 イエツサン → イエッサン）
                 # entry の重複チェックを確実に機能させるため、技名分類より先に実施する
@@ -3851,6 +3859,7 @@ class Pipeline:
                         log.info("[技ログ] 使用者名候補 %s はロスターの %s の見切れ断片と判定 → 補正",
                                  pokemon_name, matched)
                         pokemon_name = matched
+                        via_roster_fallback = True
                     else:
                         log.debug("[技ログ] 使用者名候補 %s を分類・ロスター一致とも失敗のため棄却（技候補: %s）",
                                   pokemon_name, move_candidate)
@@ -3881,6 +3890,8 @@ class Pipeline:
                 if len(result.canonical_ja) > len(move_candidate) * 1.5:
                     return False
                 move_name = result.canonical_ja or move_candidate
+                if via_roster_fallback or not self._classifier.is_move_learnable(pokemon_name, move_name):
+                    tentative = True
             else:
                 move_name = move_candidate
             # dense scan 起点ターンが設定されている場合はそれを優先する。
