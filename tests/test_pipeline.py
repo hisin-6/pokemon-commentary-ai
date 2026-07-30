@@ -1179,6 +1179,85 @@ class TestTryRegisterRosterFallback:
         assert any(s.name == "ガブリアス" for s in self.runner._battle_tracker._opponent)
 
 
+class TestOpponentAttackFallbackAmbiguity:
+    """_get_active_opponent_name の「場の1匹目」フォールバックの曖昧さ対策。
+
+    実機で「ソーラービーム→フシギバナ」等、ダブルバトルで2匹とも場に出ている時に
+    技の使い手を特定できないケースで決め打ちの1匹目に誤帰属していたバグの再発防止。
+    使い手が一意に絞れない場合は登録を諦める（誤タグよりタグ無しの方が安全）。
+    """
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._tentative_opponent_moves = []
+        self.runner._battle_active = True
+        self.runner._dense_scan_start_turn = None
+        self.runner._move_log = []
+        self.runner._MAX_MOVE_LOG = 8
+        self.runner._dense_scan_remaining = 0
+        self.runner._last_full_ocr_results = []
+
+    def _set_classifier(self, moves, pokemon):
+        class _Result:
+            def __init__(self, category, score, canonical_ja):
+                self.category = category
+                self.score = score
+                self.canonical_ja = canonical_ja
+
+        def classify(text):
+            if text in moves:
+                return _Result("move", 95, text)
+            if text in pokemon:
+                return _Result("pokemon", 95, pokemon[text])
+            return _Result("other", 0, text)
+
+        clf = MagicMock()
+        clf.classify.side_effect = classify
+        self.runner._classifier = clf
+
+    # 「相手の」の直後に使い手名トークンが無く、_find_attacker_from_full_ocr が
+    # 空振りするメッセージ（実機の「相手の[技名]」形式の圧縮表示を想定）
+    _AMBIGUOUS_EVENTS = [
+        _ocr("あいて", y_center=800.0),
+        _ocr("相手の", y_center=800.0),
+        _ocr("じだんだ!", y_center=800.0),
+    ]
+
+    def test_single_on_field_still_registers_tentatively(self):
+        """場に1匹しかいなければ、その1匹に仮登録する（従来通りの挙動を維持）。"""
+        self.runner._battle_tracker._opponent.append(
+            FieldPokemon(name="ガブリアス", on_field=True)
+        )
+        self._set_classifier(moves={"じだんだ"}, pokemon={})
+        Pipeline._update_move_log(self.runner, self._AMBIGUOUS_EVENTS, is_main_ocr=True)
+        assert self.runner._move_log == ["T0:ガブリアスのじだんだ"]
+
+    def test_two_on_field_does_not_guess(self):
+        """ダブルバトルで2匹とも場に出ている場合、使い手を決め打ちせず未登録のままにする。"""
+        self.runner._battle_tracker._opponent.append(
+            FieldPokemon(name="フシギバナ", on_field=True)
+        )
+        self.runner._battle_tracker._opponent.append(
+            FieldPokemon(name="ガブリアス", on_field=True)
+        )
+        self._set_classifier(moves={"じだんだ"}, pokemon={})
+        Pipeline._update_move_log(self.runner, self._AMBIGUOUS_EVENTS, is_main_ocr=True)
+        assert self.runner._move_log == []
+
+    def test_two_on_field_but_one_fainted_is_unambiguous(self):
+        """2匹登録済みでも片方が気絶済みなら、場にいるのは実質1匹なので登録する。"""
+        self.runner._battle_tracker._opponent.append(
+            FieldPokemon(name="フシギバナ", on_field=False, fainted=True)
+        )
+        self.runner._battle_tracker._opponent.append(
+            FieldPokemon(name="ガブリアス", on_field=True)
+        )
+        self._set_classifier(moves={"じだんだ"}, pokemon={})
+        Pipeline._update_move_log(self.runner, self._AMBIGUOUS_EVENTS, is_main_ocr=True)
+        assert self.runner._move_log == ["T0:ガブリアスのじだんだ"]
+
+
 class TestResetBattleState:
     """_reset_battle_state: battle_start／遅延起動共通のリセット処理。
     遅延起動が前試合ロスターのまま走り新試合の繰り出しで eviction 連発していた

@@ -3933,12 +3933,18 @@ class Pipeline:
             return False
 
         def _get_active_opponent_name() -> str | None:
-            """場に出ている相手ポケモン名を返す（複数いる場合は1匹目）。
+            """場に出ている相手ポケモン名を返す（1匹だけ確定している場合に限る）。
             「相手の[技]」のように相手名がROI外でトークン未取得の場合の代替用。
+
+            ダブルバトルで2匹とも場に出ている場合、以前は決め打ちで1匹目を返して
+            いたため、実際は2匹目が使った技を1匹目の技として誤登録するケースが
+            あった（実機: ソーラービーム→フシギバナ等3件）。使い手を一意に絞れない
+            場合は None を返し、技ログへの登録自体を諦める（誤帰属よりタグ無しの
+            方が安全という方針・set_not_on_field/move_user_side と同じ考え方）。
             """
             on_field_o = [p for p in self._battle_tracker._opponent
                           if p.on_field and not p.fainted]
-            return on_field_o[0].name if on_field_o else None
+            return on_field_o[0].name if len(on_field_o) == 1 else None
 
         def _find_attacker_from_full_ocr() -> str | None:
             """全OCR結果（ROI外含む）から「Xの」形式の相手ポケモン名トークンを探す。
@@ -4055,7 +4061,8 @@ class Pipeline:
             attacker = _find_attacker_from_full_ocr()
             if attacker:
                 return _try_register(attacker, cleaned_cand, is_opponent=True)
-            # フォールバック: 場の1匹目を使い手とする（仮確定・後付け修正の対象）
+            # フォールバック: 場に1匹しかいなければ仮確定（仮確定・後付け修正の対象）。
+            # 2匹とも場にいる場合は _get_active_opponent_name が None を返すため未登録のまま
             fallback = _get_active_opponent_name()
             if fallback:
                 return _try_register(fallback, cleaned_cand, is_opponent=True, tentative=True)
