@@ -116,6 +116,23 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
    - アバター録画が動画より短い場合は最終フレームで静止（正常動作）
    - **offsetは0以上のみ**（録画を先に始める運用で統一）。詳細: `docs/design/v2c-avatar-design.md`
 
+### サムネイル自動生成（改善ロードマップ⑥・任意・WSL）
+
+パス1の素材（manifest.jsonl・states.jsonl）から「盛り上がった瞬間」
+（battle_end > faint(KO) > HP急変の優先度）を機械的に選び、元動画の該当フレームに
+その瞬間の実況テキストを焼き込んだサムネイルPNGを出力する。パス2とは独立（動画本体
+の合成をやり直さなくてもサムネイルだけ再生成できる）。
+
+```
+python3 scripts/generate_thumbnail.py renders/<動画名>                    # 自動選択
+python3 scripts/generate_thumbnail.py renders/<動画名> --time 230.5 --label "きめ台詞！"  # 手動指定
+```
+
+- 出力: `renders/<動画名>/thumbnail.png`（`--out`で変更可）
+- 元動画パスは`render_info.json`から自動解決（D:\...→/mnt/d/...変換込み）。`--video`で上書き可
+- HP急変の検出閾値（既定30pt）は`--hp-swing-threshold`で調整可
+- 自動選択が微妙な場合は`--time`/`--label`で手動指定するのが手っ取り早い
+
 ## 合成後の検証チェックリスト（必ずやる）
 
 1. **スケジュール確認**: `renders/<動画名>/schedule.json` の `scheduled` を時刻順に見る。
@@ -169,8 +186,8 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | `_hp_bar_color` | 緑>50/黄>20/赤 | HPバー3色（ゲーム準拠） |
 | `_FILLER_MAX_SHIFT_SEC` | 12 | フィラー配置の最大ずれ（大きくするとネタバレ防御が弱まる） |
 | `_DEFAULT_GAIN` | 1.4 | 実況音量。ゲーム音とのバランスは`--gain`で上書き可 |
-| server.py `_gap_filler_count` | 30秒/件・上限3 | フィラー密度（変更はEC2再デプロイ必要）。18秒/件・上限5→2026-07-30視聴fb「多い」で減量 |
-| generate_gap_commentary.py `_DEFAULT_MIN_GAP_SEC` | 30秒 | フィラー対象とする最小無言秒数（`--min-gap`で上書き可） |
+| server.py `_gap_filler_count` | 25秒/件・上限4 | フィラー密度（変更はEC2再デプロイ必要）。18秒/件・上限5→2026-07-30視聴fb「多い」で30秒/件・上限3に減量→同日中「もう少し増やしたい」で25秒/件・上限4に再調整 |
+| generate_gap_commentary.py `_DEFAULT_MIN_GAP_SEC` | 25秒 | フィラー対象とする最小無言秒数（`--min-gap`で上書き可）。同上の再調整で30秒→25秒 |
 
 パネル下部（y660以降）と画面右下はv2c（アバター）用に空けてある。
 
@@ -182,7 +199,7 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 
 ## 関連ファイル
 
-- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック）・`src/api/server.py`（`/api/script`・プロンプト）・`scripts/generate_gap_commentary.py`・`scripts/render_commentary_video.py`・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）
+- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック）・`src/api/server.py`（`/api/script`・プロンプト）・`scripts/generate_gap_commentary.py`・`scripts/render_commentary_video.py`・`scripts/generate_thumbnail.py`（サムネイル自動生成）・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）
 - テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_server.py`（TestScript系）
 - 設計: `docs/adr/ADR-009-video-first-commentary.md`・レイアウト原案 `docs/design/frame-mockups/mockup_A_biim.png`
 - 経緯・実測値: `docs/daily/2026-07-14.md`

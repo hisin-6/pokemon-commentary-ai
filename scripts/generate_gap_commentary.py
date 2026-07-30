@@ -39,7 +39,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 logger = logging.getLogger(__name__)
 
 # この秒数を超える無言区間をフィラーの対象にする
-_DEFAULT_MIN_GAP_SEC = 30.0  # 2026-07-30視聴fb「フィラーが多い」で20→30秒に引き上げ
+_DEFAULT_MIN_GAP_SEC = 25.0  # 2026-07-30視聴fb「フィラーが多い」で20→30秒に引き上げ→
+                             # その後「もう少し増やしたい」で25秒に再調整
 # ギャップ端の余白（イベント実況の直前直後にフィラーを密着させない）
 _GAP_MARGIN_SEC = 2.0
 

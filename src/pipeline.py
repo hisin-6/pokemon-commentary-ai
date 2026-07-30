@@ -1916,15 +1916,25 @@ class BattleStateTracker:
     def set_not_on_field(self, pokemon_name: str) -> bool:
         """指定ポケモンを場から降ろす（交代・とんぼがえり検出時に呼ぶ）。
         見つかった場合は True を返す。
+
+        「〜は戻っていく」メッセージには陣営を示すプレフィックスが無く（faintの
+        「相手の」やswitch_outの「引っこめた」形式のような手がかりが無い）、
+        同名ミラー戦では両陣営に一致する場に出ているスロットが存在しうる。
+        従来は自分側→相手側の走査順で先に見つかった方を無条件に降ろしていたため、
+        実際は相手の交代なのに自分側を誤ベンチ化する（逆も同様）曖昧さがあった。
+        一致する「場に出ている」スロットが2つ以上ある場合は判定不能とみなし、
+        誤ベンチ化を避けるため何もしない（move_user_side と同じ「誤タグより
+        タグ無しの方が安全」の方針）。
         """
         # fuzzy マッチ（OCR誤読でポケモン名が少し違う場合も対応）
-        for side in (self._player, self._opponent):
-            for slot in side:
-                # 完全一致 or 片方がもう一方に含まれる（OCR部分読み対応）
-                if slot.name == pokemon_name or slot.name in pokemon_name or pokemon_name in slot.name:
-                    if slot.on_field:
-                        slot.on_field = False
-                        return True
+        def _match(slot: FieldPokemon) -> bool:
+            return slot.name == pokemon_name or slot.name in pokemon_name or pokemon_name in slot.name
+
+        on_field_matches = [slot for side in (self._player, self._opponent)
+                            for slot in side if _match(slot) and slot.on_field]
+        if len(on_field_matches) == 1:
+            on_field_matches[0].on_field = False
+            return True
         return False
 
     # ── メッセージ由来イベント ────────────────────────────────────────────────

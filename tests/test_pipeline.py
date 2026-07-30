@@ -744,6 +744,27 @@ class TestBattleStateTracker:
         result = self.tracker.set_not_on_field("存在しないポケモン")
         assert result is False
 
+    def test_set_not_on_field_mirror_ambiguous_does_nothing(self):
+        """同名ミラーで両陣営とも場に出ている場合、陣営を示す手がかりが
+        テキストに無いため誤ベンチ化を避けて何もしない（両方とも on_field のまま）。"""
+        gs = _make_game_state(player_names=["イダイトウ"], opponent_names=["イダイトウ"])
+        _register(self.tracker, gs)
+        result = self.tracker.set_not_on_field("イダイトウ")
+        assert result is False
+        assert all(s.on_field for s in self.tracker._player if s.name == "イダイトウ")
+        assert all(s.on_field for s in self.tracker._opponent if s.name == "イダイトウ")
+
+    def test_set_not_on_field_mirror_one_benched_still_works(self):
+        """同名ミラーでも片方が既にベンチにいれば、場に出ている方だけを一意に降ろせる。"""
+        gs = _make_game_state(player_names=["イダイトウ"], opponent_names=["イダイトウ"])
+        _register(self.tracker, gs)
+        opp_slot = next(s for s in self.tracker._opponent if s.name == "イダイトウ")
+        opp_slot.on_field = False
+        result = self.tracker.set_not_on_field("イダイトウ")
+        assert result is True
+        player_slot = next(s for s in self.tracker._player if s.name == "イダイトウ")
+        assert player_slot.on_field is False
+
     def test_pokemon_removed_from_field_after_miss_threshold(self):
         """_ON_FIELD_MISS_THRESHOLD ターン以上不検出なら場から降ろす。"""
         gs = _make_game_state(player_names=["ピカチュウ"])

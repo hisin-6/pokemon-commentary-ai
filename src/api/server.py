@@ -234,12 +234,13 @@ def _parse_commentary(text: str) -> tuple[str, str]:
 
 
 def _gap_filler_count(start: float, end: float) -> int:
-    """無言区間の長さから生成するフィラーの目安件数を決める（約30秒に1件・1〜3件）。
+    """無言区間の長さから生成するフィラーの目安件数を決める（約25秒に1件・1〜4件）。
 
     2026-07-14に「とてもしゃべらせたい」で25秒→18秒へ増量したが、
     2026-07-30の視聴フィードバック「フィラーが多い」で30秒/件・上限3へ減量。
+    その後「もう少し増やしたい」で25秒/件・上限4へ再調整（2026-07-30続き）。
     """
-    return max(1, min(3, int((end - start) // 30)))
+    return max(1, min(4, int((end - start) // 25)))
 
 
 def _build_script_prompt(gap: dict, events: list, moments: list = None) -> str:
