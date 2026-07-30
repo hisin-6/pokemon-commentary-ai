@@ -945,6 +945,22 @@ class TestBattleMessageParser:
         events = self.parser.parse(_msg_ocr("相手の", "イダイトウに", "効果は", "いまひとつだ"))
         assert self._statuses(events) == []
 
+    def test_titled_opponent_switch_in_not_truncated_by_msg_x_max(self):
+        """称号付き交代メッセージ（例:「rixohは ランクマスタ ガブリアスを 繰り出した!」）で
+        文末「繰り出した!」がMSG_X_MAXを超えて欠落しない（実機07-00-19: ガブリアス消失バグの
+        回帰ガード）。実際のbbox座標（診断JSONLフレーム5965）を再現。"""
+        events = self.parser.parse([
+            {"text": "rixohは", "confidence": 1.0,
+             "bbox": [[328, 818], [408, 818], [408, 848], [328, 848]]},
+            {"text": "ランクマスタ", "confidence": 0.673,
+             "bbox": [[376, 883], [456, 883], [456, 913], [376, 913]]},
+            {"text": "ガブリアスを", "confidence": 0.636,
+             "bbox": [[677, 883], [757, 883], [757, 913], [677, 913]]},
+            {"text": "繰り出した!", "confidence": 1.0,
+             "bbox": [[931, 884], [1011, 884], [1011, 914], [931, 914]]},
+        ])
+        assert ("opponent_switch_in", "ガブリアス") in self._types(events)
+
 
 class TestMarkBenchBySide:
     """mark_bench_by_name の side 限定（同名ミラー戦の誤ベンチ化防止）"""

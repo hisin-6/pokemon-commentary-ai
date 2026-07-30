@@ -903,7 +903,17 @@ class BattleMessageParser:
     """
 
     MSG_X_MIN  = 120   # メッセージボックス左端マージン
-    MSG_X_MAX  = 900   # チャンピオンズ対応: メッセージが画面中央まで広がるため 520→900 に拡張
+    # チャンピオンズ対応: メッセージが画面中央まで広がるため 520→900 に拡張（2026-04-18）。
+    # 900→1150（2026-07-30）: 「(トレーナー名)は (称号) (ポケモン名)を 繰り出した!」形式
+    # （称号はゲーム内の正規表示・OCR誤読ではない）で称号の分だけ末尾が右へ伸び、
+    # 「繰り出した!」がROI外（cx>900）に切り捨てられて交代検出が丸ごと失敗していた
+    # （実機: 07-00-19のガブリアス消失バグの真因）。診断JSONL6本の実データで
+    # 「繰り出した!」の最大出現cxは1129だったため、余裕を見て1150に拡張。
+    # 6本全数リプレイで新規イベント9件（すべて称号付き交代の正しい検出）・
+    # 誤検出0件・既存イベントの欠落0件を確認済み（コマンド選択画面の技名・
+    # 効果テキストは同y帯に存在するが、メッセージ表示中のフレームとは
+    # 排他的なため実害なし）。
+    MSG_X_MAX  = 1150
     MSG_Y_MIN  = 740
     MSG_Y_MAX  = 930
     DEDUP_TTL  = 8.0   # 同一イベントの重複発火を防ぐ秒数
@@ -3050,7 +3060,7 @@ class Pipeline:
                             log.debug("[密集OCR] dense scan 終了 → 起点ターンをリセット")
                     _D_Y1 = BattleMessageParser.MSG_Y_MIN   # 740
                     _D_Y2 = BattleMessageParser.MSG_Y_MAX   # 930
-                    _D_X2 = BattleMessageParser.MSG_X_MAX   # 520
+                    _D_X2 = BattleMessageParser.MSG_X_MAX   # 1150
                     msg_roi = frame[_D_Y1:_D_Y2, 0:_D_X2]
                     dense_raw = run_ocr(self._reader, msg_roi, preprocess_dense=True)
                     # bbox y座標をオリジナルフレーム座標系にオフセット補正
