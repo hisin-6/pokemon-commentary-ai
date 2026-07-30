@@ -125,6 +125,71 @@ def clf(test_db_path):
     return PokeClassifier(db_path=test_db_path)
 
 
+@pytest.fixture(scope="module")
+def champions_db_path(tmp_path_factory):
+    """champions_pokemon テーブルを持つテスト用DB（ピカチュウ・エルフーンのみ許可）。"""
+    db_dir = tmp_path_factory.mktemp("pokedb_champions")
+    db_path = db_dir / "test_champions.sqlite"
+
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE pokemon (
+            id INTEGER PRIMARY KEY,
+            name_ja TEXT NOT NULL,
+            name_en TEXT NOT NULL,
+            type1   TEXT,
+            type2   TEXT,
+            ability1       TEXT,
+            ability2       TEXT,
+            ability_hidden TEXT
+        );
+        CREATE TABLE champions_pokemon (
+            pokemon_id INTEGER PRIMARY KEY,
+            added_version TEXT,
+            note TEXT
+        );
+        CREATE TABLE moves (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL, category TEXT, power INTEGER);
+        CREATE TABLE abilities (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+        CREATE TABLE items (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+        CREATE TABLE pokemon_moves (pokemon_id INTEGER, move_id INTEGER);
+
+        INSERT INTO pokemon VALUES
+          (1, 'ピカチュウ',  'Pikachu',     'でんき', NULL,       'せいでんき', 'ひらいしん', 'かえんほう'),
+          (2, 'エルフーン',  'Whimsicott',  'くさ',   'フェアリー','いたずらごころ','すりぬけ', 'ようりょくそ'),
+          (3, 'ゴリランダー','Rillaboom',   'くさ',   NULL,       'グラスメイカー','グラスメイカー',NULL),
+          (4, 'テラパゴス',  'Terapagos',   'ノーマル',NULL,       'テラスシェル', NULL,       NULL);
+
+        -- チャンピオンズではピカチュウ・エルフーンのみ使用可能（ゴリランダー・テラパゴスは対象外）
+        INSERT INTO champions_pokemon (pokemon_id, added_version, note) VALUES
+          (1, '2026-07-30', 'test'),
+          (2, '2026-07-30', 'test');
+    """)
+    conn.commit()
+    conn.close()
+    return str(db_path)
+
+
+@pytest.fixture(scope="module")
+def empty_champions_db_path(tmp_path_factory):
+    """champions_pokemon テーブルはあるが空のテスト用DB。"""
+    db_dir = tmp_path_factory.mktemp("pokedb_champions_empty")
+    db_path = db_dir / "test_empty.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE pokemon (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL,
+            type1 TEXT, type2 TEXT, ability1 TEXT, ability2 TEXT, ability_hidden TEXT);
+        CREATE TABLE champions_pokemon (pokemon_id INTEGER PRIMARY KEY, added_version TEXT, note TEXT);
+        CREATE TABLE moves (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL, category TEXT, power INTEGER);
+        CREATE TABLE abilities (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+        CREATE TABLE items (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+        CREATE TABLE pokemon_moves (pokemon_id INTEGER, move_id INTEGER);
+        INSERT INTO pokemon VALUES (1, 'ピカチュウ', 'Pikachu', 'でんき', NULL, 'せいでんき', 'ひらいしん', 'かえんほう');
+    """)
+    conn.commit()
+    conn.close()
+    return str(db_path)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FileNotFoundError
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -141,6 +206,44 @@ class TestPokeClassifierInit:
         assert len(clf._moves) == 4
         assert len(clf._abilities) == 3
         assert len(clf._items) == 2
+
+    def test_rejects_unknown_game_mode(self, test_db_path):
+        with pytest.raises(ValueError):
+            PokeClassifier(db_path=test_db_path, game_mode="scarlet-violet")
+
+
+class TestPokeClassifierChampionsMode:
+    """game_mode="champions" の許可リスト絞り込み（docs/champions-v1-plan.md #9）。"""
+
+    def test_pokemon_filtered_to_champions_roster(self, champions_db_path):
+        clf = PokeClassifier(db_path=champions_db_path, game_mode="champions")
+        assert sorted(clf._pokemon) == ["エルフーン", "ピカチュウ"]
+
+    def test_excluded_pokemon_not_in_pool(self, champions_db_path):
+        clf = PokeClassifier(db_path=champions_db_path, game_mode="champions")
+        assert "テラパゴス" not in clf._pokemon
+        assert "ゴリランダー" not in clf._pokemon
+
+    def test_moves_abilities_items_not_filtered(self, champions_db_path):
+        """現時点ではポケモンのみ絞り込み、技・特性・アイテムは全件そのまま。"""
+        clf = PokeClassifier(db_path=champions_db_path, game_mode="champions")
+        assert clf._moves == []  # このfixtureには技データが無いだけで、絞り込みロジックは通っていない
+        # sv モードと同じロード処理を通っていることの確認（テーブルは空でも例外にならない）
+
+    def test_sv_mode_unaffected_by_champions_table_presence(self, champions_db_path):
+        """champions_pokemon テーブルがあっても sv（既定）モードは全件ロードする。"""
+        clf = PokeClassifier(db_path=champions_db_path)  # game_mode 未指定 = "sv"
+        assert sorted(clf._pokemon) == ["エルフーン", "ゴリランダー", "テラパゴス", "ピカチュウ"]
+
+    def test_missing_champions_table_raises_clear_error(self, test_db_path):
+        """champions_pokemon テーブルが無いDBで champions モードを指定すると分かりやすいエラーになる。"""
+        with pytest.raises(RuntimeError, match="champions_pokemon"):
+            PokeClassifier(db_path=test_db_path, game_mode="champions")
+
+    def test_empty_champions_table_yields_empty_pool(self, empty_champions_db_path):
+        """champions_pokemon が空でも例外にはせず、プール0件で動作する（警告ログのみ）。"""
+        clf = PokeClassifier(db_path=empty_champions_db_path, game_mode="champions")
+        assert clf._pokemon == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

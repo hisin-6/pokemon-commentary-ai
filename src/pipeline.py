@@ -2591,6 +2591,7 @@ class Pipeline:
         video_path: str | None = None,
         video_sample_fps: float = 2.0,
         render_out: str | None = None,
+        game_mode: str = "sv",
     ):
         log.info("=== パイプライン初期化 ===")
 
@@ -2683,9 +2684,9 @@ class Pipeline:
         self._skip_next_turn_start: bool = False  # faint統合でgame_turnを繰り上げた後、直後のturn_startをスキップするフラグ
 
         # PokeDB 分類器（DB がなければ None でフォールバック動作）
-        log.info("PokeClassifier 初期化中...")
+        log.info("PokeClassifier 初期化中（game_mode=%s）...", game_mode)
         try:
-            self._classifier: PokeClassifier | None = PokeClassifier()
+            self._classifier: PokeClassifier | None = PokeClassifier(game_mode=game_mode)
         except FileNotFoundError as e:
             log.warning("PokeDB が見つからないため手動フィルターで動作: %s", e)
             self._classifier = None
@@ -4207,6 +4208,10 @@ def main() -> None:
                         help="実況動画レンダリング素材の出力ディレクトリ（ADR-009 パス1）。"
                              "指定時は実況音声を再生せず WAV + manifest.jsonl を保存する。"
                              "--input（動画モード）との併用を想定。")
+    parser.add_argument("--game-mode", default="sv", choices=["sv", "champions"],
+                        help="PokeClassifier のポケモン fuzzy マッチ対象（デフォルト: sv=全1025匹）。"
+                             "'champions' 指定時は champions_pokemon テーブルの許可リストのみに絞り込む"
+                             "（要 scripts/update_champions_roster.py によるデータ投入）。")
 
     args = parser.parse_args()
 
@@ -4224,6 +4229,7 @@ def main() -> None:
         video_path=args.input,
         video_sample_fps=args.video_fps,
         render_out=args.render_out,
+        game_mode=args.game_mode,
     )
     pipeline.run()
 

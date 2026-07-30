@@ -156,6 +156,16 @@ CREATE TABLE IF NOT EXISTS pokemon_moves (
     PRIMARY KEY (pokemon_id, move_id)
 );
 
+-- ポケモンチャンピオンズで使用可能な pokemon_id の許可リスト（game_mode="champions" 用）。
+-- pokemon テーブルは削除・変更せず共用し、このテーブルへの追加だけで対応する
+-- （データ投入はローカル管理のスクリプトで行う）。
+CREATE TABLE IF NOT EXISTS champions_pokemon (
+    pokemon_id     INTEGER PRIMARY KEY,
+    added_version  TEXT,   -- 取り込み日（例: "2026-07-30"）。ゲーム内バージョン文字列は非公開のため代用
+    note           TEXT,   -- データ取得元・補足
+    FOREIGN KEY (pokemon_id) REFERENCES pokemon(id)
+);
+
 -- 検索用インデックス（rapidfuzz のスコアリング前にある程度絞り込む用）
 CREATE INDEX IF NOT EXISTS idx_pokemon_name_ja ON pokemon(name_ja);
 CREATE INDEX IF NOT EXISTS idx_pokemon_name_en ON pokemon(name_en);

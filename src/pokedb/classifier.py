@@ -83,13 +83,24 @@ class PokeClassifier:
     起動時に全レコードをメモリに展開するため、初期化は一度だけ行うこと。
     """
 
-    def __init__(self, db_path: str | Path = "data/pokedb.sqlite"):
+    def __init__(self, db_path: str | Path = "data/pokedb.sqlite", game_mode: str = "sv"):
+        """
+        Args:
+            game_mode: "sv"（既定）は全1025匹を fuzzy マッチ対象にする。
+                "champions" 指定時は champions_pokemon テーブルに登録済みの
+                ポケモンのみに絞り込む（使用可能ポケモンが大幅に少ないチャンピオンズ
+                対応・`docs/champions-v1-plan.md`）。moves/abilities/items は
+                絞り込まない（現時点でチャンピオンズ側の許可リストが無いため）。
+        """
         self._db_path = Path(db_path)
         if not self._db_path.exists():
             raise FileNotFoundError(
                 f"PokeDB が見つかりません: {self._db_path}\n"
                 "先に scripts/build_pokedb.py を実行してください。"
             )
+        if game_mode not in ("sv", "champions"):
+            raise ValueError(f"未対応の game_mode: {game_mode!r}（'sv' または 'champions'）")
+        self._game_mode = game_mode
 
         # カテゴリ別に日本語名のリストをメモリに展開
         self._pokemon:    list[str] = []
@@ -115,9 +126,26 @@ class PokeClassifier:
     # ── ロード ───────────────────────────────────────────────────────────────
 
     def _load(self) -> None:
-        rows = self._conn.execute(
-            "SELECT id, name_ja, type1, type2, ability1, ability2, ability_hidden FROM pokemon"
-        ).fetchall()
+        if self._game_mode == "champions":
+            try:
+                rows = self._conn.execute(
+                    "SELECT p.id, p.name_ja, p.type1, p.type2, p.ability1, p.ability2, "
+                    "p.ability_hidden FROM pokemon p "
+                    "INNER JOIN champions_pokemon c ON c.pokemon_id = p.id"
+                ).fetchall()
+            except sqlite3.OperationalError as e:
+                raise RuntimeError(
+                    "game_mode='champions' には champions_pokemon テーブルが必要です。"
+                    "scripts/build_pokedb.py でテーブルを作成し、"
+                    "scripts/update_champions_roster.py でデータを投入してください。"
+                ) from e
+            if not rows:
+                log.warning("champions_pokemon が空です。fuzzy マッチ対象のポケモンが0件になります。"
+                           "scripts/update_champions_roster.py の実行を確認してください。")
+        else:
+            rows = self._conn.execute(
+                "SELECT id, name_ja, type1, type2, ability1, ability2, ability_hidden FROM pokemon"
+            ).fetchall()
         for row in rows:
             self._pokemon.append(row["name_ja"])
             self._pokemon_rows[row["name_ja"]] = dict(row)

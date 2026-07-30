@@ -2,7 +2,7 @@
 
 **ブランチ**: `dev/champions-v1`  
 **作成日**: 2026-04-08  
-**更新日**: 2026-04-18（タスク状態のみ2026-07-09に見直し）  
+**更新日**: 2026-04-18（タスク状態のみ2026-07-09・2026-07-30に見直し）  
 
 ---
 
@@ -44,9 +44,9 @@
 
 | # | タスク | ファイル | 状態 |
 |---|--------|----------|------|
-| 8 | **`champions_pokemon` テーブル追加**（pokemon_id の許可リスト管理） | `data/pokedb.sqlite`、`scripts/build_pokedb.py` | 未着手 |
-| 9 | **`PokeClassifier` に `game_mode` フィルター追加**（Champions モードでは許可リストのみ検索対象にする） | `src/pokedb/classifier.py` | 未着手 |
-| 10 | **チャンピオンズ使用可能ポケモン一覧の収集・登録**（実機 or 公式情報から収集） | `scripts/build_pokedb.py` or 手動 SQL | 未着手 |
+| 8 | **`champions_pokemon` テーブル追加**（pokemon_id の許可リスト管理） | `data/pokedb.sqlite`、`scripts/build_pokedb.py` | ✅ 2026-07-30 |
+| 9 | **`PokeClassifier` に `game_mode` フィルター追加**（Champions モードでは許可リストのみ検索対象にする） | `src/pokedb/classifier.py` | ✅ 2026-07-30（`PokeClassifier(game_mode="champions")`・`src/pipeline.py`に`--game-mode`追加） |
+| 10 | **チャンピオンズ使用可能ポケモン一覧の収集・登録** | ローカル管理スクリプト（非公開） | ✅ 2026-07-30（基本種208種類を投入・全件マッチ成功。差分確認モードで2ヶ月毎のレギュレーション確認にも使う） |
 | 11 | 新ポケモン・新技がある場合は PokeAPI キャッシュ更新 | `scripts/build_pokedb.py` | 未着手 |
 
 ### 高優先（YOLO 検出系）
@@ -125,6 +125,20 @@ clf = PokeClassifier(game_mode="champions")
 # → fuzzy マッチを champions_pokemon に絞り込む
 # → SV 対応モードではこれまで通り全 1025 匹から検索
 ```
+
+パイプライン側は `python src/pipeline.py --game-mode champions ...`（既定は `sv`）。
+
+### 2026-07-30 実装完了
+
+上記の方針・スキーマ・API をそのまま実装。`champions_pokemon` へのデータ投入は
+ローカル管理のスクリプト（リポジトリには含めない）で行い、基本種208種類を投入済み。
+moves/abilities/items は現時点では未フィルター（champions側の許可リストが無いため）。
+
+**レギュレーション変更の定期確認**: ローカルの投入スクリプトを2ヶ月に1度目安で実行し、
+ポケモンの追加/削除差分を確認する運用（メモリの次回チェックリマインダー参照）。
+**ただし新要素（Zワザ・ダイマックス・テラスタル等バトルギミックの追加）はポケモン
+一覧の差分だけでは検知できない**。ギミック追加はパイプライン・OCR側の実装対応も
+必要になるため、差分が無くても2ヶ月毎に公式発表・攻略サイト等を目視確認すること。
 
 ---
 

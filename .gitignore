@@ -95,3 +95,7 @@ docs/manual/bedrock-haiku-4-5-migration.md
 docs/design/character-commission-spec.md
 docs/design/character-commission-messages.md
 data/voices/
+
+# 外部データ取得スクリプト（非公開・ローカル運用のみ）
+scripts/update_champions_roster.py
+tests/test_update_champions_roster.py
