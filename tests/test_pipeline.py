@@ -1144,6 +1144,24 @@ class TestTryRegisterRosterFallback:
         Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
         assert self.runner._move_log == ["T0:ドドゲザンのドゲザン"]
 
+    def test_opponent_move_from_unregistered_pokemon_calibrates_roster(self):
+        """技ログにだけ記録されロスター未登録の相手ポケモンは、技検出と同時に
+        ロスターへ校正登録される（実機07-00-19: 繰り出しメッセージのOCR取りこぼしで
+        ガブリアスがロスター未登録のまま技ログにだけ記録され、move_logとロスターの
+        食い違いがBedrockへの矛盾したcontextとして露呈し「保留」応答を誘発したバグの
+        再発防止）。修正前は技ログには載るがロスターには一切現れなかった。"""
+        self._set_classifier(moves={"じだんだ"}, pokemon={"ガブリアス": "ガブリアス"})
+        events = [
+            _ocr("あいて", y_center=800.0),
+            _ocr("相手の", y_center=800.0),
+            _ocr("ガブリアスの", y_center=800.0),
+            _ocr("じだんだ!", y_center=800.0),
+        ]
+        assert self.runner._battle_tracker._opponent == []  # 事前状態: ロスター未登録
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+        assert self.runner._move_log == ["T0:ガブリアスのじだんだ"]
+        assert any(s.name == "ガブリアス" for s in self.runner._battle_tracker._opponent)
+
 
 class TestResetBattleState:
     """_reset_battle_state: battle_start／遅延起動共通のリセット処理。

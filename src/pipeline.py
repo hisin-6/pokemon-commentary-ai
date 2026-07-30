@@ -3844,13 +3844,20 @@ class Pipeline:
                         log.debug("[技ログ] 使用者名候補 %s を分類・ロスター一致とも失敗のため棄却（技候補: %s）",
                                   pokemon_name, move_candidate)
                         return False
-                # is_opponent=True の場合、登録済みポケモン優先だが
-                # Champions ダブルバトルではスロット割当前のため known_opp に入っていないことがある。
-                # 未登録でも弾かず、debug ログだけ残して続行する。
+                # is_opponent=True で技ログにだけ記録されロスター未登録のケースを
+                # 即座に校正登録する（実機: 07-00-19でガブリアスの繰り出しメッセージが
+                # OCR取りこぼしで検知されないまま技ログにだけ記録され、ロスター未登録
+                # 状態がBedrockへの矛盾したcontextとして露呈し「保留」応答を誘発した）。
+                # 技名はこの時点で既にPokeClassifierスコア80以上（またはロスター名
+                # 前方一致）で確定済みの高信頼情報のため、低信頼OCR経路の幽霊登録
+                # ヒステリシス（_NEW_NAME_CONFIRM_COUNT）を経由せず register_opponent_on_field
+                # （_get_or_create low_trust=False）で即時登録してよいと判断。
                 if is_opponent:
                     known_opp = {s.name for s in self._battle_tracker._opponent}
-                    if known_opp and pokemon_name not in known_opp:
-                        log.debug("[技ログ] is_opponent=True 未登録ポケモン（スロット割当前の可能性）: %s", pokemon_name)
+                    if pokemon_name not in known_opp:
+                        self._battle_tracker.register_opponent_on_field(pokemon_name)
+                        log.info("[戦況] 技ログから相手 %s をロスターへ校正登録（繰り出し検知漏れ救済）",
+                                 pokemon_name)
                 # OCR 大文字かな誤読を補正してから分類（例: チエ→チェ, きよじゆ→きょじゅ）
                 normalized = _normalize_ocr_kana(move_candidate)
                 result = self._classifier.classify(normalized)
