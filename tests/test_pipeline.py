@@ -25,9 +25,13 @@ if _ROOT not in sys.path:
 # conftest.py で重いモジュールがモック済みなのでここで安全にインポートできる
 from src.pipeline import (
     _clean_commentary,
+    _detect_glitch_cause,
     _extract_structured_info,
     _is_battle_screen,
     _ocr_results_to_text,
+    _replace_glitch_commentary,
+    _GLITCH_CAUSE_KEYWORDS,
+    _GLITCH_TEMPLATES,
     BattleMessageParser,
     BattlePhaseClassifier,
     BattleStateTracker,
@@ -113,6 +117,60 @@ class TestCleanCommentary:
         text = "エルフーンがおいかぜを使った！ゴリランダーに追い風が吹く！"
         result = _clean_commentary(text)
         assert "エルフーン" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AIグリッチ差し替え（Bedrock保留・困惑応答対策・2026-07-29決定）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestGlitchCommentary:
+
+    def test_contradiction_keywords(self):
+        assert _detect_glitch_cause("データが矛盾していて実況できません") == "データがちぐはぐさん"
+        assert _detect_glitch_cause("情報がちぐはぐで判断できないよ") == "データがちぐはぐさん"
+
+    def test_visibility_keywords(self):
+        assert _detect_glitch_cause("画面が見えにくくて…") == "画面がチカチカしてた"
+        assert _detect_glitch_cause("HPが読み取れないの") == "画面がチカチカしてた"
+
+    def test_pending_keywords(self):
+        assert _detect_glitch_cause("まだ確定できてないの") == "情報がまだ揃ってない"
+        assert _detect_glitch_cause("次のフレーム更新をお待ちください") == "情報がまだ揃ってない"
+
+    def test_fallback_keywords(self):
+        assert _detect_glitch_cause("なんだかモヤモヤするなあ") == "ナゾのノイズ"
+        assert _detect_glitch_cause("誰か教えてほしいな") == "ナゾのノイズ"
+        assert _detect_glitch_cause("状況を教えてもらえると助かる") == "ナゾのノイズ"
+        assert _detect_glitch_cause("今は実況できないよ") == "ナゾのノイズ"
+
+    def test_normal_commentary_not_detected(self):
+        assert _detect_glitch_cause("ガブリアスのじしんが炸裂！大ダメージ！") is None
+        assert _detect_glitch_cause("") is None
+
+    def test_replace_returns_formatted_template(self):
+        replaced = _replace_glitch_commentary("データが矛盾していて実況できません")
+        expected = [t.format(cause="データがちぐはぐさん") for t in _GLITCH_TEMPLATES]
+        assert replaced in expected
+
+    def test_replace_passes_through_normal_text(self):
+        text = "ペリッパーのぼうふう！すごい風だ！"
+        assert _replace_glitch_commentary(text) == text
+
+    def test_templates_do_not_trigger_detection(self):
+        """テンプレート側が検出キーワードを含まないこと（キーワード拡張時の回帰ガード）。
+        原因文言は意図的にキーワードを含む（例:「データがちぐはぐさん」）が、
+        差し替えは実行時に1回しか通らないため実害はない。"""
+        for template in _GLITCH_TEMPLATES:
+            assert _detect_glitch_cause(template.format(cause="テスト")) is None
+
+    def test_templates_have_no_emoji(self):
+        """絵文字（U+1F300-1FAFF）はMeiryo字幕で豆腐化する既知地雷（♪♡は可）。"""
+        import re as _re
+        pat = _re.compile("[\U0001F300-\U0001FAFF]")
+        for template in _GLITCH_TEMPLATES:
+            assert not pat.search(template)
+        for _, cause in _GLITCH_CAUSE_KEYWORDS:
+            assert not pat.search(cause)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

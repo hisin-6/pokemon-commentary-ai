@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import base64
 import logging
+import random
 import re
 import sys
 import threading
@@ -2314,6 +2315,53 @@ def _clean_commentary(text: str) -> str:
     return text
 
 
+# ─── AIグリッチ差し替え（Bedrock保留・困惑応答対策） ─────────────────────────
+
+# Bedrockがデータ矛盾等で実況を保留・困惑する応答（「データが矛盾していて
+# 実況できません」等）を返した場合の検出キーワード。先頭グループから順に照合し、
+# 最初にマッチしたグループの原因文言を定型文に差し込む。
+# 言い回しの変化に応じてキーワードは今後拡張していく前提。
+_GLITCH_CAUSE_KEYWORDS: list[tuple[tuple[str, ...], str]] = [
+    (("矛盾", "ちぐはぐ"), "データがちぐはぐさん"),
+    (("見えにく", "読み取れ"), "画面がチカチカしてた"),
+    (("確定できて", "お待ち"), "情報がまだ揃ってない"),
+    (("モヤモヤ", "教えてほし", "教えてもらえ", "実況できな"), "ナゾのノイズ"),
+]
+
+# くれぴ口調の「AIグリッチ」定型文（{cause}に原因文言が入る）。
+# テンプレートはランダム選択、原因はキーワードマッチで決定する
+# （原因までランダムにすると実態と合わない文になるため）。
+# ⚠️絵文字（U+1F300以降）はMeiryoに無く字幕が豆腐化するので使わないこと（♪♡は可）。
+_GLITCH_TEMPLATES = [
+    "あれれ？{cause}で、くれぴの目がちょっとバグっちゃったかも…！次いくよ次〜♪",
+    "ちょっと待って、{cause}でデータがぐるぐるしてる…！ま、いっか♪試合に戻ろ〜！",
+    "エラー発生〜！原因は{cause}だって♪ くれぴだってたまには混乱するもん！",
+]
+
+
+def _detect_glitch_cause(text: str) -> str | None:
+    """保留・困惑応答なら差し込む原因文言を、通常の実況文なら None を返す。"""
+    for keywords, cause in _GLITCH_CAUSE_KEYWORDS:
+        if any(kw in text for kw in keywords):
+            return cause
+    return None
+
+
+def _replace_glitch_commentary(text: str) -> str:
+    """Bedrockの保留・困惑応答をくれぴ口調の「AIグリッチ」定型文に差し替える。
+
+    通常の実況文はそのまま返す。差し替えはVOICEVOX合成前に呼ぶこと
+    （合成後に字幕テキストだけ差し替えると音声と不一致になるため）。
+    """
+    cause = _detect_glitch_cause(text)
+    if cause is None:
+        return text
+    replaced = random.choice(_GLITCH_TEMPLATES).format(cause=cause)
+    log.info("[AIグリッチ] 保留・困惑応答を検出→定型文に差し替え: 「%s」→「%s」",
+             text, replaced)
+    return replaced
+
+
 # ─── Bedrock Vision 呼び出し（EC2 API 経由・オプション） ─────────────────────
 
 def _build_bedrock_context(
@@ -3276,6 +3324,9 @@ class Pipeline:
             log.warning("実況文が空のためスキップ")
             return
 
+        # 保留・困惑応答は「AIグリッチ」定型文に差し替える（VOICEVOX合成前）
+        commentary = _replace_glitch_commentary(commentary)
+
         self._commentary_history.append(commentary)
         if len(self._commentary_history) > 5:
             self._commentary_history.pop(0)
@@ -3336,6 +3387,10 @@ class Pipeline:
                     continue
             if not commentary:
                 continue
+
+            # 保留・困惑応答は「AIグリッチ」定型文に差し替える（VOICEVOX合成前・
+            # manifest.jsonlに問題テキストを一度も書き込ませない）
+            commentary = _replace_glitch_commentary(commentary)
 
             history.append(commentary)
             if len(history) > 5:

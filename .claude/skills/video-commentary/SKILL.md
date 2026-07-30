@@ -156,6 +156,7 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | クロマキーのデフォルト設定（類似度0.15） | 輪郭に緑フリンジが残る | 類似度0.25＋`despill`をデフォルト化済み（2026-07-15）。まだ残るなら類似度をさらに上げる |
 | 音声ルーティングを毎回手動切替 | 録画前後の切替が面倒・戻し忘れ | wav再生専用アプリを1つ決めて出力先を一度だけCABLE Inputに設定（アプリ単位で記憶される）。`scripts/play_commentary_track.bat <動画名>`でフォルダ解決も自動化 |
 | 実況文中の絵文字（💦💕等の絵文字ブロック文字） | 字幕が豆腐（□）化。ffmpegログに`Glyph 0x1F4A6 not found`等が出る | Meiryoに絵文字グリフが無いのが原因。♪♡等の記号（Miscellaneous Symbolsブロック・U+2600-27BF）は問題なし。**fillers.jsonlだけでなくmanifest.jsonl（通常のイベント実況）にも出る**（2026-07-29確認）。正規表現`[\U0001F300-\U0001FAFF]`でcommentary/textフィールドから該当絵文字だけ削除して④を再実行（WAVは元々発声してないので音声とズレない）。仕上げ確認のフレーム目視で毎回チェックすること |
+| Bedrockの保留・困惑応答（「データが矛盾していて実況できません」等） | 言い訳文がそのまま実況としてmanifest.jsonlに入り合成される（07-00-19で2件・08-15-22で4件実発生。原因はロスターバグ・同名ミラー混乱・試合間空データ等ケースごとにバラバラ） | **2026-07-30に恒久対策済み**: `pipeline.py`の`_replace_glitch_commentary`がVOICEVOX合成前にキーワード検出（矛盾・ちぐはぐ・モヤモヤ等=`_GLITCH_CAUSE_KEYWORDS`）し、くれぴ口調の「AIグリッチ」定型文（`_GLITCH_TEMPLATES`3種×原因4種）に差し替える。manifest.jsonlに問題テキストは書き込まれない。**新しい言い回しの保留応答を見つけたら`_GLITCH_CAUSE_KEYWORDS`にキーワードを追加すること**（仕上げ確認でmanifest/fillersのcommentaryを目視） |
 
 ## レイアウト調整ポイント（scripts/render_commentary_video.py の定数）
 

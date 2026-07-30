@@ -327,6 +327,23 @@ class TestDispatchCommentaryLiveMode:
         bedrock_called.assert_not_called()
         assert p._commentary_history == ["フォールバックのみ！"]
 
+    def test_glitch_response_replaced_before_speak(self, monkeypatch):
+        """保留・困惑応答はライブ経路でもAIグリッチ定型文に差し替えてから合成・再生する。"""
+        p = self._make_pipeline()
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_vision",
+                             lambda *a, **k: ("状況がモヤモヤしていて判断できません", "分析"))
+
+        p._dispatch_commentary("move_used", None, {"ocr_text": ""}, {}, [], attempt_bedrock=True)
+        p._speech_thread.join(timeout=5)
+
+        assert len(p._commentary_history) == 1
+        expected = [t.format(cause="ナゾのノイズ")
+                    for t in pipeline_module._GLITCH_TEMPLATES]
+        assert p._commentary_history[0] in expected
+        # 音声も差し替え後テキストで合成される
+        synthesized = p._voicevox.generate_wav.call_args[0][0]
+        assert synthesized == p._commentary_history[0]
+
 
 class TestGeneratePosthocCommentary:
     """run() 完了後にバッファから実況を一括生成する処理（ADR-009追記）。"""
@@ -412,3 +429,27 @@ class TestGeneratePosthocCommentary:
         p._generate_posthoc_commentary()  # 例外を投げずにスキップすること
 
         assert not (tmp_path / "manifest.jsonl").exists()
+
+    def test_glitch_response_replaced_before_manifest(self, tmp_path, monkeypatch):
+        """保留・困惑応答はmanifest.jsonlに書き込まれる前にAIグリッチ定型文へ差し替え、
+        差し替え後のテキストでVOICEVOX合成する（2026-07-29恒久対策・07-00-19/08-15-22で
+        保留応答がそのまま実況として合成された問題への対策）。"""
+        p = self._make_pipeline(tmp_path)
+        p._pending_render_events = [
+            {"event_time": 262.2, "event_type": "move_used", "game_state": {"ocr_text": ""},
+             "battle_context": {}, "move_log": [], "render_context": None},
+        ]
+        glitch = "データが矛盾していて実況できません。次のフレーム更新を待ちます。"
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text",
+                             lambda *a, **k: (glitch, "a"))
+
+        p._generate_posthoc_commentary()
+
+        entry = json.loads((tmp_path / "manifest.jsonl").read_text(encoding="utf-8"))
+        expected = [t.format(cause="データがちぐはぐさん")
+                    for t in pipeline_module._GLITCH_TEMPLATES]
+        assert entry["commentary"] in expected
+        assert "矛盾" not in entry["commentary"]
+        # 音声も差し替え後テキストで合成される（字幕と音声の不一致防止）
+        synthesized = p._voicevox.generate_wav.call_args[0][0]
+        assert synthesized == entry["commentary"]
