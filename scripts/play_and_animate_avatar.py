@@ -3,9 +3,9 @@ VMCへOSCで表情ブレンドシェイプ・腕の姿勢を送り、実況イ�
 切り替える（改善ロードマップ③・表情・モーション連動）。
 
 `scripts/play_commentary_track.bat` の代わりにこちらを使う。動作:
-  0. 再生開始前に一度、腕を下ろした姿勢をOSCで送る（トラッキングデバイス
-     無しだとT-poseのまま表示される問題への対策・`scripts/test_vmc_pose.py`で
-     角度を実機検証済み）
+  0. 起動直後、腕を下ろした姿勢をOSCで送る（トラッキングデバイス無しだと
+     T-poseのまま表示される問題への対策・`scripts/test_vmc_pose.py`で
+     角度を実機検証済み）→ ここでEnter入力待ちになる（下記「使い方」参照）
   1. renders/<動画名>/schedule.json（パス2の出力）を読み、イベント時刻と
      event_type/context（faint_side・battle_result）から表情を決定
   2. WAVをPython側（sounddevice）で自前に再生し、再生開始を基準時刻にする
@@ -19,10 +19,15 @@ VMC側の設定（`scripts/test_vmc_expression.py`/`test_vmc_pose.py`で確認�
   - VMCの設定画面でReceiver（39540 or 39541）の「有効化」チェックボックスをON
   - WAV再生の出力先はCABLE Input（口パクの自動連動はVMC側の音声入力設定のまま）
 
-使い方:
+使い方（2026-07-30〜: スクリプト起動→アイドル姿勢送信→OBS録画→Enterの順に変更。
+録画開始前にTポーズが解消されるので、録画にTポーズが映り込まない）:
     venv\\Scripts\\python.exe scripts\\play_and_animate_avatar.py 16-14-39 --osc-port 39540
-    （OBS録画を先に開始してから実行すること。schedule.jsonが無ければ先に
-     render_commentary_video.py --dry-run を実行して生成する）
+    1. スクリプトを起動する（この時点でVMCの腕が下がる）
+    2. 表示された「録画が始まったらEnterを押してください」を待って、ここでOBS録画を開始
+    3. 録画が始まったらEnterを押す（この瞬間からWAV再生・表情連動が始まる）
+    → 録画開始がWAV再生開始より先になるので --avatar-offset は 0（または
+      Enterを押す一瞬のラグ分の1秒未満）でよい。schedule.jsonが無ければ先に
+      render_commentary_video.py --dry-run を実行して生成する
 """
 
 from __future__ import annotations
@@ -80,8 +85,13 @@ _EXPRESSION_HOLD_SEC = 4.0
 def expression_for(event_type: str, context: dict) -> str | None:
     """イベント種別とcontextから送るべきブレンドシェイプ名を決める。
     None の場合は表情を変えない（現状維持）。
+
+    faint_side は event_type=="faint"（保留タイムアウト時の単独dispatch）だけでなく
+    event_type=="move_used"（Bedrock節約のため次のmove_usedに統合された通常経路）
+    にも乗ってくるため、event_typeを問わずcontextを先に見る（pipeline.py側の
+    faint統合バグ修正とセット・詳細はpipeline.pyの該当コメント参照）。
     """
-    if event_type == "faint":
+    if "faint_side" in context:
         side = context.get("faint_side")
         return _FAINT_EXPRESSION.get(side)  # 判定不能(None)なら表情変更なし
     if event_type == "battle_end":
@@ -173,6 +183,7 @@ def main() -> int:
                         help="腕を下ろす初期姿勢の送信をスキップ（別途トラッキングデバイスを"
                              "使う場合などT-pose対策が不要な時に指定）")
     args = parser.parse_args()
+    device = int(args.device) if args.device is not None and args.device.isdigit() else args.device
 
     render_dir = Path(__file__).parent.parent / "renders" / args.name
     wav_path = render_dir / "commentary_track.wav"
@@ -193,9 +204,10 @@ def main() -> int:
     if not args.no_idle_pose:
         send_idle_pose(client)
 
-    log.info("※OBS録画を先に開始してから実行してください")
+    log.info("初期姿勢を送信済み（Tポーズ解消）。ここでOBS録画を開始してください。")
+    input("録画が始まったらEnterを押してください（そのまま再生開始します）...")
     log.info("再生開始: %s（%.1f秒）", wav_path, duration)
-    sd.play(data, samplerate, device=args.device)
+    sd.play(data, samplerate, device=device)
     start_clock = time.monotonic()
 
     scheduler = threading.Thread(
@@ -203,7 +215,13 @@ def main() -> int:
         daemon=True)
     scheduler.start()
 
-    sd.wait()
+    try:
+        while sd.get_stream().active:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        log.info("中断されました。再生を停止します。")
+        sd.stop()
+
     scheduler.join(timeout=_EXPRESSION_HOLD_SEC + 1.0)
     send_expression(client, NEUTRAL)
     log.info("完了。")

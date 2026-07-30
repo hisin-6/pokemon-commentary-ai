@@ -3330,6 +3330,11 @@ class Pipeline:
                         f"場(自)={pending_ctx.get('player_field','')} | "
                         f"場(相)={pending_ctx.get('opponent_field','')}"
                     )
+                    # 改善ロードマップ③（表情連動）用: 保留faintのfaint_sideを統合先の
+                    # move_usedのbattle_contextにも引き継ぐ（そのままだとmanifest.jsonlの
+                    # contextにfaint_sideが載らず表情連動が発火しないバグがあった）
+                    if "faint_side" in pending_ctx:
+                        battle_context["faint_side"] = pending_ctx["faint_side"]
                 else:
                     # タイムアウト: 先に単独送信してからmove_usedを処理
                     log.info("[faint統合] タイムアウト(%.1f秒) → 先にフラッシュ", elapsed)

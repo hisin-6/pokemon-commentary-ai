@@ -110,14 +110,22 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
      `venv\Scripts\python.exe scripts\play_and_animate_avatar.py <動画名> --osc-port 39540`
      を使う（`pip install python-osc`が事前に必要）。WAV再生に合わせてVMCへOSCで表情
      ブレンドシェイプを送る（faint=自分が倒れたら哀しい/相手を倒したら嬉しい・
-     battle_end=勝敗で喜び/哀しみ・battle_start=楽しそう）。**事前にVMCの設定画面で
-     Receiver（39540 or 39541）の「有効化」チェックボックスをONにしておくこと**
-     （デフォルトOFF・OFFのままだと表情が一切変わらない＝実機で確認済みの地雷）。
-     schedule.jsonが必要なので先に`render_commentary_video.py <動画名> --dry-run`を
-     実行しておく。表情マッピングは`scripts/play_and_animate_avatar.py`の
+     battle_end=勝敗で喜び/哀しみ・battle_start=楽しそう。⚠️2026-07-30に発見した
+     faint統合バグ（faintイベントが次のmove_usedに統合される際にfaint_sideが
+     manifest.jsonlへ引き継がれず表情が発火しなかった）は同日中に修正済み）。
+     **事前にVMCの設定画面でReceiver（39540 or 39541）の「有効化」チェックボックスを
+     ONにしておくこと**（デフォルトOFF・OFFのままだと表情が一切変わらない＝実機で
+     確認済みの地雷）。schedule.jsonが必要なので先に`render_commentary_video.py <動画名>
+     --dry-run`を実行しておく。表情マッピングは`scripts/play_and_animate_avatar.py`の
      `_EVENT_EXPRESSION`/`_FAINT_EXPRESSION`/`_BATTLE_RESULT_EXPRESSION`を参照。
-     再生開始前に腕を下ろした初期姿勢も自動送信する（下記T-pose対策・
-     `--no-idle-pose`で無効化可）
+     - **手順は「スクリプト起動→OBS録画→Enter」の順**（2026-07-30変更・T-pose対策後）:
+       ①スクリプトを起動すると即座に腕を下ろした初期姿勢をOSC送信→
+       ②「録画が始まったらEnterを押してください」の表示を待ってここでOBS録画を開始→
+       ③録画開始後にEnterを押す（この瞬間からWAV再生・表情連動が始まる）。
+       録画開始前にTポーズが解消されるため、**録画にTポーズが一切映り込まない**
+       （旧手順「録画→スクリプト実行」だと録画開始直後の一瞬Tポーズが映っていた）。
+       この順序なら録画開始がWAV再生開始より確実に先になるので、下記
+       `--avatar-offset`は0固定でよい（目視で秒数を計る必要がなくなった）
 4. 合成: `python3 scripts/render_commentary_video.py renders/<動画名> --layout biim --avatar-video <録画mp4> --avatar-offset <秒> --avatar-crop <w:h:x:y>`
    - 右下344px幅にクロマキー合成（`--avatar-width`/`--avatar-chroma`で調整可）
    - `--avatar-crop`（任意）: 全身録画から上半身だけを切り出してから拡大する
@@ -181,7 +189,11 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | renders/のcommit | 数GBのmp4がリポジトリに入る | .gitignore済み。**外さないこと** |
 | states.jsonlが無い旧素材 | 戦況パネルが出ない | パス1の再実行が必要（timeline/statesは新パス1からのみ生成） |
 | モックアップ/日報の実フレーム | 対戦相手のトレーナー名が映る | publicリポジトリに載せてよいかはユーザー判断（2026-07-14に確認済み・現方針は許容） |
-| アバター全身録画をそのまま縮小 | 344px枠内で人物が極小・Tポーズの腕が窮屈 | `--avatar-crop`で上半身だけ切り出してから拡大する |
+| アバター全身録画をそのまま縮小 | 344px枠内で人物が極小・Tポーズの腕が窮屈 | `--avatar-crop`で上半身だけ切り出してから拡大する。**クロップ範囲の決め方**: 収録した生の録画（グリーンバック）から1フレーム抽出し、Pythonで緑以外のピクセルのbounding boxを検出すると人物の実座標が分かる（`PIL`+`numpy`で`is_green = (g>150)&(r<100)&(b<100)`の否定領域を`np.where`）。2026-07-30収録（`HairSample_Female.vrm`・1920x1080・全身がx760-1161/y273-1079に収まっていた）では`--avatar-crop "300:480:810:230"`（過去動画の実績値）でバストアップになり、これがそのまま流用できることを確認済み。モデルが変わったら同じ手順で再計測すること |
+| `--device`に数値インデックスを渡してもsounddeviceが認識しない | `play_and_animate_avatar.py --device 7`のように番号を渡すとエラー、または無関係のデバイスが選ばれる | sounddeviceは`device`引数が文字列だと**名前の部分一致検索**になり、数字文字列を渡しても数値インデックスとしては解釈されない。2026-07-30に対策済み: 数字文字列なら自動でintにキャストするよう`play_and_animate_avatar.py`を修正。デバイス一覧は`python -c "import sounddevice as sd; print(sd.query_devices())"`で確認し、CABLE Input側のMME/WASAPI版インデックスを指定する |
+| `play_and_animate_avatar.py`実行中にCtrl+Cで中断できない | 再生を途中で止めたくても効かない | `sd.wait()`のブロッキング待ちがWindowsだとシグナルを拾えないことがある。2026-07-30に対策済み: `sd.get_stream().active`をポーリングするループ＋`KeyboardInterrupt`ハンドリングに変更（`sd.stop()`で即座に再生停止） |
+| VMCがリップシンク中にフリーズする | 表情もリップシンクも反応しなくなる | 2026-07-30に実機で1回発生・VMC再起動で解消。再現条件は不明のため、フリーズしたらまず再起動を試す |
+| ダブルバトルで相手の2匹目が戦況パネルから消える | 一度検出された後、1フレームOCR不検出で即座に場から降ろされ二度と戻らない（`BattleStateTracker`の`quick_threshold=1`が原因） | **2026-07-30時点で未修正**（緩めると「交代直後に旧ポケモンが残り続ける」という別の既知バグが再発するリスクがあり慎重な調整が必要）。当面は戦況パネルの2匹目表示が抜けることがあると認識し、実況（manifest.jsonl）自体はボール数ロジックで気絶を把握できているので実況内容への影響は限定的 |
 | VMCがトラッキングデバイス無しでT-poseのまま | 腕を横に伸ばした初期姿勢で録画されてしまう | **2026-07-30に対策済み**: `/VMC/Ext/Bone/Pos`でLeftUpperArm/RightUpperArmにZ軸回転（80°・右は符号反転）を送ると腕が下がることを実機確認（`scripts/test_vmc_pose.py`で角度検証）。`play_and_animate_avatar.py`が再生開始前に自動送信する（`send_idle_pose`）。指先が服にわずかに埋まるが上半身のみ表示のため実害なしと判断。モデルが変わったら角度の再検証が必要な可能性あり（`_IDLE_POSE_DEG`/`_IDLE_POSE_AXIS`） |
 | クロマキーのデフォルト設定（類似度0.15） | 輪郭に緑フリンジが残る | 類似度0.25＋`despill`をデフォルト化済み（2026-07-15）。まだ残るなら類似度をさらに上げる |
 | 音声ルーティングを毎回手動切替 | 録画前後の切替が面倒・戻し忘れ | wav再生専用アプリを1つ決めて出力先を一度だけCABLE Inputに設定（アプリ単位で記憶される）。`scripts/play_commentary_track.bat <動画名>`でフォルダ解決も自動化 |
@@ -200,8 +212,9 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | `_hp_bar_color` | 緑>50/黄>20/赤 | HPバー3色（ゲーム準拠） |
 | `_FILLER_MAX_SHIFT_SEC` | 12 | フィラー配置の最大ずれ（大きくするとネタバレ防御が弱まる） |
 | `_DEFAULT_GAIN` | 1.4 | 実況音量。ゲーム音とのバランスは`--gain`で上書き可 |
-| server.py `_gap_filler_count` | 25秒/件・上限4 | フィラー密度（変更はEC2再デプロイ必要）。18秒/件・上限5→2026-07-30視聴fb「多い」で30秒/件・上限3に減量→同日中「もう少し増やしたい」で25秒/件・上限4に再調整 |
-| generate_gap_commentary.py `_DEFAULT_MIN_GAP_SEC` | 25秒 | フィラー対象とする最小無言秒数（`--min-gap`で上書き可）。同上の再調整で30秒→25秒 |
+| server.py `_gap_filler_count` | 40秒/件・上限3 | フィラー密度（変更はEC2再デプロイ必要）。18秒/件・上限5→2026-07-30視聴fb「多い」で30秒/件・上限3に減量→「もう少し増やしたい」で25秒/件・上限4に再調整→さらに「あ、あが耳につく・フィラー減らして実況を活かしたい」で40秒/件・上限3に再々調整 |
+| generate_gap_commentary.py `_DEFAULT_MIN_GAP_SEC` | 40秒 | フィラー対象とする最小無言秒数（`--min-gap`で上書き可）。同上の再調整で25秒→40秒 |
+| プロンプトの書き出しバリエーション指示 | （新規） | 2026-07-30〜: 「あ、あ」等の相槌の書き出し連発を抑制する指示を`_build_script_prompt`（フィラー用）・`_build_vision_prompt`（実況本編用）の両方に追加済み。片方だけ直しても同じキャラ設定を共有しているためもう片方で再発するので注意 |
 
 パネル下部（y660以降）と画面右下はv2c（アバター）用に空けてある。
 

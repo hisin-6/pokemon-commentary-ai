@@ -44,6 +44,14 @@ class TestExpressionFor:
         assert paa.expression_for("faint", {"faint_side": None}) is None
         assert paa.expression_for("faint", {}) is None
 
+    def test_faint_side_on_move_used_is_sorrow(self):
+        """pipeline.py側のfaint統合バグ修正により、faint_sideはevent_type=="faint"
+        単独ではなく次のmove_usedに統合されたcontextとして届く（通常経路）。"""
+        assert paa.expression_for("move_used", {"faint_side": "player"}) == "Sorrow"
+
+    def test_faint_side_on_move_used_opponent_is_joy(self):
+        assert paa.expression_for("move_used", {"faint_side": "opponent"}) == "Joy"
+
     def test_battle_end_win_is_joy(self):
         assert paa.expression_for("battle_end", {"battle_result": "勝ち"}) == "Joy"
 

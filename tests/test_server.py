@@ -545,10 +545,10 @@ class TestBuildScriptPrompt:
         assert prompt.index("63.0秒") < prompt.index("📺70.0秒")
 
     def test_gap_line_contains_filler_count(self):
-        """★区間の行に区間長に応じた件数指定が入る（53秒区間→2件）。"""
+        """★区間の行に区間長に応じた件数指定が入る（53秒区間→1件）。"""
         payload = _valid_script_payload()
         prompt = _build_script_prompt(payload["gap"], payload["events"])
-        assert "★78.0秒 〜 131.0秒 = 無言区間（ここにフィラーを2件）" in prompt  # 53秒÷25秒/件
+        assert "★78.0秒 〜 131.0秒 = 無言区間（ここにフィラーを1件）" in prompt  # 53秒÷40秒/件
 
     def test_live_commentary_persona(self):
         """録画感を出さないライブ実況指示が入る。"""
@@ -592,11 +592,12 @@ class TestBuildScriptPrompt:
 class TestGapFillerCount:
 
     def test_scales_with_gap_length(self):
-        # 2026-07-30続き「もう少し増やしたい」で25秒/件・上限4に再調整
+        # 2026-07-30続き「あ、あ、が耳につく・フィラーを減らして実況を活かしたい」で
+        # 40秒/件・上限3に再々調整
         assert _gap_filler_count(0.0, 15.0) == 1     # 短い区間は最低1件
-        assert _gap_filler_count(0.0, 65.0) == 2
-        assert _gap_filler_count(0.0, 100.0) == 4
-        assert _gap_filler_count(0.0, 300.0) == 4    # 上限4件
+        assert _gap_filler_count(0.0, 65.0) == 1
+        assert _gap_filler_count(0.0, 100.0) == 2
+        assert _gap_filler_count(0.0, 300.0) == 3    # 上限3件
 
 
 class TestParseScriptFillers:
