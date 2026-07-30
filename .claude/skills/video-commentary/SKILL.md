@@ -106,6 +106,18 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
 3. **OBS録画を先に開始→`scripts\play_commentary_track.bat <動画名>` でWAVを頭から再生**
    （録画開始から再生開始までの秒数をメモ=offset。バッチはrenders配下の同名ファイルを
    毎回自動解決するので手でフォルダを探さなくてよい）
+   - **【任意・実験的】表情連動させる場合**（改善ロードマップ③）: 上記バッチの代わりに
+     `venv\Scripts\python.exe scripts\play_and_animate_avatar.py <動画名> --osc-port 39540`
+     を使う（`pip install python-osc`が事前に必要）。WAV再生に合わせてVMCへOSCで表情
+     ブレンドシェイプを送る（faint=自分が倒れたら哀しい/相手を倒したら嬉しい・
+     battle_end=勝敗で喜び/哀しみ・battle_start=楽しそう）。**事前にVMCの設定画面で
+     Receiver（39540 or 39541）の「有効化」チェックボックスをONにしておくこと**
+     （デフォルトOFF・OFFのままだと表情が一切変わらない＝実機で確認済みの地雷）。
+     schedule.jsonが必要なので先に`render_commentary_video.py <動画名> --dry-run`を
+     実行しておく。表情マッピングは`scripts/play_and_animate_avatar.py`の
+     `_EVENT_EXPRESSION`/`_FAINT_EXPRESSION`/`_BATTLE_RESULT_EXPRESSION`を参照。
+     再生開始前に腕を下ろした初期姿勢も自動送信する（下記T-pose対策・
+     `--no-idle-pose`で無効化可）
 4. 合成: `python3 scripts/render_commentary_video.py renders/<動画名> --layout biim --avatar-video <録画mp4> --avatar-offset <秒> --avatar-crop <w:h:x:y>`
    - 右下344px幅にクロマキー合成（`--avatar-width`/`--avatar-chroma`で調整可）
    - `--avatar-crop`（任意）: 全身録画から上半身だけを切り出してから拡大する
@@ -170,11 +182,13 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | states.jsonlが無い旧素材 | 戦況パネルが出ない | パス1の再実行が必要（timeline/statesは新パス1からのみ生成） |
 | モックアップ/日報の実フレーム | 対戦相手のトレーナー名が映る | publicリポジトリに載せてよいかはユーザー判断（2026-07-14に確認済み・現方針は許容） |
 | アバター全身録画をそのまま縮小 | 344px枠内で人物が極小・Tポーズの腕が窮屈 | `--avatar-crop`で上半身だけ切り出してから拡大する |
+| VMCがトラッキングデバイス無しでT-poseのまま | 腕を横に伸ばした初期姿勢で録画されてしまう | **2026-07-30に対策済み**: `/VMC/Ext/Bone/Pos`でLeftUpperArm/RightUpperArmにZ軸回転（80°・右は符号反転）を送ると腕が下がることを実機確認（`scripts/test_vmc_pose.py`で角度検証）。`play_and_animate_avatar.py`が再生開始前に自動送信する（`send_idle_pose`）。指先が服にわずかに埋まるが上半身のみ表示のため実害なしと判断。モデルが変わったら角度の再検証が必要な可能性あり（`_IDLE_POSE_DEG`/`_IDLE_POSE_AXIS`） |
 | クロマキーのデフォルト設定（類似度0.15） | 輪郭に緑フリンジが残る | 類似度0.25＋`despill`をデフォルト化済み（2026-07-15）。まだ残るなら類似度をさらに上げる |
 | 音声ルーティングを毎回手動切替 | 録画前後の切替が面倒・戻し忘れ | wav再生専用アプリを1つ決めて出力先を一度だけCABLE Inputに設定（アプリ単位で記憶される）。`scripts/play_commentary_track.bat <動画名>`でフォルダ解決も自動化 |
 | 実況文中の絵文字（💦💕等の絵文字ブロック文字） | 字幕が豆腐（□）化。ffmpegログに`Glyph 0x1F4A6 not found`等が出る | Meiryoに絵文字グリフが無いのが原因。♪♡等の記号（Miscellaneous Symbolsブロック・U+2600-27BF）は問題なし。**fillers.jsonlだけでなくmanifest.jsonl（通常のイベント実況）にも出る**（2026-07-29確認）。正規表現`[\U0001F300-\U0001FAFF]`でcommentary/textフィールドから該当絵文字だけ削除して④を再実行（WAVは元々発声してないので音声とズレない）。仕上げ確認のフレーム目視で毎回チェックすること |
 | 末尾実況の映像はみ出し（battle_endが動画終端間際に発火） | 締めの実況が映像なし（黒画面/プレイヤー依存）で流れる（20-14-17で6.6秒・08-15-22で2.4秒実発生） | **biimは2026-07-30から自動対応**: 実況トラックが動画長を超えると最終フレーム静止で映像を延長（`tpad=stop_mode=clone`・字幕描画の前段なので延長区間でも字幕は時刻通り）。plainは映像コピーのため非対応（警告のみ） |
 | Bedrockの保留・困惑応答（「データが矛盾していて実況できません」等） | 言い訳文がそのまま実況としてmanifest.jsonlに入り合成される（07-00-19で2件・08-15-22で4件実発生。原因はロスターバグ・同名ミラー混乱・試合間空データ等ケースごとにバラバラ） | **2026-07-30に恒久対策済み**: `pipeline.py`の`_replace_glitch_commentary`がVOICEVOX合成前にキーワード検出（矛盾・ちぐはぐ・モヤモヤ等=`_GLITCH_CAUSE_KEYWORDS`）し、くれぴ口調の「AIグリッチ」定型文（`_GLITCH_TEMPLATES`3種×原因4種）に差し替える。manifest.jsonlに問題テキストは書き込まれない。**新しい言い回しの保留応答を見つけたら`_GLITCH_CAUSE_KEYWORDS`にキーワードを追加すること**（仕上げ確認でmanifest/fillersのcommentaryを目視） |
+| VMCのOSC表情操作（`play_and_animate_avatar.py`）が無反応 | OSCメッセージを送っても表情が一切変わらない | VMCの設定画面でReceiver（39540/39541）のポート番号は入っていても、**「有効化」チェックボックスがデフォルトOFFだと外部OSC入力が反映されない**（2026-07-30に実機で確認・チェックを入れたら即動作した）。必ずONにしてから実行すること |
 
 ## レイアウト調整ポイント（scripts/render_commentary_video.py の定数）
 
@@ -199,7 +213,7 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 
 ## 関連ファイル
 
-- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック）・`src/api/server.py`（`/api/script`・プロンプト）・`scripts/generate_gap_commentary.py`・`scripts/render_commentary_video.py`・`scripts/generate_thumbnail.py`（サムネイル自動生成）・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）
-- テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_server.py`（TestScript系）
+- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック/`BattleStateTracker.fainted_names`・`diff_fainted_side`）・`src/api/server.py`（`/api/script`・プロンプト）・`scripts/generate_gap_commentary.py`・`scripts/render_commentary_video.py`・`scripts/generate_thumbnail.py`（サムネイル自動生成）・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）・`scripts/play_and_animate_avatar.py`（表情連動版wav再生・Windows・改善ロードマップ③）
+- テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_server.py`（TestScript系）・`tests/test_play_and_animate_avatar.py`
 - 設計: `docs/adr/ADR-009-video-first-commentary.md`・レイアウト原案 `docs/design/frame-mockups/mockup_A_biim.png`
 - 経緯・実測値: `docs/daily/2026-07-14.md`

@@ -803,6 +803,36 @@ class TestBattleStateTracker:
         ctx = self.tracker.to_context()
         assert "T1:move_used" in ctx["event_log"]
 
+    def test_fainted_names_splits_by_side(self):
+        gs1 = _make_game_state(player_names=["ピカチュウ"], opponent_names=["エルフーン"])
+        _register(self.tracker, gs1)
+        gs2 = _make_game_state(player_names=["ピカチュウ"], hp_player=["0/176"])
+        self.tracker.update(gs2, "faint")
+        player_fainted, opponent_fainted = self.tracker.fainted_names()
+        assert player_fainted == {"ピカチュウ"}
+        assert opponent_fainted == set()
+
+    def test_diff_fainted_side_player(self):
+        prev = (set(), set())
+        curr = ({"ピカチュウ"}, set())
+        assert BattleStateTracker.diff_fainted_side(prev, curr) == "player"
+
+    def test_diff_fainted_side_opponent(self):
+        prev = (set(), set())
+        curr = (set(), {"エルフーン"})
+        assert BattleStateTracker.diff_fainted_side(prev, curr) == "opponent"
+
+    def test_diff_fainted_side_none_when_unchanged(self):
+        prev = ({"ピカチュウ"}, set())
+        curr = ({"ピカチュウ"}, set())
+        assert BattleStateTracker.diff_fainted_side(prev, curr) is None
+
+    def test_diff_fainted_side_none_when_both_sides_new(self):
+        """同時ダウン等、両陣営同時に新規気絶がある場合は判定不能としてNone。"""
+        prev = (set(), set())
+        curr = ({"ピカチュウ"}, {"エルフーン"})
+        assert BattleStateTracker.diff_fainted_side(prev, curr) is None
+
     def test_to_context_turn_history_default_nashi(self):
         ctx = self.tracker.to_context()
         assert ctx["turn_history"] == "なし"
@@ -1362,6 +1392,43 @@ class TestMoveLogDisplay:
         assert self.runner._move_log_display(5) == [
             "T1:オオニューラのわるだくみ", "T2:リキキリンのけたぐり（推定）",
         ]
+
+
+class TestRenderContextFaintSide:
+    """_render_context: 改善ロードマップ③（表情連動）用の faint_side 伝播。
+    manifest.jsonl の context.faint_side に「自分/相手どちらが倒れたか」を
+    載せ、VMC操作スクリプトが表情を選び分けられるようにする。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._move_log = []
+        self.runner._tentative_opponent_moves = []
+        self.runner._render_sink = MagicMock()  # None でなければ良い（ダミー）
+
+    def test_faint_side_included_when_present(self):
+        ctx = self.runner._render_context({"turn": 3, "faint_side": "player"})
+        assert ctx["faint_side"] == "player"
+
+    def test_faint_side_omitted_when_not_a_faint_event(self):
+        """faint以外のイベント（battle_contextにfaint_sideキーが無い）では含めない。"""
+        ctx = self.runner._render_context({"turn": 3})
+        assert "faint_side" not in ctx
+
+    def test_faint_side_none_when_ambiguous(self):
+        ctx = self.runner._render_context({"turn": 3, "faint_side": None})
+        assert ctx["faint_side"] is None
+
+    def test_battle_result_included_when_present(self):
+        ctx = self.runner._render_context({"turn": 10, "battle_result": "勝ち"})
+        assert ctx["battle_result"] == "勝ち"
+
+    def test_battle_result_omitted_when_not_battle_end(self):
+        ctx = self.runner._render_context({"turn": 3})
+        assert "battle_result" not in ctx
+
+    def test_returns_none_without_render_sink(self):
+        self.runner._render_sink = None
+        assert self.runner._render_context({"faint_side": "player"}) is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

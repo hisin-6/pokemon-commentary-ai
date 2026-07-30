@@ -2199,6 +2199,34 @@ class BattleStateTracker:
             "alive_opponent": self._opponent_alive_count or known_o,
         }
 
+    def fainted_names(self) -> tuple[set[str], set[str]]:
+        """現在気絶しているポケモン名の集合を (自分側, 相手側) で返す。
+        `update()` 呼び出し前後で比較して新規気絶の陣営を判定する用途
+        （改善ロードマップ③・表情連動: 自分が倒れたら哀しい／相手を倒したら
+        嬉しい、の判定に使う）。
+        """
+        return (
+            {s.name for s in self._player if s.fainted},
+            {s.name for s in self._opponent if s.fainted},
+        )
+
+    @staticmethod
+    def diff_fainted_side(
+        prev: tuple[set[str], set[str]], curr: tuple[set[str], set[str]]
+    ) -> str | None:
+        """fainted_names() の前後スナップショットから新規に気絶した陣営を返す。
+        「自分」/「相手」どちらかのみに新規気絶があれば "player"/"opponent"。
+        両陣営同時（同時ダウン等）や新規気絶が無い場合は判定不能として None
+        （誤タグよりタグ無しの方が安全という方針）。
+        """
+        new_player = curr[0] - prev[0]
+        new_opponent = curr[1] - prev[1]
+        if new_player and not new_opponent:
+            return "player"
+        if new_opponent and not new_player:
+            return "opponent"
+        return None
+
     def to_context(self) -> dict:
         """Bedrock に渡す戦況サマリーを返す。"""
         on_field_p = [p for p in self._player   if p.on_field and not p.fainted]
@@ -3237,10 +3265,17 @@ class Pipeline:
                     log.info("[戦況] 遅延登録: 自分 %s（battle_start フォールバック）", name)
                 self._pre_battle_player.clear()
 
+        faint_side: str | None = None
         if self._battle_active:
+            prev_fainted = self._battle_tracker.fainted_names()
             self._battle_tracker.update(game_state, event_type)
+            if event_type == "faint":
+                faint_side = self._battle_tracker.diff_fainted_side(
+                    prev_fainted, self._battle_tracker.fainted_names())
 
         battle_context = self._battle_tracker.to_context()
+        if event_type == "faint":
+            battle_context["faint_side"] = faint_side
         # レンダーモード: イベント処理後の戦況をパネル用に記録（v2b）
         self._record_panel_state()
         log.info(
@@ -3315,6 +3350,9 @@ class Pipeline:
                 game_state = dict(game_state)
                 game_state["battle_result"] = self._battle_result
                 log.info("[戦況] 勝敗検出: %s", self._battle_result)
+                # 改善ロードマップ③（表情連動）用: manifest.jsonlのcontextにも
+                # 載せ、VMC操作スクリプトが勝ち=喜び／負け=哀しみを選び分けられるようにする
+                battle_context["battle_result"] = self._battle_result
 
         # ── 実況文の生成・再生（ライブ）／後付け生成用バッファへの追加（動画モード）──
         # event_time はこのハンドラが処理中のフレームの動画内時刻（同期実行なので
@@ -3512,6 +3550,15 @@ class Pipeline:
             ctx["turn"] = battle_context.get("turn")
             ctx["player"] = battle_context.get("player_pokemon")
             ctx["opponent"] = battle_context.get("opponent_pokemon")
+            if "faint_side" in battle_context:
+                # 改善ロードマップ③（表情連動）用: "player"=自分が倒れた／
+                # "opponent"=相手を倒した／None=判定不能。VMC操作スクリプトが
+                # manifest.jsonlのcontext.faint_sideを見て表情を選び分ける
+                ctx["faint_side"] = battle_context["faint_side"]
+            if "battle_result" in battle_context:
+                # 改善ロードマップ③（表情連動）用: "勝ち"/"負け"。battle_end時の
+                # 表情（喜び/哀しみ）選択に使う
+                ctx["battle_result"] = battle_context["battle_result"]
         return ctx
 
     def _speak_async(self, commentary: str, event_type: str = "unknown",
