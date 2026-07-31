@@ -444,6 +444,28 @@ class TestAvatarCommand:
                 gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
                 avatar_video=Path("avatar.mp4"), avatar_offset=-1.0)
 
+    def test_max_duration_caps_output_length(self, tmp_path):
+        """アバター録画が本編（動画+tail_pad）より長い場合、出力を-tで本編長に
+        打ち切る（実機07-03-23-34-29: 本編309.9秒・アバター396.8秒で出力が
+        396.8秒に間延びし、末尾87秒が本編と無関係な静止画+アバターだけの
+        無駄な尻尾になっていたバグの再発防止）。"""
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
+            avatar_video=Path("avatar.mp4"), max_duration=309.956)
+        idx = cmd.index("-t")
+        assert cmd[idx + 1] == "309.956"
+        # -t は出力パスの直前（マッピング後の出力オプション）
+        assert cmd[idx + 2] == "o.mp4"
+
+    def test_max_duration_zero_omits_flag(self, tmp_path):
+        """max_duration未指定（既定0）では-tを付けない（従来コマンドと同一）。"""
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
+            avatar_video=Path("avatar.mp4"))
+        assert "-t" not in cmd
+
 
 class TestLoadStates:
     def test_missing_file_returns_empty(self, tmp_path):

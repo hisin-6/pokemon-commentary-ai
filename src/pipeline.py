@@ -269,6 +269,18 @@ def _extract_structured_info(
     if is_status_panel:
         log.debug("「相手を見る」パネル検出 → ポケモン名候補収集をスキップ")
 
+    # 技の詳細（つよさの表示・「能力」「ステータス」タブ）パネル検出
+    # 自分の全ポケモン（場・控え問わず）が画面左側に縦一列で表示され、
+    # 上位2匹（場のポケモン）が y<_PLAYER_Y_THRESHOLD の「相手」帯に入り込む。
+    # 実機（07-03-23-34-29）でガオガエン・メタグロスが相手ポケモンとして誤登録され、
+    # 本物の相手ポケモンが「新顔が登場した」と誤判定されて即時evictされた
+    # （フシギバナ・リザードン誤消失）ため、状態確認パネルと同様に名前候補収集をスキップする。
+    is_move_detail_panel = (
+        any("能力" in t for t in all_texts) and any("ステータス" in t for t in all_texts)
+    )
+    if is_move_detail_panel:
+        log.info("技の詳細（つよさの表示）パネル検出 → ポケモン名候補収集をスキップ")
+
     for r in ocr_results:
         if r["confidence"] < 0.4:
             continue
@@ -297,8 +309,8 @@ def _extract_structured_info(
             continue
 
         # チャンピオンズ: 相手HP%パターン（XX%形式）
-        # 状態確認パネル中は複数ポケモンのHP%が混在するためスキップ
-        if not is_status_panel:
+        # 状態確認パネル・技の詳細パネル中は複数ポケモンのHP%が混在するためスキップ
+        if not is_status_panel and not is_move_detail_panel:
             m_pct = hp_pct_pattern.search(text_norm)
             if m_pct:
                 pct_val = int(m_pct.group(1))
@@ -312,8 +324,8 @@ def _extract_structured_info(
                             hp_opponent_with_xy.append((hp_str, cx, cy))
                     continue
 
-        # 状態確認パネル中は名前候補収集しない（HP値は上で収集済み）
-        if is_status_panel:
+        # 状態確認パネル・技の詳細パネル中は名前候補収集しない（HP値は上で収集済み）
+        if is_status_panel or is_move_detail_panel:
             continue
 
         # 「ポケモン名」形式（ゆけ！アニメ中）の山括弧を除去してポケモン名として取り出す
@@ -1596,15 +1608,29 @@ class BattleStateTracker:
                     slot.on_field = True
 
         newly_removed_opponent: list[FieldPokemon] = []
+        _on_field_opponent_names = {s.name for s in self._opponent if s.on_field and not s.fainted}
         for slot in self._opponent:
             if slot.on_field and not slot.fainted:
                 # OCR で相手名が検出されている場合: そのフレームで見えないなら即座に降ろす
                 # （交代直後に旧ポケモンが残り続けるのを防ぐ）
-                if current_opponent_names and slot.name not in current_opponent_names:
-                    # こちらは「今フレームに他の相手名が見えているのにこの名前だけ無い」
-                    # という直接証拠に基づく即時判定のため、意図的に self.turn
-                    # （イベント単位）のままにする。self.game_turn 化すると次のターン
-                    # 境界まで除去が遅延し、交代直後に旧ポケモンが残り続けてしまう。
+                missing_this_frame = bool(current_opponent_names) and slot.name not in current_opponent_names
+                has_replacement_evidence = False
+                if missing_this_frame:
+                    # ダブルバトル対策（オーロンゲ消失バグ・実機07-03-23-34-29で確認）:
+                    # このフレームに見えている名前が既知のパートナー1匹だけ（＝新顔が
+                    # 登場していない）場合、これは「交代」の直接証拠ではなく単に2匹目の
+                    # ネームプレートがそのフレームだけ読めなかっただけの可能性が高い。
+                    # quick evictionは「未知の新しい名前が登場した」時のみ発火させ、
+                    # それ以外はすぐ下のelif（game_turnベースの猶予）に委ねる。
+                    other_known_names = _on_field_opponent_names - {slot.name}
+                    has_replacement_evidence = any(
+                        n not in other_known_names for n in current_opponent_names
+                    )
+                if missing_this_frame and has_replacement_evidence:
+                    # こちらは「新しい名前の登場」という直接証拠に基づく即時判定のため、
+                    # 意図的に self.turn（イベント単位）のままにする。self.game_turn化
+                    # すると次のターン境界まで除去が遅延し、交代直後に旧ポケモンが
+                    # 残り続けてしまう。
                     quick_threshold = 1
                     if self.turn - slot.last_seen_turn >= quick_threshold:
                         slot.on_field = False
@@ -2390,13 +2416,31 @@ def _detect_battle_result(text: str) -> str | None:
 
     OCRの分割・スペース混入（「勝負に 勝った!」等）を吸収するため
     スペース除去後に部分一致で判定する。判定不能（降参・通信エラー等）は None。
+
+    ⚠️ 実際の`_ocr_results_to_text`は検出テキスト断片を" / "（スラッシュ）区切りで
+    結合する（例:「bennyとの / 勝負に / 勝った!」）ため、スペースだけでなく
+    スラッシュも除去しないと「勝負に」と「勝った!」が別断片になった瞬間に
+    判定できなくなる（実機07-03-23-34-29で確認: battle_result恒久未検出の真因）。
     """
-    joined = text.replace(" ", "")
+    joined = text.replace(" ", "").replace("/", "")
     if "勝負に勝" in joined:
         return "勝ち"
     if "勝負に負" in joined:
         return "負け"
     return None
+
+
+def _check_end_screen_ocr(texts: list[str]) -> tuple[bool, str | None]:
+    """終了画面連続確認中に蓄積した複数フレーム分のOCRテキストから、
+    誤発火防止のキーワード一致可否と勝敗判定を行う。
+
+    「勝負に勝った/負けた」はフェードイン等で1フレーム目には出揃わないことがあるため、
+    確認フレーム全部のテキストを結合してから判定する（1フレームだけに頼ると取りこぼす）。
+    """
+    joined = "".join(texts)
+    if not any(kw in joined for kw in _END_SCREEN_OCR_KEYWORDS):
+        return False, None
+    return True, _detect_battle_result(joined)
 
 
 # ─── AIグリッチ差し替え（Bedrock保留・困惑応答対策） ─────────────────────────
@@ -2665,6 +2709,7 @@ class Pipeline:
         self._BATTLE_START_COOLDOWN = 10.0  # battle_end 後この秒数は battle_start をブロック
         self._end_screen_count: int = 0  # 終了画面連続検出カウント
         self._END_SCREEN_CONFIRM = 3      # この回数連続で検出したら battle_end 確定
+        self._end_screen_ocr_texts: list[str] = []  # 連続確認中の各フレームOCRを蓄積（勝敗テキストの取りこぼし対策）
         self._battle_active_since: float = 0.0  # battle_start の時刻
         self._MIN_BATTLE_DURATION = 25.0  # バトル開始からこの秒数は終了画面チェックをスキップ
         self._prev_yolo: BattleState | None = None
@@ -2741,6 +2786,7 @@ class Pipeline:
         self._battle_active = True
         self._battle_active_since = self._now()
         self._end_screen_count = 0
+        self._end_screen_ocr_texts = []
         self._commentary_history = []
         self._move_log = []
         self._last_ball_yolo = None   # バトル開始時にボール情報をリセット
@@ -2832,20 +2878,27 @@ class Pipeline:
                     if self._yolo.detect_end_screen(frame):
                         self._end_screen_count += 1
                         log.debug(f"[YOLO] 終了画面検出 {self._end_screen_count}/{self._END_SCREEN_CONFIRM}")
+                        # OCR で勝敗テキストを確認（誤発火防止の AND 条件）。
+                        # 「勝負に勝った/負けた」の文字はフェードイン等で1フレーム目には
+                        # 出揃っていないことがあるため、連続確認の毎フレームでOCRし蓄積する
+                        # （3回目の1フレームだけに頼ると取りこぼす＝battle_result未検出の原因）。
+                        _end_ocr = run_ocr(self._reader, frame)
+                        _end_joined = "".join(r["text"] for r in _end_ocr)
+                        self._end_screen_ocr_texts.append(_end_joined)
                         if self._end_screen_count >= self._END_SCREEN_CONFIRM:
-                            # OCR で勝敗テキストを確認（誤発火防止の AND 条件）
-                            _end_ocr = run_ocr(self._reader, frame)
-                            _end_joined = "".join(r["text"] for r in _end_ocr)
-                            if not any(kw in _end_joined for kw in _END_SCREEN_OCR_KEYWORDS):
-                                log.info(f"[YOLO] 終了画面{self._end_screen_count}回検出 → OCRキーワード不一致のため誤発火と判定 (OCR: {_end_joined[:60]})")
+                            _kw_matched, _result = _check_end_screen_ocr(self._end_screen_ocr_texts)
+                            if not _kw_matched:
+                                log.info(f"[YOLO] 終了画面{self._end_screen_count}回検出 → OCRキーワード不一致のため誤発火と判定 (OCR: {''.join(self._end_screen_ocr_texts)[:60]})")
                                 self._end_screen_count = 0
+                                self._end_screen_ocr_texts = []
                             else:
                                 log.info(f"[YOLO] 終了画面を{self._end_screen_count}回連続検出 + OCR確認済 → battle_end")
                                 # YOLO経路のbattle_endはocr_results=[]で発行するため
                                 # 確認用OCRテキストからここで勝敗を拾っておく
                                 if self._battle_result is None:
-                                    self._battle_result = _detect_battle_result(_end_joined)
+                                    self._battle_result = _result
                                 self._end_screen_count = 0
+                                self._end_screen_ocr_texts = []
                                 turn += 1
                                 self._phase_classifier.set_processing(True)
                                 try:
@@ -2859,6 +2912,7 @@ class Pipeline:
                                 continue
                     else:
                         self._end_screen_count = 0
+                        self._end_screen_ocr_texts = []
 
                 # ── HPバーピクセル解析（バトル中は毎フレーム）────────────────
                 # 軽量なピクセル処理のためOCRサイクルに依存させない。

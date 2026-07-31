@@ -238,6 +238,10 @@ def main(argv=None) -> int:
     gaps = compute_gaps(scheduled, video_dur, min_gap=args.min_gap)
     if not gaps:
         logger.info("%.0f秒超の無言区間なし。フィラー生成は不要", args.min_gap)
+        if not args.dry_run:
+            # fillers.jsonl を空で作成しておく（check_spoilers.py が「未実行」と
+            # 「実行したがフィラー0件」を区別できるようにするため）
+            (render_dir / "fillers.jsonl").write_text("", encoding="utf-8")
         return 0
     logger.info("無言区間 %d箇所: %s", len(gaps),
                 " / ".join(f"{g['start']:.0f}〜{g['end']:.0f}s" for g in gaps))

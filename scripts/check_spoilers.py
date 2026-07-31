@@ -94,10 +94,13 @@ def main(argv=None) -> int:
     rd = Path(args.render_dir)
     events = _load_jsonl(rd / "manifest.jsonl")
     moments = _load_jsonl(rd / "timeline.jsonl")
-    fillers = _load_jsonl(rd / "fillers.jsonl")
-    if not fillers:
+    if not (rd / "fillers.jsonl").exists():
         print("fillers.jsonl がありません（パス1.5が未実行 or dry-runのみ）")
         return 1
+    fillers = _load_jsonl(rd / "fillers.jsonl")
+    if not fillers:
+        print("fillers.jsonl は0件（無言区間なし・検査対象なし）")
+        return 0
 
     flags = find_spoilers(fillers, moments, events)
     flagged_times = {round(float(fl["filler"]["event_time"]), 3) for fl in flags}

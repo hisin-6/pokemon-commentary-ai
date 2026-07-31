@@ -25,6 +25,7 @@ if _ROOT not in sys.path:
 # conftest.py で重いモジュールがモック済みなのでここで安全にインポートできる
 from src.pipeline import (
     _build_bedrock_context,
+    _check_end_screen_ocr,
     _clean_commentary,
     _detect_battle_result,
     _detect_glitch_cause,
@@ -137,6 +138,13 @@ class TestDetectBattleResult:
         """OCRが「勝負に」と「負けた!」に分割してスペース結合されるケース。"""
         assert _detect_battle_result("〇〇は 勝負に 負けた!") == "負け"
 
+    def test_ocr_fragments_joined_with_slash(self):
+        """実際の_ocr_results_to_textは断片を" / "（スラッシュ）区切りで結合するため、
+        スペース除去だけでは「勝負に」と「勝った!」の間に"/"が残り判定できなかった
+        （実機07-03-23-34-29のocr_text「bennyとの / 勝負に / 勝った!」で再現・
+        battle_result恒久未検出の真因）。"""
+        assert _detect_battle_result("bennyとの / 勝負に / 勝った!") == "勝ち"
+
     def test_unknown_returns_none(self):
         assert _detect_battle_result("降参が選ばれました") is None
         assert _detect_battle_result("") is None
@@ -152,6 +160,36 @@ class TestDetectBattleResult:
         gs2 = dict(gs)
         del gs2["battle_result"]
         assert _build_bedrock_context(gs2, "move_used", None, None, [])["battle_result"] == ""
+
+
+class TestCheckEndScreenOcr:
+    """終了画面連続確認の複数フレーム分OCRを結合して判定する_check_end_screen_ocr。
+    battle_result未検出バグ（07-03-23-34-29）は3回目確認フレーム1枚のOCRだけに
+    依存していたため「勝負に勝った/負けた」がフェードイン中で拾えないと永久にNoneのままだった。
+    複数フレームの結合判定でこれを緩和する。"""
+
+    def test_keyword_and_result_in_last_frame_only(self):
+        """1・2枚目はまだ文字が出ておらず、3枚目でようやく出揃うケース（フェードイン想定）。"""
+        matched, result = _check_end_screen_ocr(["", "選ばれ", "勝負に勝った!"])
+        assert matched is True
+        assert result == "勝ち"
+
+    def test_result_split_across_frames(self):
+        """「勝負に」と「負けた!」が別フレームに分かれて出るケース。"""
+        matched, result = _check_end_screen_ocr(["勝負に", "負けた!"])
+        assert matched is True
+        assert result == "負け"
+
+    def test_no_keyword_in_any_frame_is_not_matched(self):
+        matched, result = _check_end_screen_ocr(["", "", ""])
+        assert matched is False
+        assert result is None
+
+    def test_keyword_matched_but_result_undetermined(self):
+        """「選ばれました」（降参等）はキーワード一致するが勝敗は不明のままNone。"""
+        matched, result = _check_end_screen_ocr(["降参が選ばれました"])
+        assert matched is True
+        assert result is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -370,6 +408,54 @@ class TestExtractStructuredInfo:
         ]
         info = _extract_structured_info(results)
         assert len(info["name_candidates_player"]) == 0
+
+    def test_move_detail_panel_skips_name_collection(self):
+        """「能力」「ステータス」タブ（技の詳細・つよさの表示パネル）がある場合、
+        名前候補収集をスキップする。
+
+        実機（07-03-23-34-29）で、このパネルは自分の全ポケモン（場・控え問わず）を
+        画面左側に縦一列で表示し、上位2匹（場のポケモン=ガオガエン・メタグロス）が
+        y<_PLAYER_Y_THRESHOLD の「相手」帯に入り込んでいた。これにより本物の相手
+        ポケモン（フシギバナ・リザードン）が「新顔が登場した」と誤判定されて
+        即時evictされるバグが発生した（quick_threshold=1の直接証拠チェックへの
+        誤入力）。状態確認パネルと同様に名前候補収集自体をスキップして対策する。
+        """
+        mock_clf = MagicMock()
+        mock_result = MagicMock()
+        mock_result.category = "pokemon"
+        mock_result.canonical_ja = "ガオガエン"
+        mock_clf.classify.return_value = mock_result
+
+        results = [
+            _ocr("能力", y_center=130.0),
+            _ocr("ステータス", y_center=130.0),
+            self._opponent_ocr("ガオガエン"),  # 本来は自分のポケモンだが相手帯に誤表示される
+        ]
+        info = _extract_structured_info(results, classifier=mock_clf)
+        assert "ガオガエン" not in info["name_candidates_opponent"]
+
+    def test_move_detail_panel_tolerates_ocr_noise_in_tab_labels(self):
+        """タブ文字列にOCRノイズ（前後の余分な文字）が混じっても検出できる。
+
+        実機の再検証（2回目のパス1実行）で、この判定を完全一致
+        （`"能力" in all_texts`という集合の要素一致）で実装したところ、ログ上は
+        「能力」「ステータス」が明確に見えているのに検出されず誤evictが再現した。
+        `is_status_panel`（"戦闘中" in t という部分一致方式）と同じ書き方に
+        揃えることで、周辺文字混入に耐性を持たせて解決した。
+        """
+        mock_clf = MagicMock()
+        mock_result = MagicMock()
+        mock_result.category = "pokemon"
+        mock_result.canonical_ja = "ガオガエン"
+        mock_clf.classify.return_value = mock_result
+
+        results = [
+            _ocr("L能力", y_center=130.0),       # Lボタンアイコンのテキストが混入
+            _ocr("ステータスR", y_center=130.0),  # Rボタンアイコンのテキストが混入
+            self._opponent_ocr("ガオガエン"),
+        ]
+        info = _extract_structured_info(results, classifier=mock_clf)
+        assert "ガオガエン" not in info["name_candidates_opponent"]
 
     def test_with_classifier_pokemon_included(self):
         """PokeClassifier がポケモン名と判定したテキストは名前候補に含まれる。"""
@@ -1095,6 +1181,51 @@ class TestOnFieldMissThresholdUsesGameTurn:
         assert self.mine.on_field is True
 
 
+class TestOpponentQuickEvictionRequiresReplacementEvidence:
+    """相手側の「今フレームで名前が見えなければ即座に降ろす」（quick_threshold=1）の
+    回帰ガード。ダブルバトルで2匹目の名前が単に1フレーム読めなかっただけで
+    「交代」と誤判定して即時evictし、二度と復帰しなくなるバグ（オーロンゲ消失・
+    実機07-03-23-34-29のstates.jsonl/timeline.jsonlで確認: オーロンゲがリフレクター
+    使用直後、交代メッセージなしに同ターン中に消えたまま試合終了まで戻らなかった）
+    の再発防止。「新しい名前が登場した」という直接証拠がある時だけ即時evictする。
+    """
+
+    def setup_method(self):
+        self.tracker = BattleStateTracker()
+
+    def test_doubles_partner_only_miss_does_not_evict(self):
+        """ダブルバトルでパートナーの名前しか見えないフレームでは即座に降ろされない
+        （新顔が登場していないため交代の直接証拠がない）。"""
+        gs_both = _make_game_state(opponent_names=["アシレーヌ", "オーロンゲ"])
+        _register(self.tracker, gs_both)
+        oorondge = next(s for s in self.tracker._opponent if s.name == "オーロンゲ")
+        assert oorondge.on_field is True
+
+        gs_partner_only = _make_game_state(opponent_names=["アシレーヌ"])
+        self.tracker.update(gs_partner_only, "move_used")
+        assert oorondge.on_field is True
+
+    def test_doubles_new_name_appearing_still_evicts_immediately(self):
+        """新しい名前が登場した場合は本物の交代なので従来通り即座に降ろされる。"""
+        gs_both = _make_game_state(opponent_names=["アシレーヌ", "オーロンゲ"])
+        _register(self.tracker, gs_both)
+        oorondge = next(s for s in self.tracker._opponent if s.name == "オーロンゲ")
+
+        gs_switched = _make_game_state(opponent_names=["アシレーヌ", "フシギバナ"])
+        self.tracker.update(gs_switched, "move_used")
+        assert oorondge.on_field is False
+
+    def test_singles_absence_still_evicts_immediately(self):
+        """単体バトル（場に1匹だけ）では新顔登場と同義なので従来通り即座に降ろされる。"""
+        gs = _make_game_state(opponent_names=["ドドゲザン"])
+        _register(self.tracker, gs)
+        mon = next(s for s in self.tracker._opponent if s.name == "ドドゲザン")
+
+        gs_switched = _make_game_state(opponent_names=["ガブリアス"])
+        self.tracker.update(gs_switched, "move_used")
+        assert mon.on_field is False
+
+
 class TestUpdateSwitchOut:
     """_update_switch_out のパターン1（「〜は戻っていく」検出）の誤爆防止回帰ガード。
 
@@ -1426,6 +1557,7 @@ class TestResetBattleState:
         runner._battle_tracker = old_tracker
         runner._battle_active = False
         runner._end_screen_count = 2
+        runner._end_screen_ocr_texts = ["選ばれ"]
         runner._commentary_history = ["前試合の実況"]
         runner._move_log = ["T1:スピアーのどくづき"]
         runner._last_ball_yolo = object()
@@ -1445,6 +1577,7 @@ class TestResetBattleState:
         assert runner._battle_active is True
         assert runner._battle_active_since == 100.0
         assert runner._end_screen_count == 0
+        assert runner._end_screen_ocr_texts == []
         assert runner._commentary_history == []
         assert runner._move_log == []
         assert runner._last_ball_yolo is None

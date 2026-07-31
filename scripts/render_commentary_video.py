@@ -514,7 +514,8 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
                               avatar_chroma: str = _AVATAR_CHROMA,
                               avatar_similarity: float = _AVATAR_SIMILARITY,
                               avatar_crop: str = None,
-                              tail_pad: float = 0.0) -> list:
+                              tail_pad: float = 0.0,
+                              max_duration: float = 0.0) -> list:
     """biim風レイアウト（案A）合成のffmpegコマンドを組み立てる。
 
     ゲーム画面を左上に縮小配置し、右サイドパネルの下地・下部実況帯を描画、
@@ -531,6 +532,14 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
     （tpad=stop_mode=clone）。末尾の実況が動画終端をまたぐ場合に映像なしで音声
     だけ流れるのを防ぐ。tpadはフィルタチェーン先頭（字幕・パネル描画の前段）に
     置くため、延長区間でも字幕は時刻通りに表示・消滅する。
+
+    max_duration > 0 のとき、出力を max_duration 秒で打ち切る（-t）。アバター録画が
+    本編（動画+tail_pad）より長い場合、overlay のデフォルト挙動（eof_action=repeat と
+    対称に、先に終わった側の最終フレームで静止して長い方に合わせる）により本編側の
+    最終フレームが静止したまま余ったアバター秒数だけ出力が伸びてしまう
+    （実機07-03-23-34-29で確認: 本編309.9秒・アバター396.8秒の組み合わせで
+    出力が396.8秒に間延びし、末尾87秒が試合とは無関係な静止画+アバターだけの
+    無駄な尻尾になっていた）。本編の長さに揃えて余剰分を切り捨てるための安全弁。
     """
     if avatar_video is not None and avatar_offset < 0:
         raise ValueError("avatar_offset は0以上（録画をWAV再生より先に開始する運用）")
@@ -585,6 +594,7 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
         f"[duck][cm]amix=inputs=2:duration=longest:dropout_transition=0,"
         f"volume=2[aout]"
     )
+    duration_opts = ["-t", f"{max_duration:.3f}"] if max_duration > 0 else []
     return (
         ["ffmpeg", "-y"] + inputs + [
             "-filter_complex", f"{video_filter};{audio_filter}",
@@ -592,6 +602,7 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k",
+        ] + duration_opts + [
             str(out_path),
         ]
     )
@@ -788,6 +799,8 @@ def main(argv=None) -> int:
             logger.info("アバター合成: %s（offset=%.2fs・幅%dpx）",
                         avatar_video, args.avatar_offset, args.avatar_width)
         out_path = Path(args.out) if args.out else render_dir / f"{render_dir.name}{suffix}"
+        # アバター録画が本編（動画+tail_pad）より長い場合の間延び防止（末尾を本編長で打ち切る）
+        max_duration = (video_dur or track_end) + tail_pad if avatar_video else 0.0
         cmd = build_ffmpeg_command_biim(video, track_wav, out_path, ass_path,
                                         args.gain, args.duck_threshold, args.duck_ratio,
                                         avatar_video=avatar_video,
@@ -795,7 +808,8 @@ def main(argv=None) -> int:
                                         avatar_width=args.avatar_width,
                                         avatar_chroma=args.avatar_chroma,
                                         avatar_crop=args.avatar_crop,
-                                        tail_pad=tail_pad)
+                                        tail_pad=tail_pad,
+                                        max_duration=max_duration)
     else:
         if args.avatar_video:
             logger.error("--avatar-video は --layout biim でのみ使えます")
