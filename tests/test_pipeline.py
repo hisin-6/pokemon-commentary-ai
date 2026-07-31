@@ -1323,6 +1323,93 @@ class TestOpponentAttackFallbackAmbiguity:
         assert self.runner._move_log == ["T0:ガブリアスのじだんだ"]
 
 
+class TestMoveSingleDispatch:
+    """技ごとの実況（move_single）: _update_move_log が技エントリを確定登録した瞬間に
+    _dispatch_commentary を event_type="move_single" で呼ぶことの回帰ガード。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._tentative_opponent_moves = []
+        self.runner._battle_active = True
+        self.runner._dense_scan_start_turn = None
+        self.runner._move_log = []
+        self.runner._MAX_MOVE_LOG = 8
+        self.runner._dense_scan_remaining = 0
+        self.runner._last_full_ocr_results = []
+        self.runner._video_now = 123.0
+        self.runner._ec2_url = "http://fake-ec2:5000"
+        self.runner._dispatch_commentary = MagicMock()
+
+    def _set_classifier(self, moves, pokemon, learnable=True):
+        class _Result:
+            def __init__(self, category, score, canonical_ja):
+                self.category = category
+                self.score = score
+                self.canonical_ja = canonical_ja
+
+        def classify(text):
+            if text in moves:
+                return _Result("move", 95, text)
+            if text in pokemon:
+                return _Result("pokemon", 95, pokemon[text])
+            return _Result("other", 0, text)
+
+        clf = MagicMock()
+        clf.classify.side_effect = classify
+        clf.is_move_learnable.return_value = learnable
+        self.runner._classifier = clf
+
+    def test_confirmed_move_dispatches_move_single(self):
+        self.runner._battle_tracker._player.append(FieldPokemon(name="ガブリアス", on_field=True))
+        self._set_classifier(moves={"じしん"}, pokemon={"ガブリアス": "ガブリアス"})
+        events = [_ocr("ガブリアスの", y_center=800.0), _ocr("じしん!", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+
+        assert self.runner._move_log == ["T0:ガブリアスのじしん"]
+        self.runner._dispatch_commentary.assert_called_once()
+        args, kwargs = self.runner._dispatch_commentary.call_args
+        event_type, frame, game_state, battle_context, move_log, attempt_bedrock = args
+        assert event_type == "move_single"
+        assert game_state["move_focus"] == "自分のガブリアスのじしん"
+        assert attempt_bedrock is True
+        assert kwargs["event_time"] == 123.0
+
+    def test_tentative_move_still_dispatches(self):
+        """断片一致救済等でtentative扱いになった技も実況の対象にする（ユーザー決定）。"""
+        self.runner._battle_tracker._opponent.append(FieldPokemon(name="ドドゲザン", on_field=True))
+        self._set_classifier(moves={"ドゲザン"}, pokemon={})
+        events = [_ocr("ドゲザンの", y_center=800.0), _ocr("ドゲザン", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+
+        assert len(self.runner._tentative_opponent_moves) == 1
+        self.runner._dispatch_commentary.assert_called_once()
+        _, _, game_state, _, _, _ = self.runner._dispatch_commentary.call_args.args
+        assert game_state["move_focus"] == "相手のドドゲザンのドゲザン"
+
+    def test_duplicate_entry_does_not_redispatch(self):
+        """直近3件と同一エントリは_move_log自体に追加されないため、実況も再ディスパッチされない。"""
+        self.runner._battle_tracker._player.append(FieldPokemon(name="ガブリアス", on_field=True))
+        self._set_classifier(moves={"じしん"}, pokemon={"ガブリアス": "ガブリアス"})
+        events = [_ocr("ガブリアスの", y_center=800.0), _ocr("じしん!", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+
+        assert self.runner._move_log == ["T0:ガブリアスのじしん"]
+        self.runner._dispatch_commentary.assert_called_once()
+
+    def test_partial_pipeline_without_ec2_url_does_not_raise(self):
+        """_ec2_url未設定（他の既存テストの部分構築Pipeline）では何もせず早期returnする。"""
+        del self.runner._ec2_url
+        self.runner._battle_tracker._player.append(FieldPokemon(name="ガブリアス", on_field=True))
+        self._set_classifier(moves={"じしん"}, pokemon={"ガブリアス": "ガブリアス"})
+        events = [_ocr("ガブリアスの", y_center=800.0), _ocr("じしん!", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)  # raise しなければOK
+
+        assert self.runner._move_log == ["T0:ガブリアスのじしん"]
+        self.runner._dispatch_commentary.assert_not_called()
+
+
 class TestResetBattleState:
     """_reset_battle_state: battle_start／遅延起動共通のリセット処理。
     遅延起動が前試合ロスターのまま走り新試合の繰り出しで eviction 連発していた

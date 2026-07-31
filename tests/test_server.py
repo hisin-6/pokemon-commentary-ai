@@ -230,6 +230,21 @@ class TestBuildVisionPrompt:
         )
         assert "OCRで検出した使用技" in prompt
 
+    def test_move_single_hint_embeds_move_focus(self):
+        """技ごとの実況（move_single）: move_focus に積んだ「陣営の＋ポケモン＋の＋技」を
+        プロンプトのイベント指示に埋め込み、この技1つだけに焦点を絞らせる。"""
+        prompt = _build_vision_prompt(
+            self._context("move_single", move_focus="自分のガブリアスのじしん"),
+            [], self._battle_state(),
+        )
+        assert "自分のガブリアスのじしん" in prompt
+        assert "1つだけに反応する" in prompt
+
+    def test_move_single_hint_handles_missing_move_focus(self):
+        """move_focus が無くても例外にならない（空文字扱い）。"""
+        prompt = _build_vision_prompt(self._context("move_single"), [], self._battle_state())
+        assert "1つだけに反応する" in prompt
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GET /health
@@ -353,7 +368,7 @@ class TestVisionEndpoint:
 
     def test_all_valid_event_types_accepted(self, client):
         """全イベント種別が 400 にならないことを確認（Bedrock はモック）。"""
-        valid_events = ["battle_start", "move_used", "switch", "faint", "battle_end"]
+        valid_events = ["battle_start", "move_used", "move_single", "switch", "faint", "battle_end"]
         mock_response_body = {
             "content": [{"text": "【実況】テスト実況"}],
             "usage": {"input_tokens": 50, "output_tokens": 20},

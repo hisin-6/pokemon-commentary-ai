@@ -81,7 +81,7 @@ log = logging.getLogger(__name__)
 log.info(f"ログファイル: {log_file_path}")
 
 # Bedrock を呼ぶイベント種別
-BEDROCK_EVENTS = {"battle_start", "move_used", "switch", "faint", "battle_end"}
+BEDROCK_EVENTS = {"battle_start", "move_used", "move_single", "switch", "faint", "battle_end"}
 
 
 # ─── OCR 結果からゲーム状態を構築 ─────────────────────────────────────────────
@@ -2508,6 +2508,7 @@ def _build_bedrock_context(
         "detected_moves":           " / ".join(move_log) if move_log else "なし",
         "faint_context":            game_state.get("faint_context", ""),  # 直前のfaint情報（統合時のみ）
         "battle_result":            game_state.get("battle_result", ""),  # 勝敗（battle_endのみ・"勝ち"/"負け"）
+        "move_focus":               game_state.get("move_focus", ""),  # 実況対象の1技（move_singleのみ）
     }
 
 
@@ -2920,7 +2921,7 @@ class Pipeline:
 
                     # ── 技使用・交代メッセージの検出（バトル中は常時監視）──────
                     if self._battle_active:
-                        self._update_move_log(ocr_results, is_main_ocr=True)
+                        self._update_move_log(ocr_results, is_main_ocr=True, frame=frame)
                         self._update_switch_out(ocr_results)
                         # OCR bbox 位置から状態異常アイコンを検出してトラッカーに反映
                         fh, fw = frame.shape[:2]
@@ -3105,7 +3106,7 @@ class Pipeline:
                     dense_texts = [r["text"] for r in dense_results if r["confidence"] >= 0.4]
                     if dense_texts:
                         log.info("[密集OCR] %s", " / ".join(dense_texts[:10]))
-                        self._update_move_log(dense_results)
+                        self._update_move_log(dense_results, frame=frame)
 
                 self._prev_yolo = yolo_state
 
@@ -3807,7 +3808,42 @@ class Pipeline:
             for e in self._move_log[-n:]
         ]
 
-    def _update_move_log(self, ocr_results: list[dict], is_main_ocr: bool = False) -> None:
+    def _dispatch_move_commentary(
+        self,
+        pokemon_name: str,
+        move_name: str,
+        side: str | None,
+        ocr_results: list[dict],
+        frame: "np.ndarray | None",
+    ) -> None:
+        """技ごとの実況（move_single）: 技1つ1つに専用の実況イベントをディスパッチする。
+
+        _update_move_log が技エントリを確定登録した瞬間（entry の重複除外がそのまま
+        デバウンス代わり）に呼ばれる。tentative（仮確定）な技検出でもそのまま実況する
+        （取りこぼしを減らす方を優先・ユーザー決定）。ライブ/動画後付け両モードとも
+        _dispatch_commentary の既存分岐にそのまま乗る。
+
+        テストが部分構築のPipeline（Pipeline.__new__）から _update_move_log 経由で
+        呼ぶケースがあるため、_ec2_url 等が未設定なら何もしない（早期return）。
+        """
+        if not hasattr(self, "_ec2_url"):
+            return
+        if not self._battle_active:
+            return
+        game_state = _build_game_state(
+            ocr_results, BattleState(), "move_single", BattleState(),
+            self._classifier, ability_msg=getattr(self, "_last_ability_msg", {}))
+        side_prefix = f"{side}の" if side else ""
+        game_state["move_focus"] = f"{side_prefix}{pokemon_name}の{move_name}"
+        battle_context = self._battle_tracker.to_context()
+        attempt_bedrock = bool(
+            self._ec2_url and "move_single" in BEDROCK_EVENTS and self._battle_active)
+        self._dispatch_commentary(
+            "move_single", frame, game_state, battle_context,
+            self._move_log_display(5), attempt_bedrock, event_time=self._now())
+
+    def _update_move_log(self, ocr_results: list[dict], is_main_ocr: bool = False,
+                          frame: "np.ndarray | None" = None) -> None:
         """OCR 結果から「〜の → 技名」パターンを検出して _move_log に追記する。
 
         スキャン対象:
@@ -3815,6 +3851,8 @@ class Pipeline:
           2. メッセージボックスROI の結合テキスト内の「[ポケモン名]の[技名]」（ROIスキャン）
              ROI: x < 520, 740 < cy < 930 (BattleMessageParser と同じ領域)
         is_main_ocr=True の場合: dense scan フォールバックで仮確定した相手技の後付け修正も行う。
+        frame: 技ごとの実況（move_single）ディスパッチ用。ライブモードのBedrock Vision呼び出しに使う
+        （動画後付けモードでは画像を使わないため None でも可）。
         """
         _INVALID_POKEMON_KEYWORDS = {"相手", "あいて", "とも", "自分", "じぶん"}
 
@@ -3970,13 +4008,16 @@ class Pipeline:
                 log.info("[技ログ] 検出: %s%s", entry, "（仮確定）" if tentative else "")
                 # レンダーモード: 技が画面に映った瞬間の動画内時刻を記録
                 # （台本パスがライブ実況風の時刻アンカーとして使う）
+                move_side = self._battle_tracker.move_user_side(
+                    pokemon_name, is_opponent=is_opponent)
                 # getattr: テストが部分構築のPipelineで_update_move_logを呼ぶため
                 render_sink = getattr(self, "_render_sink", None)
                 if render_sink is not None:
-                    render_sink.add_moment(
-                        self._now(), "move", entry,
-                        side=self._battle_tracker.move_user_side(
-                            pokemon_name, is_opponent=is_opponent))
+                    render_sink.add_moment(self._now(), "move", entry, side=move_side)
+                # 技ごとの実況（move_single）: 技1つ1つに専用の実況イベントをディスパッチする。
+                # entry の重複除外（この if ブロック自体）がそのままデバウンス代わりになる。
+                # tentative（仮確定）でも実況する（取りこぼしを減らす方を優先・ユーザー決定）
+                self._dispatch_move_commentary(pokemon_name, move_name, move_side, ocr_results, frame)
                 if tentative:
                     self._tentative_opponent_moves.append({
                         "old_entry": entry,

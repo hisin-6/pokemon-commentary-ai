@@ -43,7 +43,7 @@ IMAGE_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 S3_REGION = os.environ.get("S3_REGION", "ap-southeast-2")
 
-VALID_EVENT_TYPES = {"battle_start", "move_used", "switch", "faint", "battle_end"}
+VALID_EVENT_TYPES = {"battle_start", "move_used", "move_single", "switch", "faint", "battle_end"}
 
 # ─── Flask・AWS クライアント初期化 ────────────────────────────────────────────
 
@@ -93,13 +93,22 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
 
     # イベント別の実況指示
     event_type = context.get("event_type", "")
-    event_hint = {
-        "battle_start": "バトル開始！両者のポケモンを紹介して試合への期待感を高める実況をする",
-        "move_used":    "今ターンで使われた技とその効果を実況する",
-        "switch":       "ポケモンの交代について実況する",
-        "faint":        "ポケモンが倒れた瞬間を実況する（HP=0のポケモンを特定すること）",
-        "battle_end":   "試合終了を締めくくる実況をする",
-    }.get(event_type, "状況を実況する")
+    if event_type == "move_single":
+        # 技ごとの実況（timeline.jsonlの瞬間ログをトリガーにした新パス）: ターン全体では
+        # なく「今まさに使われた技1つ」だけに焦点を絞らせる。move_focus はこのイベント用に
+        # pipeline側で組み立てた「陣営の＋ポケモン名＋の＋技名」の文字列
+        event_hint = (
+            f"今まさに使われた技「{context.get('move_focus', '')}」1つだけに反応する"
+            "短い実況をする（ターン全体のまとめや他の技には触れず、この技への即時リアクションに徹すること）"
+        )
+    else:
+        event_hint = {
+            "battle_start": "バトル開始！両者のポケモンを紹介して試合への期待感を高める実況をする",
+            "move_used":    "今ターンで使われた技とその効果を実況する",
+            "switch":       "ポケモンの交代について実況する",
+            "faint":        "ポケモンが倒れた瞬間を実況する（HP=0のポケモンを特定すること）",
+            "battle_end":   "試合終了を締めくくる実況をする",
+        }.get(event_type, "状況を実況する")
 
     lines = [
         "あなたは、ポケモン対戦実況AIVTuber「花圓くれぴ（はなまるくれぴ）」です。",
