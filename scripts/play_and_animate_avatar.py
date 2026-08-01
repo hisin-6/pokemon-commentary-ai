@@ -12,9 +12,14 @@ VMCへOSCで表情ブレンドシェイプ・腕の姿勢を送り、実況イ�
      実況テキストのキーワードからJoy寄り/Sorrow寄りを推定=2026-08-01追加）
   2. WAVをPython側（sounddevice）で自前に再生し、再生開始を基準時刻にする
   3. 各イベント時刻が来るたびVMCへ /VMC/Ext/Blend/Val + /VMC/Ext/Blend/Apply を送信
-     （表情が変わった瞬間は/VMC/Ext/Bone/PosでNeckのうなずきジェスチャーも1回送る）
+     （表情が変わった瞬間はNeckへ感情別のリアクション動作も送る。Joyは大きめに
+     弾むうなずき＋腕を軽く持ち上げる動作、Sorrowはうなだれ気味、それ以外は
+     標準のうなずき＝2026-08-01感情別化）
   4. 最後のイベントの少し後にNeutralへ戻す
-  5. 再生中はSpineへゆっくりスウェイ（待機モーション）を送り続ける（`--no-sway`で無効化可）
+  5. 再生中はSpine+Chestへレイヤードサイン（主周期＋副周期を重ねた呼吸っぽい
+     揺れ）を送り続ける待機モーション（`--no-sway`で無効化可）
+  6. 加えてHeadへ数秒〜十数秒おきにランダムな軽い仕草（前傾のみ・首かしげ等）を挟み、
+     長い無反応区間の単調さを崩す（`--no-idle-gestures`で無効化可）
 
 事前準備（Windows側・初回のみ）:
     venv\\Scripts\\pip.exe install python-osc
@@ -40,9 +45,11 @@ import argparse
 import json
 import logging
 import math
+import random
 import sys
 import threading
 import time
+from collections import namedtuple
 from pathlib import Path
 
 import soundfile as sf
@@ -184,51 +191,137 @@ def send_idle_pose(client: SimpleUDPClient) -> None:
     log.info("[姿勢] 腕を下ろした初期姿勢を送信")
 
 
-# ── 常時の揺れ（モーション② 2026-08-01）────────────────────────────────────
-# トラッキングデバイスが無く静止したままだと不自然なため、Spineをゆっくり
-# 左右にスウェイさせて「呼吸・待機モーション」らしさを出す。腕下げ姿勢
-# （_IDLE_POSE_BONES=UpperArm）とは別のボーンを使うので競合しない。
-_SWAY_BONE = "Spine"
-_SWAY_AXIS = "y"
-_SWAY_AMPLITUDE_DEG = 4.0     # 振れ幅（小さめ・上半身のみ表示なので目立ちすぎないように）
-_SWAY_PERIOD_SEC = 5.0        # 1往復にかかる秒数
+# ── 常時の揺れ（モーション② 2026-08-01 → 多ボーン化 2026-08-01）───────────
+# Spine単発の正弦波1本だと「ゆらゆらしてるだけ」で機械的に見えるため、
+# Spine+Chestの2ボーンに、それぞれ主周期＋副周期（振幅小さめ・周期をずらす）を
+# 重ねたレイヤードサインを送る。ボーンごとに位相もずらすので、全身が
+# 同じタイミングでピタッと揺れる不自然さを避けられる。
+# Headは使わない（ランダム待機仕草＝run_idle_gesturesが専用で使うため競合を避ける）。
+# 腕下げ姿勢（_IDLE_POSE_BONES=UpperArm）とも別ボーンなので競合しない。
+_IdleBoneConfig = namedtuple(
+    "_IdleBoneConfig",
+    ["bone", "axis", "amplitude_deg", "period_sec",
+     "sub_amplitude_deg", "sub_period_sec", "phase_rad"])
+
+_IDLE_BONES: tuple[_IdleBoneConfig, ...] = (
+    _IdleBoneConfig("Spine", "y", 4.0, 5.0, 1.0, 3.3, 0.0),
+    _IdleBoneConfig("Chest", "x", 1.5, 6.5, 0.6, 2.7, 0.6),
+)
 _SWAY_UPDATE_INTERVAL_SEC = 0.15
 
-# ── 表情変化時のうなずきジェスチャー（モーション② 2026-08-01）──────────────
+# ── 表情変化時のリアクション動作（モーション② 2026-08-01 → 感情別化 2026-08-01）
 # Neckを一瞬前後に傾けて「相槌」らしい動きを付ける。表情が変わった瞬間にだけ
-# 発火し（Neutralへの自動復帰時は発火しない）、_NOD_SEQUENCE_DEGを順に送って
-# 最後は0°（=Neck自体はニュートラル。基本姿勢はSwayが担当）に戻す。
+# 発火し（Neutralへの自動復帰時は発火しない）。感情ごとにNeckの振れ方を変え、
+# 単なる「相槌」から「感情のこもったリアクション」に寄せる:
+#   Joy    = 大きめに弾むうなずき（+腕を軽く持ち上げるsend_joy_arm_pumpも併発）
+#   Fun    = 従来の標準うなずき（_NOD_SEQUENCE_DEGのデフォルト値を踏襲）
+#   Sorrow = うなだれ気味・戻りきらずに少し傾いたまま保持（次のNeutral復帰でリセットされる）
+# 未定義の表情（Angryなど現状未使用）はFunと同じ標準うなずきにフォールバックする。
 _NOD_BONE = "Neck"
 _NOD_AXIS = "x"
 _NOD_SEQUENCE_DEG = (10.0, 14.0, 6.0, 0.0)
 _NOD_STEP_SEC = 0.12
+_REACTION_NECK_SEQUENCE = {
+    "Joy": (14.0, 20.0, 10.0, 0.0),
+    "Sorrow": (14.0, 20.0, 16.0, 8.0),
+}
+
+# Joyの時だけ、T-pose対策で下げてある腕（_IDLE_POSE_DEG）を軽く持ち上げてから
+# 戻す「弾む」動作を追加する。UpperArmは常時制御スレッドが無い（起動時に一度
+# 送るだけの静的姿勢）ため、戻り先は0°ではなく_IDLE_POSE_DEG（元の下げ角度）
+# にする必要がある。0°に戻すとT-poseへ逆戻りしてしまうので注意。
+# 2026-08-01実機fb「早すぎてよくわからない」対応: 元は3ステップ×0.12秒=0.36秒で
+# 一瞬すぎたため、持ち上げ→ピークで一拍ホールド→ゆっくり戻す、の6ステップに
+# 分割してステップ間隔も伸ばした（6×0.15秒=0.9秒）。
+_ARM_PUMP_LIFT_DEG = 20.0
+_ARM_PUMP_SEQUENCE_RATIO = (0.5, 1.0, 1.0, 0.6, 0.2, 0.0)  # 持ち上げ量の割合（1.0=最大リフト）
+_ARM_PUMP_STEP_SEC = 0.15
+
+# ── ランダム待機仕草（モーション③ 2026-08-01）────────────────────────────
+# 長い無反応区間が単調にならないよう、Headへ数秒〜十数秒おきにランダムな
+# 軽い仕草（首かしげ等）を挟む。Neckの相槌（前後）と軸を分けず同じx軸だが、
+# ボーン自体をHeadにして常時スウェイ（Spine/Chest）とも独立させている。
+# 2026-08-01実機fb「少し上を向く動作があり不自然」対応: うなずき（+方向=前傾）は
+# OKだった一方、-方向（後ろに傾げる=見上げる）の仕草が脈絡なく発生して不自然と
+# 判明したため削除。前傾方向（うなずきと同じ+方向）のバリエーションのみに絞る。
+_GESTURE_BONE = "Head"
+_GESTURE_AXIS = "x"
+_GESTURE_SEQUENCES = (
+    (6.0, 9.0, 4.0, 0.0),     # 軽く前に傾げる（強め）
+    (4.0, 6.0, 2.0, 0.0),     # 軽く前に傾げる（弱め）
+    (5.0, 0.0),               # 小さな相槌一往復
+)
+_GESTURE_STEP_SEC = 0.15
+_GESTURE_MIN_INTERVAL_SEC = 9.0
+_GESTURE_MAX_INTERVAL_SEC = 20.0
 
 
-def _sway_quat(elapsed: float) -> tuple[float, float, float, float]:
-    """待機モーション（スウェイ）の経過時間elapsed（秒）における回転を返す。
-    正弦波なので周期_SWAY_PERIOD_SECで滑らかに往復する。"""
-    deg = _SWAY_AMPLITUDE_DEG * math.sin(2 * math.pi * elapsed / _SWAY_PERIOD_SEC)
-    return _axis_angle_quat(_SWAY_AXIS, deg)
+def _idle_bone_deg(cfg: _IdleBoneConfig, elapsed: float) -> float:
+    """レイヤードサイン（主周期＋副周期）による経過時間elapsed（秒）時点の角度。"""
+    deg = cfg.amplitude_deg * math.sin(2 * math.pi * elapsed / cfg.period_sec + cfg.phase_rad)
+    if cfg.sub_period_sec:
+        deg += cfg.sub_amplitude_deg * math.sin(
+            2 * math.pi * elapsed / cfg.sub_period_sec + cfg.phase_rad * 1.7)
+    return deg
+
+
+def _sway_quat(elapsed: float, cfg: _IdleBoneConfig = _IDLE_BONES[0]
+              ) -> tuple[float, float, float, float]:
+    """指定ボーン設定cfg（既定はSpine）の経過時間elapsed（秒）時点の回転。"""
+    return _axis_angle_quat(cfg.axis, _idle_bone_deg(cfg, elapsed))
 
 
 def run_idle_sway(client: SimpleUDPClient, stop_event: threading.Event,
                   start_clock: float) -> None:
-    """再生中ずっとSpineへ揺れを送り続ける（stop_eventがセットされたら終了）。"""
+    """再生中ずっとSpine/Chestへレイヤードサインの揺れを送り続ける
+    （stop_eventがセットされたら終了）。"""
     while not stop_event.is_set():
         elapsed = time.monotonic() - start_clock
-        qx, qy, qz, qw = _sway_quat(elapsed)
-        client.send_message("/VMC/Ext/Bone/Pos", [_SWAY_BONE, 0.0, 0.0, 0.0, qx, qy, qz, qw])
+        for cfg in _IDLE_BONES:
+            qx, qy, qz, qw = _axis_angle_quat(cfg.axis, _idle_bone_deg(cfg, elapsed))
+            client.send_message("/VMC/Ext/Bone/Pos", [cfg.bone, 0.0, 0.0, 0.0, qx, qy, qz, qw])
         stop_event.wait(_SWAY_UPDATE_INTERVAL_SEC)
-    # 停止時はSpineをニュートラルに戻す
-    client.send_message("/VMC/Ext/Bone/Pos", [_SWAY_BONE, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    # 停止時は対象ボーンを全てニュートラルに戻す
+    for cfg in _IDLE_BONES:
+        client.send_message("/VMC/Ext/Bone/Pos", [cfg.bone, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
 
 
-def send_nod(client: SimpleUDPClient) -> None:
-    """表情が変わった瞬間に一度だけ呼ぶ「うなずき」ジェスチャー（短時間ブロッキング）。"""
-    for deg in _NOD_SEQUENCE_DEG:
+def run_idle_gestures(client: SimpleUDPClient, stop_event: threading.Event,
+                      rng: random.Random | None = None) -> None:
+    """ランダムな間隔でHeadへ軽い仕草を送り続ける（stop_eventがセットされたら終了）。"""
+    rng = rng or random
+    while not stop_event.wait(rng.uniform(_GESTURE_MIN_INTERVAL_SEC, _GESTURE_MAX_INTERVAL_SEC)):
+        for deg in rng.choice(_GESTURE_SEQUENCES):
+            qx, qy, qz, qw = _axis_angle_quat(_GESTURE_AXIS, deg)
+            client.send_message("/VMC/Ext/Bone/Pos", [_GESTURE_BONE, 0.0, 0.0, 0.0, qx, qy, qz, qw])
+            stop_event.wait(_GESTURE_STEP_SEC)
+    client.send_message("/VMC/Ext/Bone/Pos", [_GESTURE_BONE, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+
+
+def send_joy_arm_pump(client: SimpleUDPClient) -> None:
+    """Joy表情の時だけ呼ぶ、腕を軽く持ち上げてから元の下げ姿勢に戻す「弾む」動作。
+    戻り先は0°ではなく_IDLE_POSE_DEG（T-pose対策の下げ角度）にすること。"""
+    for ratio in _ARM_PUMP_SEQUENCE_RATIO:
+        lift = _ARM_PUMP_LIFT_DEG * ratio
+        for bone in _IDLE_POSE_BONES:
+            base = -_IDLE_POSE_DEG if "Right" in bone else _IDLE_POSE_DEG
+            sign = -1.0 if "Right" in bone else 1.0
+            deg = base - sign * lift
+            qx, qy, qz, qw = _axis_angle_quat(_IDLE_POSE_AXIS, deg)
+            client.send_message("/VMC/Ext/Bone/Pos", [bone, 0.0, 0.0, 0.0, qx, qy, qz, qw])
+        time.sleep(_ARM_PUMP_STEP_SEC)
+
+
+def send_reaction(client: SimpleUDPClient, expression: str) -> None:
+    """表情が変わった瞬間に一度だけ呼ぶリアクション動作（短時間ブロッキング）。
+    Neckの振れ方を感情ごとに変え、Joyの時だけ腕の弾む動作も追加する。"""
+    sequence = _REACTION_NECK_SEQUENCE.get(expression, _NOD_SEQUENCE_DEG)
+    for deg in sequence:
         qx, qy, qz, qw = _axis_angle_quat(_NOD_AXIS, deg)
         client.send_message("/VMC/Ext/Bone/Pos", [_NOD_BONE, 0.0, 0.0, 0.0, qx, qy, qz, qw])
         time.sleep(_NOD_STEP_SEC)
+    if expression == "Joy":
+        send_joy_arm_pump(client)
 
 
 def send_expression(client: SimpleUDPClient, name: str) -> None:
@@ -250,7 +343,7 @@ def run_expression_scheduler(client: SimpleUDPClient, timeline: list[tuple[float
         if wait > 0:
             time.sleep(wait)
         send_expression(client, expr)
-        send_nod(client)  # 表情が変わった瞬間だけ「うなずき」を1回入れる
+        send_reaction(client, expr)  # 表情が変わった瞬間だけ感情別のリアクションを1回入れる
 
         next_t = timeline[i + 1][0] if i + 1 < len(timeline) else total_duration
         hold_until = min(t + _EXPRESSION_HOLD_SEC, next_t)
@@ -272,7 +365,9 @@ def main() -> int:
                         help="腕を下ろす初期姿勢の送信をスキップ（別途トラッキングデバイスを"
                              "使う場合などT-pose対策が不要な時に指定）")
     parser.add_argument("--no-sway", action="store_true",
-                        help="待機モーション（Spineのスウェイ）を無効化")
+                        help="待機モーション（Spine/Chestのスウェイ）を無効化")
+    parser.add_argument("--no-idle-gestures", action="store_true",
+                        help="ランダム待機仕草（Headの首かしげ等）を無効化")
     args = parser.parse_args()
     device = int(args.device) if args.device is not None and args.device.isdigit() else args.device
 
@@ -306,12 +401,18 @@ def main() -> int:
         daemon=True)
     scheduler.start()
 
-    sway_stop = threading.Event()
+    idle_stop = threading.Event()
     sway_thread = None
     if not args.no_sway:
         sway_thread = threading.Thread(
-            target=run_idle_sway, args=(client, sway_stop, start_clock), daemon=True)
+            target=run_idle_sway, args=(client, idle_stop, start_clock), daemon=True)
         sway_thread.start()
+
+    gesture_thread = None
+    if not args.no_idle_gestures:
+        gesture_thread = threading.Thread(
+            target=run_idle_gestures, args=(client, idle_stop), daemon=True)
+        gesture_thread.start()
 
     try:
         while sd.get_stream().active:
@@ -321,9 +422,11 @@ def main() -> int:
         sd.stop()
 
     scheduler.join(timeout=_EXPRESSION_HOLD_SEC + 1.0)
+    idle_stop.set()
     if sway_thread is not None:
-        sway_stop.set()
         sway_thread.join(timeout=1.0)
+    if gesture_thread is not None:
+        gesture_thread.join(timeout=1.0)
     send_expression(client, NEUTRAL)
     log.info("完了。")
     return 0

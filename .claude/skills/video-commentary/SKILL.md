@@ -114,15 +114,21 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
      faint統合バグ（faintイベントが次のmove_usedに統合される際にfaint_sideが
      manifest.jsonlへ引き継がれず表情が発火しなかった）は同日中に修正済み）。
      **2026-08-01追加**: move_single/move_used/switchも実況テキストのキーワードから
-     Fun/Sorrowを推定して反応するようになった（技1つ1つに表情がつく）。加えて再生中は
-     Spineへ常時スウェイ（待機モーション・`--no-sway`で無効化可）、表情が変わった瞬間は
-     Neckのうなずきジェスチャーも自動で入る。
+     Fun/Sorrowを推定して反応するようになった（技1つ1つに表情がつく）。
+     **2026-08-01モーション拡張**（実機未検証・角度は次回録画で調整予定）: 待機モーションは
+     Spine単発のスウェイから、Spine+Chestの2ボーン×主周期/副周期を重ねたレイヤードサイン
+     （呼吸っぽい揺れ・`--no-sway`で無効化可）に拡張。表情が変わった瞬間のリアクションは
+     Neckのうなずきを感情ごとに変える（Joy=大きめに弾む＋腕を軽く持ち上げる
+     `send_joy_arm_pump`も併発、Sorrow=うなだれ気味、それ以外=従来の標準うなずき）。
+     加えてHeadへ数秒〜十数秒おきにランダムな軽い仕草（首かしげ等）を挟み、長い
+     無反応区間の単調さを崩す（`--no-idle-gestures`で無効化可）。
      **事前にVMCの設定画面でReceiver（39540 or 39541）の「有効化」チェックボックスを
      ONにしておくこと**（デフォルトOFF・OFFのままだと表情が一切変わらない＝実機で
      確認済みの地雷）。schedule.jsonが必要なので先に`render_commentary_video.py <動画名>
      --dry-run`を実行しておく。表情マッピングは`scripts/play_and_animate_avatar.py`の
      `_EVENT_EXPRESSION`/`_FAINT_EXPRESSION`/`_BATTLE_RESULT_EXPRESSION`/
-     `_POSITIVE_KEYWORDS`/`_NEGATIVE_KEYWORDS`を、モーションは`_SWAY_*`/`_NOD_*`を参照。
+     `_POSITIVE_KEYWORDS`/`_NEGATIVE_KEYWORDS`を、モーションは`_IDLE_BONES`/`_NOD_*`/
+     `_REACTION_NECK_SEQUENCE`/`_GESTURE_*`/`_ARM_PUMP_*`を参照。
      - **手順は「スクリプト起動→OBS録画→Enter」の順**（2026-07-30変更・T-pose対策後）:
        ①スクリプトを起動すると即座に腕を下ろした初期姿勢をOSC送信→
        ②「録画が始まったらEnterを押してください」の表示を待ってここでOBS録画を開始→
