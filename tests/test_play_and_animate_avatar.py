@@ -28,11 +28,32 @@ class TestExpressionFor:
     def test_battle_start_is_fun(self):
         assert paa.expression_for("battle_start", {}) == "Fun"
 
-    def test_move_used_is_neutral_none(self):
+    def test_move_used_with_no_commentary_is_none(self):
         assert paa.expression_for("move_used", {}) is None
 
     def test_filler_is_neutral_none(self):
         assert paa.expression_for("filler", {}) is None
+
+    def test_filler_ignores_commentary_sentiment(self):
+        """fillerは雑談なので、テキストにポジティブワードがあっても反応しない
+        （_EVENT_EXPRESSIONの明示的なNoneを_SENTIMENT_EVENT_TYPESより優先）。"""
+        assert paa.expression_for("filler", {}, "バツグンだ！決まった！") is None
+
+    def test_battle_start_ignores_commentary_sentiment(self):
+        """battle_startは_EVENT_EXPRESSIONの明示値"Fun"を常に優先する。"""
+        assert paa.expression_for("battle_start", {}, "ピンチ…厳しい展開になりそう") == "Fun"
+
+    def test_move_single_positive_commentary_is_fun(self):
+        assert paa.expression_for("move_single", {}, "バツグンだ！炸裂したね〜！") == "Fun"
+
+    def test_move_single_negative_commentary_is_sorrow(self):
+        assert paa.expression_for("move_single", {}, "うわ、ピンチかも…削られちゃった") == "Sorrow"
+
+    def test_move_single_neutral_commentary_no_change(self):
+        assert paa.expression_for("move_single", {}, "淡々とターンが進んでいます") is None
+
+    def test_switch_uses_sentiment_too(self):
+        assert paa.expression_for("switch", {}, "急所に決まった〜！") == "Fun"
 
     def test_faint_player_side_is_sorrow(self):
         assert paa.expression_for("faint", {"faint_side": "player"}) == "Sorrow"
@@ -109,6 +130,57 @@ class TestAxisAngleQuat:
     def test_quaternion_is_unit_length(self):
         qx, qy, qz, qw = paa._axis_angle_quat("z", 37.0)
         assert math.isclose(qx**2 + qy**2 + qz**2 + qw**2, 1.0, rel_tol=1e-9)
+
+
+class TestSwayQuat:
+    def test_zero_elapsed_is_identity(self):
+        """sin(0)=0なので経過0秒はニュートラル回転。"""
+        assert paa._sway_quat(0.0) == (0.0, 0.0, 0.0, 1.0)
+
+    def test_amplitude_does_not_exceed_configured_max(self):
+        """半周期ごとにサンプリングして、振れ幅が_SWAY_AMPLITUDE_DEGを超えないことを確認。"""
+        max_angle = max(
+            2 * math.degrees(math.asin(min(1.0, abs(paa._sway_quat(t)[2]))))
+            for t in [i * paa._SWAY_PERIOD_SEC / 20 for i in range(21)]
+        )
+        assert max_angle <= paa._SWAY_AMPLITUDE_DEG + 1e-6
+
+    def test_periodic(self):
+        """1周期後は同じ角度に戻る。"""
+        a = paa._sway_quat(1.234)
+        b = paa._sway_quat(1.234 + paa._SWAY_PERIOD_SEC)
+        assert all(math.isclose(x, y, abs_tol=1e-9) for x, y in zip(a, b))
+
+
+class TestRunIdleSway:
+    def test_sends_to_sway_bone_and_stops_on_event(self):
+        client = MagicMock()
+        stop_event = __import__("threading").Event()
+
+        def _stop_soon():
+            import time as _t
+            _t.sleep(paa._SWAY_UPDATE_INTERVAL_SEC * 2.5)
+            stop_event.set()
+
+        t = __import__("threading").Thread(target=_stop_soon)
+        t.start()
+        paa.run_idle_sway(client, stop_event, __import__("time").monotonic())
+        t.join()
+
+        bones_sent = {call.args[1][0] for call in client.send_message.call_args_list}
+        assert bones_sent == {paa._SWAY_BONE}
+        assert client.send_message.call_count >= 2  # ループ中の送信＋停止時のニュートラル復帰
+
+
+class TestSendNod:
+    def test_sends_full_sequence_ending_neutral(self):
+        client = MagicMock()
+        paa.send_nod(client)
+        sent = [call.args[1] for call in client.send_message.call_args_list]
+        assert len(sent) == len(paa._NOD_SEQUENCE_DEG)
+        assert all(s[0] == paa._NOD_BONE for s in sent)
+        # 最後のステップは_NOD_SEQUENCE_DEGの最後（0.0度=ニュートラル）
+        assert tuple(sent[-1][4:8]) == (0.0, 0.0, 0.0, 1.0)
 
 
 class TestSendIdlePose:

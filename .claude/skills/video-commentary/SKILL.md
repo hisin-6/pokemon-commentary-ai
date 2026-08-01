@@ -113,11 +113,16 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
      battle_end=勝敗で喜び/哀しみ・battle_start=楽しそう。⚠️2026-07-30に発見した
      faint統合バグ（faintイベントが次のmove_usedに統合される際にfaint_sideが
      manifest.jsonlへ引き継がれず表情が発火しなかった）は同日中に修正済み）。
+     **2026-08-01追加**: move_single/move_used/switchも実況テキストのキーワードから
+     Fun/Sorrowを推定して反応するようになった（技1つ1つに表情がつく）。加えて再生中は
+     Spineへ常時スウェイ（待機モーション・`--no-sway`で無効化可）、表情が変わった瞬間は
+     Neckのうなずきジェスチャーも自動で入る。
      **事前にVMCの設定画面でReceiver（39540 or 39541）の「有効化」チェックボックスを
      ONにしておくこと**（デフォルトOFF・OFFのままだと表情が一切変わらない＝実機で
      確認済みの地雷）。schedule.jsonが必要なので先に`render_commentary_video.py <動画名>
      --dry-run`を実行しておく。表情マッピングは`scripts/play_and_animate_avatar.py`の
-     `_EVENT_EXPRESSION`/`_FAINT_EXPRESSION`/`_BATTLE_RESULT_EXPRESSION`を参照。
+     `_EVENT_EXPRESSION`/`_FAINT_EXPRESSION`/`_BATTLE_RESULT_EXPRESSION`/
+     `_POSITIVE_KEYWORDS`/`_NEGATIVE_KEYWORDS`を、モーションは`_SWAY_*`/`_NOD_*`を参照。
      - **手順は「スクリプト起動→OBS録画→Enter」の順**（2026-07-30変更・T-pose対策後）:
        ①スクリプトを起動すると即座に腕を下ろした初期姿勢をOSC送信→
        ②「録画が始まったらEnterを押してください」の表示を待ってここでOBS録画を開始→
