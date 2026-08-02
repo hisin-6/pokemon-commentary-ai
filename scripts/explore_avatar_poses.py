@@ -98,6 +98,12 @@ POSES: dict[str, dict[str, list[tuple[str, float]]]] = {
         # 手首や肩のY/X軸の微調整等）はこのGUIで実際の見た目を見ながら
         # 手直しされている。調整の経緯（VRMファイル実測手法・見つかった不具合・
         # ボツ案）は git履歴・会話ログ参照。
+        # ⚠️既知の課題（2026-08-02実機確認・改善は後日）: idle→このポーズへの
+        # transition_to_pose遷移中、腕がくるっと回ってからガッツポーズを取るように
+        # 見え、他の6ポーズより不自然。RightUpperArm/RightLowerArmの回転量が大きい
+        # （especially LowerArmのx=-180°）ためswing-twist分解でも経路が素直に
+        # ならない可能性。一旦許容してこのまま採用。改善するなら中間キーフレームの
+        # 追加や_bone_time_windowでのRightUpperArm/RightLowerArm遅延スタートを検討。
         "LeftUpperArm": [("y", 6.5), ("z", 80.0)],
         "RightUpperArm": [("x", 95.4), ("y", -23.9), ("z", -73.7)],
         "RightLowerArm": [("x", -180.0), ("y", 6.5), ("z", 119.3)],
@@ -118,15 +124,36 @@ POSES: dict[str, dict[str, list[tuple[str, float]]]] = {
         "RightLittleDistal": [("z", -71.6)],
     },
     "thinking_chin": {
-        # 右手を顔の近くに持っていく「考え中」ポーズ。保留・AIグリッチ演出や
-        # 「困惑」表現に使えそうな候補。
-        # ⚠️肘の軸をfist_pump_rightと同じ理由でX→Zに修正（2026-08-01・VRM実測計算のみ・
-        # まだ実機未検証）: X軸はほぼ純粋なツイストで曲げてもほぼ動かないため、
-        # 旧-100°指定は見た目にほとんど効いていなかった可能性が高い
-        "LeftUpperArm": [("z", _IDLE_ARM_DEG)],
-        "RightUpperArm": [("z", 40.0)],
-        "RightLowerArm": [("z", 45.0)],
-        "Head": [("x", -8.0)],
+        # 右手を顔の近くに持っていく「考え中」ポーズ。`pose_tuner_gui.py`で
+        # ユーザーが実機を見ながら最終確定した値（2026-08-02）。
+        "Neck": [("x", -2.0), ("z", -5.0)],
+        "LeftUpperArm": [("x", 70.0), ("y", 26.0), ("z", 87.0)],
+        "LeftLowerArm": [("y", 86.0), ("z", -10.0)],
+        "LeftHand": [("x", -130.0)],
+        "RightUpperArm": [("y", -40.0), ("z", -80.0)],
+        "RightLowerArm": [("x", -40.0), ("y", -150.0), ("z", 29.0)],
+        "RightHand": [("x", -80.0)],
+        "LeftThumbProximal": [("x", 10.0), ("y", -30.0)],
+        "LeftIndexProximal": [("y", -6.0), ("z", 40.0)],
+        "LeftIndexIntermediate": [("z", 10.0)],
+        "LeftIndexDistal": [("z", 30.0)],
+        "LeftMiddleProximal": [("x", -10.0), ("z", 32.0)],
+        "LeftMiddleIntermediate": [("z", 20.0)],
+        "LeftMiddleDistal": [("z", 30.0)],
+        "LeftRingProximal": [("x", -20.0), ("y", 6.0), ("z", 28.0)],
+        "LeftRingIntermediate": [("z", 30.0)],
+        "LeftLittleProximal": [("y", 17.0), ("z", 40.0)],
+        "RightThumbProximal": [("y", -10.0)],
+        "RightThumbIntermediate": [("y", -30.0)],
+        "RightMiddleProximal": [("z", -80.0)],
+        "RightMiddleIntermediate": [("z", -80.0)],
+        "RightMiddleDistal": [("z", -100.0)],
+        "RightRingProximal": [("x", -30.0), ("z", -90.0)],
+        "RightRingIntermediate": [("z", -80.0)],
+        "RightRingDistal": [("z", -100.0)],
+        "RightLittleProximal": [("x", -60.0), ("z", -100.0)],
+        "RightLittleIntermediate": [("z", -80.0)],
+        "RightLittleDistal": [("z", -100.0)],
     },
     "head_tilt_curious": {
         # 腕は動かさず首だけ傾ける「興味津々」ポーズ。`pose_tuner_gui.py`で

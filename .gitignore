@@ -99,3 +99,18 @@ data/voices/
 # 外部データ取得スクリプト（非公開・ローカル運用のみ）
 scripts/update_champions_roster.py
 tests/test_update_champions_roster.py
+
+# モーションデータ（CMU BVH等・外部配布物のためGit管理しない）
+data/mocap/
+
+# MMDモーションデータ（VMD・外部配布物のためGit管理しない）
+data/vmd/
+
+# BVH/VMDモーション変換の検証スクリプト（2026-08-02・方針によりGit非公開）
+scripts/explore_bvh_motion.py
+scripts/explore_vmd_motion.py
+scripts/pmx_bone_reader.py
+scripts/vrm_bone_reader.py
+scripts/compute_vmd_retarget_correction.py
+scripts/compute_bone_local_frames.py
+scripts/visualize_vmd_stick_figure.py
