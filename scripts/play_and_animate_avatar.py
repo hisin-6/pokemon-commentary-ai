@@ -12,14 +12,20 @@ VMCへOSCで表情ブレンドシェイプ・腕の姿勢を送り、実況イ�
      実況テキストのキーワードからJoy寄り/Sorrow寄りを推定=2026-08-01追加）
   2. WAVをPython側（sounddevice）で自前に再生し、再生開始を基準時刻にする
   3. 各イベント時刻が来るたびVMCへ /VMC/Ext/Blend/Val + /VMC/Ext/Blend/Apply を送信
-     （表情が変わった瞬間はNeckへ感情別のリアクション動作も送る。Joyは大きめに
-     弾むうなずき＋腕を軽く持ち上げる動作、Sorrowはうなだれ気味、それ以外は
-     標準のうなずき＝2026-08-01感情別化）
+     （表情が変わった瞬間はリアクション動作も送る。Joy/Sorrow/Funは
+     `explore_avatar_poses.py`で実機検証済みのポーズ
+     （victory_arms_up/bow_apologetic/head_tilt_curious）へSLERP遷移→保持→
+     idle_downへ戻す一連の動作、それ以外は標準のうなずきのみ＝2026-08-03統合）
   4. 最後のイベントの少し後にNeutralへ戻す
   5. 再生中はSpine+Chestへレイヤードサイン（主周期＋副周期を重ねた呼吸っぽい
      揺れ）を送り続ける待機モーション（`--no-sway`で無効化可）
   6. 加えてHeadへ数秒〜十数秒おきにランダムな軽い仕草（前傾のみ・首かしげ等）を挟み、
      長い無反応区間の単調さを崩す（`--no-idle-gestures`で無効化可）
+
+ポーズ再生中、そのポーズが使うボーンは常時スウェイ（Spine/Chest）・ランダム仕草
+（Head）から一時的に除外する（`_suspend_bones`/`_resume_bones`）。同じボーンへ
+複数スレッドが同時に書き込むと最後に送られた方が勝ってアニメーションが競合する
+（VMCは相対加算ではなく絶対値上書きのため）。
 
 事前準備（Windows側・初回のみ）:
     venv\\Scripts\\pip.exe install python-osc
@@ -55,6 +61,9 @@ from pathlib import Path
 import soundfile as sf
 import sounddevice as sd
 from pythonosc.udp_client import SimpleUDPClient
+
+sys.path.insert(0, str(Path(__file__).parent))
+import explore_avatar_poses as eap  # noqa: E402  POSES/クォータニオン補間ヘルパーを再利用
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -209,33 +218,90 @@ _IDLE_BONES: tuple[_IdleBoneConfig, ...] = (
 )
 _SWAY_UPDATE_INTERVAL_SEC = 0.15
 
-# ── 表情変化時のリアクション動作（モーション② 2026-08-01 → 感情別化 2026-08-01）
-# Neckを一瞬前後に傾けて「相槌」らしい動きを付ける。表情が変わった瞬間にだけ
-# 発火し（Neutralへの自動復帰時は発火しない）。感情ごとにNeckの振れ方を変え、
-# 単なる「相槌」から「感情のこもったリアクション」に寄せる:
-#   Joy    = 大きめに弾むうなずき（+腕を軽く持ち上げるsend_joy_arm_pumpも併発）
-#   Fun    = 従来の標準うなずき（_NOD_SEQUENCE_DEGのデフォルト値を踏襲）
-#   Sorrow = うなだれ気味・戻りきらずに少し傾いたまま保持（次のNeutral復帰でリセットされる）
-# 未定義の表情（Angryなど現状未使用）はFunと同じ標準うなずきにフォールバックする。
+# ── 表情変化時のリアクション動作（モーション② 2026-08-01 → ポーズ統合 2026-08-03）
+# Joy/Sorrow/Funは`explore_avatar_poses.py`で実機検証済みのポーズへ滑らかに
+# 遷移する（_EXPRESSION_POSE・play_pose_reaction）。それ以外（Angryなど現状未使用の
+# 表情）はNeckの標準うなずきにフォールバックする。
 _NOD_BONE = "Neck"
 _NOD_AXIS = "x"
 _NOD_SEQUENCE_DEG = (10.0, 14.0, 6.0, 0.0)
 _NOD_STEP_SEC = 0.12
-_REACTION_NECK_SEQUENCE = {
-    "Joy": (14.0, 20.0, 10.0, 0.0),
-    "Sorrow": (14.0, 20.0, 16.0, 8.0),
+
+# 表情 → 遷移させるポーズ名（`explore_avatar_poses.POSES`のキー）。
+# Joy    = victory_arms_up（バンザイ・勝利の瞬間用）
+# Sorrow = bow_apologetic（会釈・謝罪系リアクション）
+# Fun    = head_tilt_curious（首かしげ・興味津々）
+# fist_pump_right/thinking_chin/lean_back_confidentは実機検証済みだが、まだ
+# 対応するイベント種別が無いため未マッピング（将来の拡張用にPOSESには残っている）。
+_EXPRESSION_POSE = {
+    "Joy": "victory_arms_up",
+    "Sorrow": "bow_apologetic",
+    "Fun": "head_tilt_curious",
 }
 
-# Joyの時だけ、T-pose対策で下げてある腕（_IDLE_POSE_DEG）を軽く持ち上げてから
-# 戻す「弾む」動作を追加する。UpperArmは常時制御スレッドが無い（起動時に一度
-# 送るだけの静的姿勢）ため、戻り先は0°ではなく_IDLE_POSE_DEG（元の下げ角度）
-# にする必要がある。0°に戻すとT-poseへ逆戻りしてしまうので注意。
-# 2026-08-01実機fb「早すぎてよくわからない」対応: 元は3ステップ×0.12秒=0.36秒で
-# 一瞬すぎたため、持ち上げ→ピークで一拍ホールド→ゆっくり戻す、の6ステップに
-# 分割してステップ間隔も伸ばした（6×0.15秒=0.9秒）。
-_ARM_PUMP_LIFT_DEG = 20.0
-_ARM_PUMP_SEQUENCE_RATIO = (0.5, 1.0, 1.0, 0.6, 0.2, 0.0)  # 持ち上げ量の割合（1.0=最大リフト）
-_ARM_PUMP_STEP_SEC = 0.15
+# ポーズ遷移1回あたりの秒数（遷移in→保持→遷移outの3段）
+_POSE_TRANSITION_SEC = 0.45
+_POSE_HOLD_SEC = 0.6
+
+# ポーズ再生中、そのポーズが使うボーンを常時スウェイ/ランダム仕草から
+# 一時的に除外するための共有集合。マルチスレッドで軽く読み書きするが、
+# 見た目のアニメーションにしか影響しないため厳密なロックは省略している
+# （最悪でも1フレーム分のちらつき程度で実害が無いと判断）。
+_suspended_bones: set[str] = set()
+
+
+def _suspend_bones(bones) -> None:
+    _suspended_bones.update(bones)
+
+
+def _resume_bones(bones) -> None:
+    _suspended_bones.difference_update(bones)
+
+
+def _pose_transition_frames(client: SimpleUDPClient,
+                            starts: dict[str, tuple[float, float, float, float]],
+                            targets: dict[str, tuple[float, float, float, float]],
+                            duration_sec: float, fps: float = 30.0) -> None:
+    """startsからtargetsへ、`explore_avatar_poses`のSLERP遷移ロジック（swing-twist
+    分解＋加減速）をそのまま再利用して補間送信する（`transition_to_pose`参照）。"""
+    frame_count = max(1, round(duration_sec * fps))
+    interval = duration_sec / frame_count
+    for i in range(1, frame_count + 1):
+        global_t = i / frame_count
+        for bone, target in targets.items():
+            local_t = eap.ease_smoothstep(eap._windowed_t(global_t, eap._bone_time_window(bone)))
+            start = starts[bone]
+            if any(k in bone for k in eap._TWIST_AXIS_BONE_KEYWORDS):
+                qx, qy, qz, qw = eap.quat_slerp_swing_twist(start, target, local_t)
+            else:
+                qx, qy, qz, qw = eap.quat_slerp(start, target, local_t)
+            client.send_message("/VMC/Ext/Bone/Pos", [bone, 0.0, 0.0, 0.0, qx, qy, qz, qw])
+        time.sleep(interval)
+
+
+def play_pose_reaction(client: SimpleUDPClient, pose_name: str,
+                       hold_sec: float = _POSE_HOLD_SEC,
+                       transition_sec: float = _POSE_TRANSITION_SEC) -> None:
+    """`explore_avatar_poses.POSES[pose_name]`へ滑らかに遷移→保持→idle_downへ
+    戻す一連の動作。ポーズが使うボーンは実行中`_suspended_bones`に加えて常時
+    スウェイ/ランダム仕草からの書き込みを止め、終わったら必ず解放する。
+    idle_down（腕の下げ角度）に含まれないボーン（Neck/Head/Spineなど）は、
+    遷移開始前のニュートラル(0,0,0,1)からの遷移とみなす（常時スウェイ等の
+    実際の途中角度は数度程度の振れ幅しか無いため、この近似による見た目の
+    ずれは軽微）。"""
+    idle = eap.POSES["idle_down"]
+    pose = eap.POSES[pose_name]
+    bones = set(pose) | set(idle)
+    _suspend_bones(bones)
+    try:
+        starts = {b: eap.compose_quat(idle[b]) if b in idle else (0.0, 0.0, 0.0, 1.0)
+                 for b in bones}
+        targets = {b: eap.compose_quat(pose[b]) if b in pose else starts[b] for b in bones}
+        _pose_transition_frames(client, starts, targets, transition_sec)
+        time.sleep(hold_sec)
+        _pose_transition_frames(client, targets, starts, transition_sec)
+    finally:
+        _resume_bones(bones)
 
 # ── ランダム待機仕草（モーション③ 2026-08-01）────────────────────────────
 # 長い無反応区間が単調にならないよう、Headへ数秒〜十数秒おきにランダムな
@@ -278,6 +344,8 @@ def run_idle_sway(client: SimpleUDPClient, stop_event: threading.Event,
     while not stop_event.is_set():
         elapsed = time.monotonic() - start_clock
         for cfg in _IDLE_BONES:
+            if cfg.bone in _suspended_bones:
+                continue  # ポーズ再生中はそのボーンへの書き込みを譲る
             qx, qy, qz, qw = _axis_angle_quat(cfg.axis, _idle_bone_deg(cfg, elapsed))
             client.send_message("/VMC/Ext/Bone/Pos", [cfg.bone, 0.0, 0.0, 0.0, qx, qy, qz, qw])
         stop_event.wait(_SWAY_UPDATE_INTERVAL_SEC)
@@ -291,6 +359,8 @@ def run_idle_gestures(client: SimpleUDPClient, stop_event: threading.Event,
     """ランダムな間隔でHeadへ軽い仕草を送り続ける（stop_eventがセットされたら終了）。"""
     rng = rng or random
     while not stop_event.wait(rng.uniform(_GESTURE_MIN_INTERVAL_SEC, _GESTURE_MAX_INTERVAL_SEC)):
+        if _GESTURE_BONE in _suspended_bones:
+            continue  # ポーズ再生中はHeadへの書き込みを譲る
         for deg in rng.choice(_GESTURE_SEQUENCES):
             qx, qy, qz, qw = _axis_angle_quat(_GESTURE_AXIS, deg)
             client.send_message("/VMC/Ext/Bone/Pos", [_GESTURE_BONE, 0.0, 0.0, 0.0, qx, qy, qz, qw])
@@ -298,30 +368,40 @@ def run_idle_gestures(client: SimpleUDPClient, stop_event: threading.Event,
     client.send_message("/VMC/Ext/Bone/Pos", [_GESTURE_BONE, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
 
 
-def send_joy_arm_pump(client: SimpleUDPClient) -> None:
-    """Joy表情の時だけ呼ぶ、腕を軽く持ち上げてから元の下げ姿勢に戻す「弾む」動作。
-    戻り先は0°ではなく_IDLE_POSE_DEG（T-pose対策の下げ角度）にすること。"""
-    for ratio in _ARM_PUMP_SEQUENCE_RATIO:
-        lift = _ARM_PUMP_LIFT_DEG * ratio
-        for bone in _IDLE_POSE_BONES:
-            base = -_IDLE_POSE_DEG if "Right" in bone else _IDLE_POSE_DEG
-            sign = -1.0 if "Right" in bone else 1.0
-            deg = base - sign * lift
-            qx, qy, qz, qw = _axis_angle_quat(_IDLE_POSE_AXIS, deg)
+def _send_smooth_keyframes(client: SimpleUDPClient, bone: str, axis: str,
+                           degrees_sequence: tuple[float, ...], duration_sec: float,
+                           fps: float = 30.0) -> None:
+    """boneをaxis軸まわりで、degrees_sequenceの折れ線をキーフレーム間SLERP+
+    ease_smoothstepでなぞるように滑らかに送る。単一ボーン・単一軸の簡易
+    アニメーション用（Neckの標準うなずき等）。2026-08-03実機fb「標準うなずきだけ
+    ロボットっぽい」対応: 従来は各角度を瞬間切り替え→静止の繰り返し（補間なし）
+    だったため、ポーズ遷移（SLERP+イージング）と並べると相対的にカクついて
+    見えていた。"""
+    keyframes = [_axis_angle_quat(axis, deg) for deg in degrees_sequence]
+    segment_count = len(keyframes) - 1
+    if segment_count <= 0:
+        return
+    segment_duration = duration_sec / segment_count
+    frame_count = max(1, round(segment_duration * fps))
+    interval = segment_duration / frame_count
+    for start, end in zip(keyframes, keyframes[1:]):
+        for i in range(1, frame_count + 1):
+            t = eap.ease_smoothstep(i / frame_count)
+            qx, qy, qz, qw = eap.quat_slerp(start, end, t)
             client.send_message("/VMC/Ext/Bone/Pos", [bone, 0.0, 0.0, 0.0, qx, qy, qz, qw])
-        time.sleep(_ARM_PUMP_STEP_SEC)
+            time.sleep(interval)
 
 
 def send_reaction(client: SimpleUDPClient, expression: str) -> None:
     """表情が変わった瞬間に一度だけ呼ぶリアクション動作（短時間ブロッキング）。
-    Neckの振れ方を感情ごとに変え、Joyの時だけ腕の弾む動作も追加する。"""
-    sequence = _REACTION_NECK_SEQUENCE.get(expression, _NOD_SEQUENCE_DEG)
-    for deg in sequence:
-        qx, qy, qz, qw = _axis_angle_quat(_NOD_AXIS, deg)
-        client.send_message("/VMC/Ext/Bone/Pos", [_NOD_BONE, 0.0, 0.0, 0.0, qx, qy, qz, qw])
-        time.sleep(_NOD_STEP_SEC)
-    if expression == "Joy":
-        send_joy_arm_pump(client)
+    _EXPRESSION_POSEにマッピングされた表情はポーズ遷移（play_pose_reaction）、
+    それ以外はNeckの標準うなずき（滑らか化済み）のみ。"""
+    pose_name = _EXPRESSION_POSE.get(expression)
+    if pose_name:
+        play_pose_reaction(client, pose_name)
+        return
+    _send_smooth_keyframes(client, _NOD_BONE, _NOD_AXIS, (0.0,) + _NOD_SEQUENCE_DEG,
+                           _NOD_STEP_SEC * len(_NOD_SEQUENCE_DEG))
 
 
 def send_expression(client: SimpleUDPClient, name: str) -> None:

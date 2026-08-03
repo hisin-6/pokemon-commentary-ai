@@ -5,6 +5,7 @@ scripts/play_and_animate_avatar.py（改善ロードマップ③・表情連動�
   - expression_for              イベント種別/contextからのブレンドシェイプ決定
   - build_expression_timeline   schedule.jsonのscheduledからの発火時刻リスト構築
   - _axis_angle_quat/send_idle_pose  T-pose対策の腕ボーン姿勢OSC送信
+  - send_reaction/play_pose_reaction  表情変化時のポーズ遷移（explore_avatar_poses.POSES統合）
 """
 
 import importlib.util
@@ -218,41 +219,56 @@ class TestRunIdleGestures:
 
 
 class TestSendReaction:
-    def test_fun_uses_default_nod_sequence(self):
-        client = MagicMock()
-        paa.send_reaction(client, "Fun")
-        sent = [call.args[1] for call in client.send_message.call_args_list]
-        assert len(sent) == len(paa._NOD_SEQUENCE_DEG)
-        assert all(s[0] == paa._NOD_BONE for s in sent)
-        assert tuple(sent[-1][4:8]) == (0.0, 0.0, 0.0, 1.0)
-
     def test_unknown_expression_falls_back_to_default_nod(self):
+        """2026-08-03滑らか化: フォールバックのうなずきはキーフレーム間をSLERP補間する
+        多フレームアニメーションになったため、送信回数はキーフレーム数より多くなる。"""
         client = MagicMock()
         paa.send_reaction(client, "Angry")
         sent = [call.args[1] for call in client.send_message.call_args_list]
-        assert len(sent) == len(paa._NOD_SEQUENCE_DEG)
+        assert len(sent) > len(paa._NOD_SEQUENCE_DEG)
+        assert all(s[0] == paa._NOD_BONE for s in sent)
+        assert tuple(sent[-1][4:8]) == (0.0, 0.0, 0.0, 1.0)
 
-    def test_sorrow_uses_sorrow_sequence(self):
+    def test_fun_transitions_to_head_tilt_curious_pose(self):
+        client = MagicMock()
+        paa.send_reaction(client, "Fun")
+        bones_sent = {call.args[1][0] for call in client.send_message.call_args_list}
+        assert set(paa.eap.POSES["head_tilt_curious"]) <= bones_sent
+
+    def test_sorrow_transitions_to_bow_apologetic_pose(self):
         client = MagicMock()
         paa.send_reaction(client, "Sorrow")
-        sent = [call.args[1] for call in client.send_message.call_args_list]
-        assert len(sent) == len(paa._REACTION_NECK_SEQUENCE["Sorrow"])
-        assert all(s[0] == paa._NOD_BONE for s in sent)
+        bones_sent = {call.args[1][0] for call in client.send_message.call_args_list}
+        assert set(paa.eap.POSES["bow_apologetic"]) <= bones_sent
 
-    def test_joy_also_sends_arm_pump(self):
+    def test_joy_transitions_to_victory_arms_up_pose(self):
         client = MagicMock()
         paa.send_reaction(client, "Joy")
-        bones_sent = [call.args[1][0] for call in client.send_message.call_args_list]
-        assert paa._NOD_BONE in bones_sent
-        assert set(paa._IDLE_POSE_BONES).issubset(set(bones_sent))
+        bones_sent = {call.args[1][0] for call in client.send_message.call_args_list}
+        assert set(paa.eap.POSES["victory_arms_up"]) <= bones_sent
 
 
-class TestSendJoyArmPump:
-    def test_returns_to_idle_pose_angle_not_neutral(self):
-        """最終ステップはratio=0.0なので、腕はsend_idle_poseと同じ角度に戻る
+class TestSendSmoothKeyframes:
+    def test_ends_exactly_at_last_keyframe(self):
+        client = MagicMock()
+        paa._send_smooth_keyframes(client, "Neck", "x", (0.0, 10.0, 0.0), 0.05)
+        sent = [call.args[1] for call in client.send_message.call_args_list]
+        assert all(s[0] == "Neck" for s in sent)
+        expected_last = paa._axis_angle_quat("x", 0.0)
+        assert tuple(sent[-1][4:8]) == expected_last
+
+    def test_single_keyframe_sends_nothing(self):
+        client = MagicMock()
+        paa._send_smooth_keyframes(client, "Neck", "x", (5.0,), 0.05)
+        client.send_message.assert_not_called()
+
+
+class TestPlayPoseReaction:
+    def test_returns_arms_to_idle_pose_angle_not_neutral(self):
+        """最後は必ずidle_downへ戻すので、腕はsend_idle_poseと同じ角度に戻る
         （0度=T-poseに逆戻りしてはいけない）。"""
         client = MagicMock()
-        paa.send_joy_arm_pump(client)
+        paa.play_pose_reaction(client, "victory_arms_up", hold_sec=0.01, transition_sec=0.03)
         sent = [call.args[1] for call in client.send_message.call_args_list]
         last_by_bone = {}
         for s in sent:
@@ -260,16 +276,40 @@ class TestSendJoyArmPump:
         for bone in paa._IDLE_POSE_BONES:
             expected_deg = -paa._IDLE_POSE_DEG if "Right" in bone else paa._IDLE_POSE_DEG
             expected_qz = paa._axis_angle_quat(paa._IDLE_POSE_AXIS, expected_deg)[2]
-            assert math.isclose(last_by_bone[bone][6], expected_qz, abs_tol=1e-9)
+            assert math.isclose(last_by_bone[bone][6], expected_qz, abs_tol=1e-6)
 
-    def test_lift_step_reduces_downward_angle_magnitude(self):
-        """最初のステップ（ratio=1.0）は腕が最も持ち上がる=下げ角度の絶対値が小さくなる。"""
+    def test_suspends_pose_bones_during_playback_and_resumes_after(self):
         client = MagicMock()
-        paa.send_joy_arm_pump(client)
-        sent = [call.args[1] for call in client.send_message.call_args_list]
-        first_left = next(s for s in sent if s[0] == "LeftUpperArm")
-        base_qz = paa._axis_angle_quat(paa._IDLE_POSE_AXIS, paa._IDLE_POSE_DEG)[2]
-        assert abs(first_left[6]) < abs(base_qz)
+        assert paa._suspended_bones == set()
+        paa.play_pose_reaction(client, "bow_apologetic", hold_sec=0.01, transition_sec=0.03)
+        assert paa._suspended_bones == set()
+
+
+class TestSuspendedBones:
+    def test_run_idle_sway_skips_suspended_bone(self):
+        client = MagicMock()
+        stop_event = __import__("threading").Event()
+        bone = paa._IDLE_BONES[0].bone
+        paa._suspend_bones({bone})
+        try:
+            def _stop_soon():
+                import time as _t
+                _t.sleep(paa._SWAY_UPDATE_INTERVAL_SEC * 2.5)
+                stop_event.set()
+
+            t = __import__("threading").Thread(target=_stop_soon)
+            t.start()
+            paa.run_idle_sway(client, stop_event, __import__("time").monotonic())
+            t.join()
+        finally:
+            paa._resume_bones({bone})
+
+        # 停止時の無条件ニュートラル復帰（末尾1回）を除けば、サスペンド中の
+        # ボーンには揺れの値が一切送られていないはず。
+        sent_for_bone = [call.args[1] for call in client.send_message.call_args_list
+                         if call.args[1][0] == bone]
+        assert len(sent_for_bone) == 1
+        assert tuple(sent_for_bone[0][4:8]) == (0.0, 0.0, 0.0, 1.0)
 
 
 class TestSendIdlePose:

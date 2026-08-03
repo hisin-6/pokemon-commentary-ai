@@ -117,18 +117,23 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
      Fun/Sorrowを推定して反応するようになった（技1つ1つに表情がつく）。
      **2026-08-01モーション拡張**（実機未検証・角度は次回録画で調整予定）: 待機モーションは
      Spine単発のスウェイから、Spine+Chestの2ボーン×主周期/副周期を重ねたレイヤードサイン
-     （呼吸っぽい揺れ・`--no-sway`で無効化可）に拡張。表情が変わった瞬間のリアクションは
-     Neckのうなずきを感情ごとに変える（Joy=大きめに弾む＋腕を軽く持ち上げる
-     `send_joy_arm_pump`も併発、Sorrow=うなだれ気味、それ以外=従来の標準うなずき）。
-     加えてHeadへ数秒〜十数秒おきにランダムな軽い仕草（首かしげ等）を挟み、長い
-     無反応区間の単調さを崩す（`--no-idle-gestures`で無効化可）。
+     （呼吸っぽい揺れ・`--no-sway`で無効化可）に拡張。加えてHeadへ数秒〜十数秒おきに
+     ランダムな軽い仕草（首かしげ等）を挟み、長い無反応区間の単調さを崩す
+     （`--no-idle-gestures`で無効化可）。
+     **2026-08-03ポーズ統合**: 表情が変わった瞬間のリアクションは、`explore_avatar_poses.py`
+     （＋`pose_tuner_gui.py`）で実機検証済みのポーズへSLERP遷移→保持→idle_downへ戻す
+     動作に統合（Joy=`victory_arms_up`・Sorrow=`bow_apologetic`・Fun=`head_tilt_curious`。
+     マッピング外の表情はNeckの標準うなずきにフォールバック）。ポーズ再生中は該当ボーンを
+     常時スウェイ/ランダム仕草から一時除外（`_suspend_bones`/`_resume_bones`）して競合を
+     防ぐ。`fist_pump_right`/`thinking_chin`/`lean_back_confident`は実機検証済みだが
+     まだイベント未マッピング（`explore_avatar_poses.POSES`には残っているので今後拡張可）。
      **事前にVMCの設定画面でReceiver（39540 or 39541）の「有効化」チェックボックスを
      ONにしておくこと**（デフォルトOFF・OFFのままだと表情が一切変わらない＝実機で
      確認済みの地雷）。schedule.jsonが必要なので先に`render_commentary_video.py <動画名>
      --dry-run`を実行しておく。表情マッピングは`scripts/play_and_animate_avatar.py`の
      `_EVENT_EXPRESSION`/`_FAINT_EXPRESSION`/`_BATTLE_RESULT_EXPRESSION`/
-     `_POSITIVE_KEYWORDS`/`_NEGATIVE_KEYWORDS`を、モーションは`_IDLE_BONES`/`_NOD_*`/
-     `_REACTION_NECK_SEQUENCE`/`_GESTURE_*`/`_ARM_PUMP_*`を参照。
+     `_POSITIVE_KEYWORDS`/`_NEGATIVE_KEYWORDS`/`_EXPRESSION_POSE`を、モーションは
+     `_IDLE_BONES`/`_NOD_*`/`_GESTURE_*`/`play_pose_reaction`を参照。
      - **手順は「スクリプト起動→OBS録画→Enter」の順**（2026-07-30変更・T-pose対策後）:
        ①スクリプトを起動すると即座に腕を下ろした初期姿勢をOSC送信→
        ②「録画が始まったらEnterを押してください」の表示を待ってここでOBS録画を開始→

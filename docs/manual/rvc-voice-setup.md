@@ -135,7 +135,13 @@ RVC WebUIの**「ckpt処理」タブ**にモデル融合機能がある。
 - RVC-Project 公式README（日本語）: https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI/blob/main/docs/jp/README.ja.md
 - モデルマージ解説（RVC Wiki）: https://seesaawiki.jp/rvc_ch/d/%A5%E2%A5%C7%A5%EB%A5%DE%A1%BC%A5%B8
 
+## 進捗
+
+- **ITAコーパス録音: 155/324文 完了（2026-08-03時点）**。recitation（朗読）324文中の進捗。
+  残り169文は今後のセッションで継続録音
+- 録音データの保存先: `data/voices/`（**`.gitignore`済み**・リポジトリには含まれない）
+
 ## 未決事項（次回以降）
 
-- ITAコーパスでの自分の声の録音（未実施）
+- ITAコーパス録音の続き（上記進捗参照）
 - VOICEVOX四国めたんの感情スタイル（ノーマル/たのしみ等）の実況用途での選定

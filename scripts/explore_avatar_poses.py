@@ -330,9 +330,13 @@ def quat_slerp_swing_twist(q0: tuple[float, float, float, float],
 
 
 def ease_smoothstep(t: float) -> float:
-    """線形のtを滑らかな加減速カーブに変換する（3t²-2t³）。0/1の端点は不変。"""
+    """線形のtを滑らかな加減速カーブに変換する（6t⁵-15t⁴+10t³・通称smootherstep）。
+    0/1の端点は不変。2026-08-03実機fb「もっとスムーズに」対応: 従来のcubic版
+    （3t²-2t³）は速度こそ両端でゼロになるが加速度は不連続で、動き出し/止まり際に
+    わずかな「カクッ」感が出ていた。quintic版は速度・加速度ともに両端でゼロになる
+    ため、より滑らかに動き始め・動き終わる。"""
     t = max(0.0, min(1.0, t))
-    return t * t * (3.0 - 2.0 * t)
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 
 
 # 腕・指（1本軸で長さ方向を持つボーン）はswing-twist分解を使う。Spine/Chest/Neck/Head
