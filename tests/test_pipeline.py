@@ -216,6 +216,14 @@ class TestGlitchCommentary:
         assert _detect_glitch_cause("状況を教えてもらえると助かる") == "ナゾのノイズ"
         assert _detect_glitch_cause("今は実況できないよ") == "ナゾのノイズ"
 
+    def test_instruction_echo_keywords(self):
+        """2026-08-04発見: Bedrockが指示への「了解しました」を実況の代わりに返す事故（安全網）。"""
+        assert _detect_glitch_cause(
+            "了解しました！ 花圓くれぴとして、ポケモン対戦実況を担当させていただきます♪"
+        ) == "指示書を読みすぎちゃった"
+        assert _detect_glitch_cause("**性格・口調の確認:** 元気で甘えん坊") == "指示書を読みすぎちゃった"
+        assert _detect_glitch_cause("**実況時の重要ルール:**") == "指示書を読みすぎちゃった"
+
     def test_normal_commentary_not_detected(self):
         assert _detect_glitch_cause("ガブリアスのじしんが炸裂！大ダメージ！") is None
         assert _detect_glitch_cause("") is None

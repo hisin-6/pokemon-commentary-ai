@@ -245,6 +245,25 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context("move_single"), [], self._battle_state())
         assert "1つだけに反応する" in prompt
 
+    def test_includes_slang_glossary(self):
+        """改善ロードマップ④（口調・知識改善）: 対戦スラング用語集が注入されている。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "集中攻撃" in prompt
+        assert "積み" in prompt
+
+    def test_includes_tone_examples(self):
+        """口調のfew-shot例文が注入されている。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "この試合とは無関係な架空例" in prompt
+        assert "狙うはただ1匹" in prompt
+
+    def test_includes_doubles_tactics_knowledge(self):
+        """改善ロードマップ④続き: ダブルバトルの技・特性・戦術知識が注入されている。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "ねこだまし＝必ずひるませる" in prompt
+        assert "いかく＝場に出た瞬間敵2体の攻撃を下げる" in prompt
+        assert "トリックルームパ" in prompt
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GET /health
@@ -602,6 +621,27 @@ class TestBuildScriptPrompt:
         assert "開幕だ" not in prompt
         assert "倒れた" not in prompt
         assert "★0.0秒 〜 61.0秒" in prompt
+
+    def test_includes_slang_glossary(self):
+        """改善ロードマップ④（口調・知識改善）: 対戦スラング用語集が注入されている。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "集中攻撃" in prompt
+        assert "積み" in prompt
+
+    def test_includes_tone_examples(self):
+        """口調のfew-shot例文が注入されている。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "この試合とは無関係な架空例" in prompt
+        assert "狙うはただ1匹" in prompt
+
+    def test_includes_doubles_tactics_knowledge(self):
+        """改善ロードマップ④続き: ダブルバトルの技・特性・戦術知識が注入されている。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "ねこだまし＝必ずひるませる" in prompt
+        assert "トリックルームパ" in prompt
 
 
 class TestGapFillerCount:
