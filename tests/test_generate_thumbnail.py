@@ -2,16 +2,22 @@
 generate_thumbnail.py（実況動画のサムネイル自動生成・改善ロードマップ⑥）の単体テスト
 
 テスト対象:
-  - _collect_event_candidates    manifestからKO/battle_end候補を抽出
+  - _collect_event_candidates    manifestからKO（・battle_end）候補を抽出
   - _collect_hp_swing_candidates statesからHP急変候補を抽出
-  - select_thumbnail_moment      候補からの最終選択（優先度: battle_end>faint>HP急変）
+  - select_thumbnail_moment      候補からの最終選択（既定はfaint>HP急変・battle_end除外・
+                                    allow_result_spoiler=Trueでbattle_end>faint>HP急変）
   - build_extract_frame_command  ffmpegコマンド組み立て
-  - compose_thumbnail            フレームへのテキスト焼き込み（実PILで検証）
+  - _collect_roster              statesから陣営の登場ポケモン名を収集（2026-08-04）
+  - _resolve_pokemon_id/fetch_pokemon_icon  図鑑DB参照・アイコン取得キャッシュ（2026-08-04）
+  - build_avatar_face_command    アバター顔クロップffmpegコマンド組み立て（2026-08-04）
+  - compose_thumbnail            フレームへのテキスト・バッジ・顔・構築アイコン焼き込み
 """
 
 import importlib.util
+import sqlite3
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -35,7 +41,8 @@ def _mon(name, hp_pct):
 
 
 class TestCollectEventCandidates:
-    def test_faint_and_battle_end_collected(self):
+    def test_faint_collected_battle_end_excluded_by_default(self):
+        """2026-08-04: battle_end（試合結果）は既定でネタバレ防止のため除外する。"""
         manifest = [
             _manifest_entry(10.0, "move_used"),
             _manifest_entry(50.0, "faint", "たおれた！"),
@@ -43,11 +50,20 @@ class TestCollectEventCandidates:
         ]
         candidates = gt._collect_event_candidates(manifest)
         reasons = {c["reason"] for c in candidates}
+        assert reasons == {"faint"}
+
+    def test_battle_end_included_when_spoiler_allowed(self):
+        manifest = [
+            _manifest_entry(50.0, "faint", "たおれた！"),
+            _manifest_entry(90.0, "battle_end", "勝った！"),
+        ]
+        candidates = gt._collect_event_candidates(manifest, allow_result_spoiler=True)
+        reasons = {c["reason"] for c in candidates}
         assert reasons == {"faint", "battle_end"}
 
     def test_battle_end_scores_higher_than_faint(self):
         manifest = [_manifest_entry(10.0, "faint"), _manifest_entry(20.0, "battle_end")]
-        candidates = gt._collect_event_candidates(manifest)
+        candidates = gt._collect_event_candidates(manifest, allow_result_spoiler=True)
         by_reason = {c["reason"]: c["score"] for c in candidates}
         assert by_reason["battle_end"] > by_reason["faint"]
 
@@ -101,13 +117,24 @@ class TestCollectHpSwingCandidates:
 
 
 class TestSelectThumbnailMoment:
-    def test_prefers_battle_end_over_faint_and_hp_swing(self):
+    def test_battle_end_excluded_by_default(self):
+        """2026-08-04: 既定ではbattle_endを見せず、faintが選ばれる。"""
         manifest = [_manifest_entry(50.0, "faint"), _manifest_entry(90.0, "battle_end")]
         states = [
             _state(0.0, player=[_mon("ピカチュウ", 100)]),
             _state(30.0, player=[_mon("ピカチュウ", 0)]),
         ]
         moment = gt.select_thumbnail_moment(manifest, states)
+        assert moment["reason"] == "faint"
+        assert moment["time"] == 50.0
+
+    def test_prefers_battle_end_when_spoiler_allowed(self):
+        manifest = [_manifest_entry(50.0, "faint"), _manifest_entry(90.0, "battle_end")]
+        states = [
+            _state(0.0, player=[_mon("ピカチュウ", 100)]),
+            _state(30.0, player=[_mon("ピカチュウ", 0)]),
+        ]
+        moment = gt.select_thumbnail_moment(manifest, states, allow_result_spoiler=True)
         assert moment["reason"] == "battle_end"
         assert moment["time"] == 90.0
 
@@ -198,3 +225,156 @@ class TestComposeThumbnail:
         assert len(lines) <= gt._LABEL_MAX_LINES
         for line in lines:
             assert draw.textlength(line, font=font) <= max_width
+
+    def test_avatar_face_composited_top_right(self, tmp_path):
+        """avatar_face_png指定時、右上付近が元フレームと変わっていること。"""
+        frame = tmp_path / "frame.png"
+        w, h = 800, 600
+        Image.new("RGB", (w, h), color=(30, 30, 30)).save(frame)
+        face = tmp_path / "face.png"
+        Image.new("RGBA", (400, 400), color=(255, 0, 0, 255)).save(face)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "", avatar_face_png=face)
+        with Image.open(out) as img:
+            # face_w = int(h*0.34) = 204, fx = w-204-20 = 576, fy = int(h*0.03) = 18
+            # → (700, 60) は貼り付けたRGBA画像の内側に確実に収まる
+            r, g, b = img.convert("RGB").getpixel((700, 60))
+            assert (r, g, b) != (30, 30, 30)
+
+    def test_missing_avatar_face_png_skipped_gracefully(self, tmp_path):
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (400, 300), color=(30, 30, 30)).save(frame)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "", avatar_face_png=tmp_path / "does_not_exist.png")
+        assert out.exists()
+
+    def test_roster_icons_composited_above_caption_bar(self, tmp_path):
+        frame = tmp_path / "frame.png"
+        w, h = 800, 600
+        Image.new("RGB", (w, h), color=(30, 30, 30)).save(frame)
+        icon = tmp_path / "icon.png"
+        Image.new("RGBA", (96, 96), color=(0, 255, 0, 255)).save(icon)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "", roster_icon_pngs=[icon, icon, icon])
+        bar_h = int(h * 0.26)
+        icon_size = int(h * 0.09)
+        strip_h = int(icon_size * 1.3)
+        strip_y = h - bar_h - strip_h
+        with Image.open(out) as img:
+            r, g, b = img.convert("RGB").getpixel((w // 2, strip_y + strip_h // 2))
+            assert (r, g, b) != (30, 30, 30)
+
+
+class TestCollectRoster:
+    def test_dedup_preserves_first_appearance_order(self):
+        states = [
+            _state(0.0, player=[_mon("コノヨザル", 100)]),
+            _state(10.0, player=[_mon("コノヨザル", 90), _mon("メタグロス", 100)]),
+            _state(20.0, player=[_mon("メタグロス", 80)]),
+        ]
+        assert gt._collect_roster(states, "player") == ["コノヨザル", "メタグロス"]
+
+    def test_sides_are_independent(self):
+        states = [
+            _state(0.0, player=[_mon("コノヨザル", 100)], opponent=[_mon("イッカネズミ", 100)]),
+        ]
+        assert gt._collect_roster(states, "player") == ["コノヨザル"]
+        assert gt._collect_roster(states, "opponent") == ["イッカネズミ"]
+
+    def test_empty_states_returns_empty_list(self):
+        assert gt._collect_roster([], "player") == []
+
+
+class TestResolvePokemonId:
+    def _make_pokedb(self, tmp_path) -> Path:
+        db_path = tmp_path / "pokedb.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE pokemon (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, "
+                     "name_en TEXT NOT NULL)")
+        conn.execute("INSERT INTO pokemon (id, name_ja, name_en) VALUES (376, 'メタグロス', 'Metagross')")
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_known_name_resolves_to_id(self, tmp_path):
+        db_path = self._make_pokedb(tmp_path)
+        assert gt._resolve_pokemon_id("メタグロス", pokedb_path=db_path) == 376
+
+    def test_unknown_name_returns_none(self, tmp_path):
+        db_path = self._make_pokedb(tmp_path)
+        assert gt._resolve_pokemon_id("存在しないポケモン", pokedb_path=db_path) is None
+
+    def test_missing_db_returns_none(self, tmp_path):
+        assert gt._resolve_pokemon_id("メタグロス", pokedb_path=tmp_path / "no_such.sqlite") is None
+
+
+class TestFetchPokemonIcon:
+    def _make_pokedb(self, tmp_path) -> Path:
+        db_path = tmp_path / "pokedb.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE pokemon (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, "
+                     "name_en TEXT NOT NULL)")
+        conn.execute("INSERT INTO pokemon (id, name_ja, name_en) VALUES (376, 'メタグロス', 'Metagross')")
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_downloads_and_caches_on_first_call(self, tmp_path):
+        db_path = self._make_pokedb(tmp_path)
+        cache_dir = tmp_path / "icons"
+
+        def _fake_urlretrieve(url, out_path):
+            Path(out_path).write_bytes(b"fake-png-bytes")
+
+        with patch("generate_thumbnail.urllib.request.urlretrieve", side_effect=_fake_urlretrieve) as mock_dl:
+            result = gt.fetch_pokemon_icon("メタグロス", cache_dir=cache_dir, pokedb_path=db_path)
+            assert result == cache_dir / "376.png"
+            assert result.read_bytes() == b"fake-png-bytes"
+            assert mock_dl.call_count == 1
+
+    def test_second_call_uses_cache_without_network(self, tmp_path):
+        db_path = self._make_pokedb(tmp_path)
+        cache_dir = tmp_path / "icons"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "376.png").write_bytes(b"cached-bytes")
+
+        with patch("generate_thumbnail.urllib.request.urlretrieve") as mock_dl:
+            result = gt.fetch_pokemon_icon("メタグロス", cache_dir=cache_dir, pokedb_path=db_path)
+            assert result.read_bytes() == b"cached-bytes"
+            mock_dl.assert_not_called()
+
+    def test_network_failure_returns_none(self, tmp_path):
+        db_path = self._make_pokedb(tmp_path)
+        cache_dir = tmp_path / "icons"
+
+        with patch("generate_thumbnail.urllib.request.urlretrieve", side_effect=OSError("boom")):
+            assert gt.fetch_pokemon_icon("メタグロス", cache_dir=cache_dir, pokedb_path=db_path) is None
+
+    def test_unknown_pokemon_returns_none_without_network_call(self, tmp_path):
+        db_path = self._make_pokedb(tmp_path)
+        cache_dir = tmp_path / "icons"
+
+        with patch("generate_thumbnail.urllib.request.urlretrieve") as mock_dl:
+            result = gt.fetch_pokemon_icon("存在しないポケモン", cache_dir=cache_dir, pokedb_path=db_path)
+            assert result is None
+            mock_dl.assert_not_called()
+
+
+class TestBuildAvatarFaceCommand:
+    def test_command_contains_crop_and_chromakey_filter(self, tmp_path):
+        avatar_video = tmp_path / "avatar.mp4"
+        out = tmp_path / "face.png"
+        cmd = gt.build_avatar_face_command("ffmpeg", avatar_video, 71.5, "400:400:800:250", out)
+        assert cmd[0] == "ffmpeg"
+        assert str(avatar_video) in cmd
+        assert str(out) in cmd
+        vf = cmd[cmd.index("-vf") + 1]
+        assert "crop=400:400:800:250" in vf
+        assert "chromakey=" in vf
+        assert "despill=" in vf
+        assert "format=rgba" in vf
+
+    def test_negative_time_clamped_to_zero(self, tmp_path):
+        cmd = gt.build_avatar_face_command(
+            "ffmpeg", tmp_path / "a.mp4", -3.0, "400:400:800:250", tmp_path / "f.png")
+        assert "0.0" in cmd
