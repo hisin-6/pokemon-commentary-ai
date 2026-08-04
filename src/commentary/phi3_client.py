@@ -1,28 +1,28 @@
 """
-Phi-3 mini 実況文生成クライアント
+ローカルLLM 実況文生成クライアント（Bedrockフォールバック用）
 Ollama経由でローカルLLMを呼び出し、ポケモン対戦の実況文を生成する。
 
 実行環境: Windows Python (venv/Scripts/python.exe)
 Ollama URL: http://localhost:11434
+
+⚠️ クラス名/ファイル名は歴史的経緯で`Phi3Client`/`phi3_client.py`のままだが、
+既定モデルは2026-08-04に`gemma2:9b`へ変更した（ADR-003追記・改善ロードマップ⑦の
+第一歩）。`src/pipeline.py`側のimport文（`from src.commentary.phi3_client import
+Phi3Client`）・属性名（`self._phi3`）を変えない範囲での最小変更にしている。
+プロンプトは`scripts/compare_local_llm_commentary.py`によるモデル比較の結果を踏まえ、
+`src/commentary/kurepi_persona.py`（くれぴのキャラ設定・用語集・出力ルール共通ソース）
+から組み立てる。
 """
+
+from __future__ import annotations
 
 import requests
 
+from src.commentary import kurepi_persona as persona
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "phi3:mini"
+MODEL_NAME = "gemma2:9b"
 HISTORY_SIZE = 3
-
-SYSTEM_PROMPT = """あなたはポケモン対戦の実況者です。以下のルールで実況してください。
-- 1〜2文で簡潔に実況する
-- テンポよく、興奮感のある実況をする
-- ポケモン名・技名はそのまま使う
-- HPが低い時は緊張感を出す
-- 日本語で出力する
-- 【重要】画面から読み取れた情報だけを使う。不明な情報は絶対に創作しない
-- 鉤括弧（「」）は使わない
-- 余計な説明・質問・指示は出力しない。実況文だけ出力する
-"""
 
 
 class Phi3Client:
@@ -46,28 +46,24 @@ class Phi3Client:
         self,
         game_state: dict,
         bedrock_analysis: str | None = None,
+        battle_context: dict | None = None,
     ) -> str:
         """
         実況文を生成する。
 
         Args:
-            game_state: OCR/YOLOで取得した対戦状況
-                {
-                    "pokemon_player": str,
-                    "hp_player": int,
-                    "pokemon_opponent": str,
-                    "hp_opponent": int,
-                    "last_move": str,
-                    "status": str,
-                    "balls_remaining": [int, int],
-                    "event_type": str,
-                }
-            bedrock_analysis: Bedrock Vision分析結果テキスト（任意）
+            game_state: OCR/YOLOで取得した対戦状況（"event_type"/"status"/"ocr_text"等。
+                pipeline.pyの`_ocr_results_to_text`等が組み立てる辞書）
+            bedrock_analysis: Bedrock Vision分析結果テキスト（任意・補足情報として使う）
+            battle_context: `BattleStateTracker.to_context()`の戦況サマリー（任意）。
+                自分/相手の場・控え・ターン数等の構造化情報。渡せる場合は必ず渡すこと
+                （2026-08-04のモデル比較で、これが無いとgemma2:9bでも精度が大きく落ちると
+                判明したため）
 
         Returns:
             生成された実況テキスト
         """
-        prompt = self._build_prompt(game_state, bedrock_analysis)
+        prompt = self._build_prompt(game_state, bedrock_analysis, battle_context)
 
         response = requests.post(
             self.ollama_url,
@@ -76,7 +72,7 @@ class Phi3Client:
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "num_predict": 120,  # 最大生成トークン数（1〜2文で十分）
+                    "num_predict": 150,  # 最大生成トークン数（1〜2文で十分）
                     "temperature": 0.7,
                 },
             },
@@ -88,29 +84,38 @@ class Phi3Client:
         self._add_history(commentary)
         return commentary
 
-    def _build_prompt(self, game_state: dict, bedrock_analysis: str | None) -> str:
-        lines = [SYSTEM_PROMPT, ""]
+    def _build_prompt(self, game_state: dict, bedrock_analysis: str | None,
+                      battle_context: dict | None) -> str:
+        lines = [persona.CHARACTER_INTRO, ""]
+        lines += persona.DOUBLES_TACTICS_LINES + [""]
+        lines += persona.SLANG_GLOSSARY_LINES + [""]
+        lines += persona.OUTPUT_RULES_LINES
+        result = (battle_context or {}).get("battle_result")
+        if result:
+            lines.append(persona.battle_result_line(result))
+        lines.append("")
 
-        # Bedrock 分析結果がある場合のみ使う
+        lines += ["【今回の対戦状況】", f"今回のイベント種別: {game_state.get('event_type', '不明')}"]
+        if battle_context:
+            lines += [
+                f"ターン数: {battle_context.get('turn', '不明')}",
+                f"自分の場: {battle_context.get('player_pokemon', '情報収集中')}",
+                f"相手の場: {battle_context.get('opponent_pokemon', '情報収集中')}",
+            ]
+            event_log = battle_context.get("event_log")
+            if event_log:
+                lines.append(f"直近の出来事: {event_log}")
+
+        # Bedrock 分析結果がある場合のみ補足として使う
         if bedrock_analysis and not bedrock_analysis.startswith("（テキスト未検出）"):
-            lines.append(f"現在の対戦状況（AI分析）: {bedrock_analysis}")
-            lines.append("")
-
-        # 値が確定している情報だけ渡す（不明・?・（OCR参照）は渡さない）
-        ocr_text = game_state.get("ocr_text", "")
-        if ocr_text and ocr_text != "（テキスト未検出）":
-            lines.append(f"画面テキスト（OCR）: {ocr_text}")
+            lines.append(f"画面の補足情報: {bedrock_analysis}")
 
         status = game_state.get("status", "なし")
         if status and status != "なし":
             lines.append(f"状態異常: {status}")
 
-        balls = game_state.get("balls_remaining", [])
-        if len(balls) == 2 and (balls[0] > 0 or balls[1] > 0):
-            lines.append(f"残りボール: 自分{balls[0]}個 / 相手{balls[1]}個")
-
         if self._history:
-            lines.append(f"直前の実況: {self._history[-1]}")
+            lines.append(f"直前の実況（繰り返さないこと）: {self._history[-1]}")
 
         lines.append("\n実況文（1〜2文・日本語のみ）：")
         return "\n".join(lines)
@@ -128,20 +133,17 @@ class Phi3Client:
 if __name__ == "__main__":
     client = Phi3Client()
 
-    test_state = {
-        "pokemon_player": "ガブリアス",
-        "hp_player": 85,
-        "pokemon_opponent": "サーフゴー",
-        "hp_opponent": 42,
-        "last_move": "じしん",
-        "status": "normal",
-        "balls_remaining": [6, 4],
-        "event_type": "move_used",
+    test_state = {"event_type": "move_used", "status": "なし"}
+    test_battle_context = {
+        "turn": 3,
+        "player_pokemon": "場: ガブリアス / 控え: なし",
+        "opponent_pokemon": "場: サーフゴー / 控え: なし",
+        "event_log": "T3:ガブリアスのじしん",
     }
 
-    print("Phi-3 mini 接続テスト中...")
+    print(f"{client.model} 接続テスト中...")
     try:
-        result = client.generate_commentary(test_state)
+        result = client.generate_commentary(test_state, battle_context=test_battle_context)
         print(f"生成結果: {result}")
     except requests.exceptions.ConnectionError:
         print("エラー: Ollamaが起動していません。タスクトレイのOllamaアイコンを確認してください。")

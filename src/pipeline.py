@@ -3487,7 +3487,8 @@ class Pipeline:
             log.debug("Phi-3 実況文生成中（フォールバック）...")
             t0 = time.perf_counter()
             try:
-                commentary = self._phi3.generate_commentary(game_state, bedrock_analysis=phi3_context)
+                commentary = self._phi3.generate_commentary(
+                    game_state, bedrock_analysis=phi3_context, battle_context=battle_context)
                 commentary = _clean_commentary(commentary)
                 log.info(f"Phi-3 実況文生成完了 ({time.perf_counter()-t0:.2f}s): 「{commentary}」")
             except requests.exceptions.ConnectionError:
@@ -3558,7 +3559,9 @@ class Pipeline:
                 phi3_context = bedrock_analysis or ev["game_state"]["ocr_text"]
                 try:
                     commentary = _clean_commentary(
-                        self._phi3.generate_commentary(ev["game_state"], bedrock_analysis=phi3_context))
+                        self._phi3.generate_commentary(
+                            ev["game_state"], bedrock_analysis=phi3_context,
+                            battle_context=ev["battle_context"]))
                 except Exception as e:
                     log.error(f"Phi-3 エラー（後付け）: {e}")
                     continue

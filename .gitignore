@@ -18,6 +18,9 @@ logs/
 # 実況動画レンダリング素材・出力（--render-out とパス2が生成・mp4は数GB）
 renders/
 
+# ローカルLLM候補比較の出力（scripts/compare_local_llm_commentary.py --out）
+comparison_*.json
+
 # PokeAPI キャッシュ（336MB、scripts/build_pokedb.pyが生成）
 data/pokeapi_cache/
 

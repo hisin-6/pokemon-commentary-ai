@@ -65,3 +65,12 @@ AWSより`anthropic.claude-3-haiku-20240307-v1:0`のBedrockモデル廃止通知
 - `server.py`更新版をEC2へWinSCPデプロイ
 
 詳細手順: [Bedrock Claude Haiku 4.5 移行マニュアル](../manual/bedrock-haiku-4-5-migration.md)
+
+## 追記（2026-08-04）: 実況文生成の責務も本ADR側に実質移動している
+
+本ADRの「改訂内容」では「実況文生成はADR-003（Phi-3 mini）が担当する」としていたが、
+現在の実装（`src/pipeline.py`の`_dispatch_commentary`）はBedrock Vision呼び出しが
+返した`bedrock_commentary`を実況文としてそのまま優先採用し、**Phi-3 miniはBedrock呼び出しが
+失敗した場合のみのフォールバック**という扱いになっている（ADR-003側にも追記済み）。
+「Vision分析専用」としていた本ADRのスコープは実態としては実況文生成も含む形に広がっている。
+責務表は将来的に本ADRを再改訂して統合するのが望ましいが、現時点では両ADRへの追記に留める。
