@@ -410,6 +410,58 @@ class TestGetPokemonInfo:
         assert "かえんほう" in hidden[0]
 
 
+class TestGetPokemonTypes:
+    """get_pokemon_types: type_chart.pyへ渡す生のタイプリストを返す（2026-08-04新設）。"""
+
+    def test_single_type_returns_one_element_list(self, clf):
+        assert clf.get_pokemon_types("ピカチュウ") == ["でんき"]
+
+    def test_dual_type_returns_two_element_list(self, clf):
+        assert clf.get_pokemon_types("エルフーン") == ["くさ", "フェアリー"]
+
+    def test_unknown_pokemon_returns_none(self, clf):
+        assert clf.get_pokemon_types("存在しないポケモン12345") is None
+
+
+class TestGetMoveType:
+    """get_move_type: 2026-08-04新設。type_chart.pyでの相性計算用に技のタイプを取得する。"""
+
+    @pytest.fixture(scope="class")
+    def clf_with_move_types(self, tmp_path_factory):
+        db_dir = tmp_path_factory.mktemp("pokedb_movetypes")
+        db_path = db_dir / "test_move_types.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE pokemon (
+                id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL,
+                type1 TEXT, type2 TEXT, ability1 TEXT, ability2 TEXT, ability_hidden TEXT
+            );
+            CREATE TABLE moves (
+                id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL,
+                type TEXT, category TEXT, power INTEGER
+            );
+            CREATE TABLE abilities (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+            CREATE TABLE items (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+            CREATE TABLE pokemon_moves (pokemon_id INTEGER, move_id INTEGER);
+
+            INSERT INTO pokemon VALUES
+              (1, 'ピカチュウ', 'Pikachu', 'でんき', NULL, 'せいでんき', 'ひらいしん', 'かえんほう');
+            INSERT INTO moves VALUES
+              (1, 'かみなり', 'Thunder', 'でんき', '特殊', 110),
+              (2, 'アイアンヘッド', 'Iron Head', 'はがね', '物理', 80);
+        """)
+        conn.commit()
+        conn.close()
+        return PokeClassifier(db_path=str(db_path))
+
+    def test_known_move_returns_type(self, clf_with_move_types):
+        assert clf_with_move_types.get_move_type("かみなり") == "でんき"
+        assert clf_with_move_types.get_move_type("アイアンヘッド") == "はがね"
+
+    def test_unknown_move_returns_none(self, clf_with_move_types):
+        assert clf_with_move_types.get_move_type("存在しない技12345") is None
+
+
 class TestIsMoveLearnable:
     """is_move_learnable: 技帰属の断片一致幽霊技対策で使う学習可能技チェック。"""
 

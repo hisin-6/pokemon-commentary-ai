@@ -295,6 +295,28 @@ class PokeClassifier:
             "moves":     moves,
         }
 
+    def get_pokemon_types(self, name_ja: str) -> list[str] | None:
+        """ポケモン名（日本語）からタイプのリストを取得する（相性計算用）。
+
+        `get_pokemon_info`の`type`（"くさ / フェアリー"形式の表示用文字列）とは異なり、
+        `src/pokedb/type_chart.py`にそのまま渡せる生のリストを返す。見つからない場合はNone。
+        """
+        row = self._pokemon_rows.get(name_ja)
+        if not row:
+            r = self.classify(name_ja)
+            if r.category == CATEGORY_POKEMON and r.confident:
+                row = self._pokemon_rows.get(r.canonical_ja)
+            if not row:
+                return None
+        return [t for t in (row["type1"], row["type2"]) if t]
+
+    def get_move_type(self, move_name_ja: str) -> str | None:
+        """技名（日本語）からタイプを取得する（相性計算用）。見つからない場合はNone。"""
+        row = self._conn.execute(
+            "SELECT type FROM moves WHERE name_ja = ?", (move_name_ja,)
+        ).fetchone()
+        return row["type"] if row else None
+
     def _get_moves_for_pokemon(self, pokemon_id: int) -> list[str]:
         """pokemon_moves テーブルから代表技リストを取得する。"""
         rows = self._conn.execute(

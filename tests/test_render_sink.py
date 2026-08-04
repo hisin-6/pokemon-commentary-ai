@@ -368,6 +368,9 @@ class TestGeneratePosthocCommentary:
         p._voicevox = MagicMock()
         p._voicevox.generate_wav.return_value = _make_wav(0.3)
         p._pending_render_events = []
+        # 戦況ウェアハウス（2026-08-04）: 実データ（data/battle_situations.sqlite）を
+        # 汚さないようテスト専用のtmp_pathに向ける
+        p._situation_db_path = tmp_path / "test_situations.sqlite"
         return p
 
     def test_generates_manifest_entries_in_event_time_order(self, tmp_path, monkeypatch):

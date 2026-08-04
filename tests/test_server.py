@@ -148,6 +148,39 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context("battle_end"), [], self._battle_state())
         assert "勝敗に触れること" not in prompt
 
+    def test_effectiveness_tag_usage_rule(self):
+        """2026-08-04: パイプライン側でバツグンタグを検出できるようになったため、
+        『絶対に使うな』の全面禁止から『タグがあれば信頼して使ってよい』に変更した。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "「（バツグン）」の注記がある技は、実際に検出された" in prompt
+        assert "信頼して有利不利の実況に使ってよい" in prompt
+        assert "絶対に実況文に含めてはいけない" not in prompt
+
+    def test_type_hint_included_when_present(self):
+        """2026-08-04: pipeline.py側で計算したタイプ相性ヒント（Cicero型アーキテクチャ）
+        が battle_state.type_hint 経由で渡された場合、プロンプトに含める。"""
+        prompt = _build_vision_prompt(
+            self._context(), [], self._battle_state(type_hint="メタグロスの技はコータスにバツグン"))
+        assert "メタグロスの技はコータスにバツグン" in prompt
+        assert "信頼して有利不利の実況に使ってよい" in prompt
+
+    def test_type_hint_omitted_when_absent(self):
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "タイプ相性ヒント" not in prompt
+
+    def test_condition_hint_included_when_present(self):
+        """2026-08-04: 天候/壁/速度操作ヒント（Cicero型アーキテクチャ）が
+        battle_state.condition_hint 経由で渡された場合、プロンプトに含める。"""
+        prompt = _build_vision_prompt(
+            self._context(), [],
+            self._battle_state(condition_hint="あめが3ターン継続中 / トリックルーム中"))
+        assert "あめが3ターン継続中 / トリックルーム中" in prompt
+        assert "信頼して有利不利の実況に使ってよい" in prompt
+
+    def test_condition_hint_omitted_when_absent(self):
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "場のコンディション" not in prompt
+
     def test_persona_self_name_and_perspective(self):
         """自称くれぴ（花圓の誤読対策）と自分側視点の固定（2026-07-30視聴fb#1・#3）。"""
         prompt = _build_vision_prompt(self._context(), [], self._battle_state())

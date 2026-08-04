@@ -16,13 +16,22 @@ Phi3Client`）・属性名（`self._phi3`）を変えない範囲での最小変
 
 from __future__ import annotations
 
+import logging
+
 import requests
 
 from src.commentary import kurepi_persona as persona
 
+log = logging.getLogger(__name__)
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL_NAME = "gemma2:9b"
 HISTORY_SIZE = 3
+
+# 自分/相手の帰属を取り違えた言い回し（改善ロードマップ「戦況推論強化」2026-08-04・
+# phi3.5の実機比較で「我がイッカネズミ」＝相手のポケモンを自分呼ばわりする事故を確認）。
+_SELF_ATTRIBUTION_PREFIXES = ("自分の", "我が", "うちの", "味方の")
+_OPPONENT_ATTRIBUTION_PREFIXES = ("相手の",)
 
 
 class Phi3Client:
@@ -47,6 +56,7 @@ class Phi3Client:
         game_state: dict,
         bedrock_analysis: str | None = None,
         battle_context: dict | None = None,
+        samples: int = 1,
     ) -> str:
         """
         実況文を生成する。
@@ -59,12 +69,30 @@ class Phi3Client:
                 自分/相手の場・控え・ターン数等の構造化情報。渡せる場合は必ず渡すこと
                 （2026-08-04のモデル比較で、これが無いとgemma2:9bでも精度が大きく落ちると
                 判明したため）
+            samples: 生成を試みる回数（既定1）。2以上の場合、自分/相手の帰属エラーが
+                無い最初のサンプルを採用する「consistent action generation」
+                （PokéLLMon論文に着想・2026-08-04）。呼び出しが線形に増えるため、
+                即時性が求められないバッチ処理（動画モード後付け生成）でのみ使うこと。
 
         Returns:
             生成された実況テキスト
         """
         prompt = self._build_prompt(game_state, bedrock_analysis, battle_context)
 
+        candidates: list[str] = []
+        for _ in range(max(1, samples)):
+            text = self._generate_once(prompt)
+            candidates.append(text)
+            if not self._has_attribution_error(text, battle_context):
+                self._add_history(text)
+                return text
+
+        log.warning("生成%d回とも自分/相手の帰属エラーの疑いあり。先頭のサンプルを採用: 「%s」",
+                   len(candidates), candidates[0])
+        self._add_history(candidates[0])
+        return candidates[0]
+
+    def _generate_once(self, prompt: str) -> str:
         response = requests.post(
             self.ollama_url,
             json={
@@ -79,10 +107,25 @@ class Phi3Client:
             timeout=self.timeout,
         )
         response.raise_for_status()
+        return response.json()["response"].strip()
 
-        commentary = response.json()["response"].strip()
-        self._add_history(commentary)
-        return commentary
+    @staticmethod
+    def _has_attribution_error(text: str, battle_context: dict | None) -> bool:
+        """相手のポケモンを自分側の言い回しで（またはその逆で）言及していないかを
+        簡易チェックする。battle_contextに`player_names`/`opponent_names`
+        （`BattleStateTracker.to_context()`のRAG用フィールド）が無ければ判定不能として
+        Falseを返す（過検出で全サンプル却下になるのを避ける）。"""
+        if not battle_context:
+            return False
+        opponent_names = set(battle_context.get("opponent_names") or [])
+        player_names = set(battle_context.get("player_names") or [])
+        for name in opponent_names:
+            if any(f"{prefix}{name}" in text for prefix in _SELF_ATTRIBUTION_PREFIXES):
+                return True
+        for name in player_names:
+            if any(f"{prefix}{name}" in text for prefix in _OPPONENT_ATTRIBUTION_PREFIXES):
+                return True
+        return False
 
     def _build_prompt(self, game_state: dict, bedrock_analysis: str | None,
                       battle_context: dict | None) -> str:

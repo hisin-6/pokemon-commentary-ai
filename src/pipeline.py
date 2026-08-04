@@ -47,11 +47,18 @@ if _ROOT not in sys.path:
 from src.capture.hpbar_analyzer import HpBarAnalyzer, slot_bar_centers
 from src.capture.screen_capture import DiffDetector, init_reader, run_ocr
 from src.capture.yolo_detector import BattleState, YoloDetector
+from src.analytics.situation_warehouse import (
+    DEFAULT_DB_PATH as _SITUATION_DEFAULT_DB_PATH,
+    backfill_outcome,
+    record_situation,
+)
 from src.commentary.phi3_client import Phi3Client
 from src.output.audio_player import AudioPlayer
 from src.output.render_sink import RenderSink
 from src.output.voicevox_client import VoicevoxClient
 from src.pokedb.classifier import CATEGORY_POKEMON, PokeClassifier
+from src.pokedb.mega_forms import get_mega_types
+from src.pokedb.type_chart import describe_matchup
 
 
 def _setup_logging() -> Path:
@@ -133,6 +140,39 @@ _BATTLE_RESULT_WORDS = {
     "バツグンだ", "いまひとつ", "こうかは", "こうかなし", "こうかがない",
     "効果は", "今ひとつ", "のようだ", "こうか", "効果",
     "あまり", "ない", "技", "わざ", "もどる",
+}
+
+# 技の効果テキスト → 実況で使える効果タグ（改善ロードマップ・戦況推論強化 2026-08-04）。
+# 「いまひとつ」「こうかなし」は技選択UIのタイプ相性プレビューにも表示されるため
+# （_TECH_SELECT_KW 参照）、バトルメッセージと技選択UIを区別せずに拾うと誤タグ付けの
+# リスクがある。「バツグンだ」は技選択UIに出ないと判明済み（_ANIM_KW のコメント参照）
+# なので、まずはこれだけを対象にする（他の効果は別途UI状態との連携を検討してから追加）。
+_EFFECTIVENESS_TAGS = {"バツグンだ": "バツグン"}
+
+# 場のコンディション発動メッセージのキーワード（改善ロードマップ「戦況推論強化」続き・
+# 2026-08-04）。⚠️正確な文言はWeb検索でも確定できず一般的な知識ベースの推測に留まる。
+# バツグン検出の時と同様、実機のOCRログを見ながら調整する前提（複数キーワードのAND
+# 一致にして誤検出を抑えつつ、OCR欠落にはある程度寛容にしている）。
+_WEATHER_KEYWORDS: dict[tuple[str, ...], str] = {
+    ("ひざしが", "つよく"): "にほんばれ",
+    ("あめが", "ふり"): "あまごい",
+    ("すなあらし",): "すなあらし",
+    ("ゆきが", "ふり"): "ゆき",
+}
+_SCREEN_KEYWORDS = {"リフレクター": "リフレクター", "ひかりのかべ": "ひかりのかべ",
+                    "オーロラベール": "オーロラベール"}
+_TRICK_ROOM_KEYWORDS = ("空間が", "ゆがんだ")
+_TAILWIND_KEYWORDS = ("追い風が", "ふき")
+
+# 素早さのランクを下げる技 → 段階数（マイナス）。全て相手対象の技のみ収録
+# （2026-08-04ユーザー提供リストより。まひ状態にする技/でんじは等はFieldPokemon.status
+# 側で既に追跡済みのためここには含めない）。
+# ⚠️みずあめボムは本来「命中時ではなく3ターンの間ターン終了時に毎回-1（合計最大-3）」だが、
+# 検出時点で-1を即時適用する近似実装にしている（他の技と同じ即時1段階ダウン扱い）。
+_SPEED_STAGE_MOVES = {
+    "ローキック": -1, "じならし": -1, "がんせきふうじ": -1, "エレキネット": -1,
+    "こごえるかぜ": -1, "マッドショット": -1, "とびつく": -1, "みずあめボム": -1,
+    "いとをはく": -2, "わたほうし": -2, "どくのいと": -2,
 }
 
 # 技名・特性名（バトルメッセージ/コマンドエリアに出やすくポケモン名と混同される）
@@ -1117,6 +1157,7 @@ class FieldPokemon:
     confidence: int = 0                           # 検出回数（信頼度）
     last_seen_turn: int = 0                       # 最後に検出されたターン番号
     slot_index: int | None = None                 # 画面スロット番号: 0=左(x<960), 1=右(x>=960)
+    mega_evolved: bool = False                    # メガシンカ済みか（戦況推論強化・2026-08-04）
 
 
 class BattleStateTracker:
@@ -1153,6 +1194,14 @@ class BattleStateTracker:
     # （選出リスト cx≈250 が相手側スロットを誤取得するのを防ぐ）
     _SLOT_CX_TOLERANCE = 200
 
+    # 場のコンディション持続ターン数（改善ロードマップ「戦況推論強化」続き・2026-08-04）。
+    # 天候/壁は道具（天候石・ひかりのねんど）で8ターンに伸びる場合があるが、画面から
+    # 道具の有無を判別できないため既定値（無強化）を使う近似実装。
+    _WEATHER_DURATION = 5
+    _SCREEN_DURATION = 5
+    _TRICK_ROOM_DURATION = 5
+    _TAILWIND_DURATION = 4
+
     @staticmethod
     def _fuzzy_name_match(a: str, b: str) -> bool:
         """OCR揺らぎ（前方一致・末尾見切れ）を許容したポケモン名の同一性判定。
@@ -1179,6 +1228,22 @@ class BattleStateTracker:
         self._opponent_alive_count: int | None = None # 最新の相手生存数
         # 定期OCR数値HPの確定ヒステリシス: (側, スロット番号) → (読み値, 連続観測数)
         self._pending_ocr_hp: dict[tuple[str, int], tuple[str, int]] = {}
+
+        # 場のコンディション（改善ロードマップ「戦況推論強化」続き・2026-08-04）。
+        # 「開始ターン」だけ記録し、参照時に game_turn との差分から残りターン数を
+        # 逆算する（毎ターンのデクリメント処理が不要・ターン検出の既存ロジックに
+        # 一切手を加えずに済む設計）。
+        self._weather: str | None = None
+        self._weather_start_turn: int | None = None
+        self._screens: dict[str, tuple[str, int]] = {}       # side -> (名前, 開始turn)
+        self._trick_room_start_turn: int | None = None
+        self._tailwind_start_turn: dict[str, int] = {}       # side -> 開始turn
+
+    def _turns_left(self, start_turn: int | None, duration: int) -> int:
+        """開始ターンと持続ターン数から、現在の残りターン数を逆算する（0以下なら終了扱い）。"""
+        if start_turn is None:
+            return 0
+        return max(0, duration - (self.game_turn - start_turn))
 
     # ── 内部ヘルパー ─────────────────────────────────────────────────────────
 
@@ -2282,7 +2347,18 @@ class BattleStateTracker:
         player_names   = [p.name for p in sorted(self._player,   key=lambda p: -p.confidence)]
         opponent_names = [p.name for p in sorted(self._opponent, key=lambda p: -p.confidence)]
 
-        return {
+        weather_left = self._turns_left(self._weather_start_turn, self._WEATHER_DURATION)
+        screens = {
+            side: name for side, (name, start) in self._screens.items()
+            if self._turns_left(start, self._SCREEN_DURATION) > 0
+        }
+        trick_room_left = self._turns_left(self._trick_room_start_turn, self._TRICK_ROOM_DURATION)
+        tailwind = {
+            side: left for side, start in self._tailwind_start_turn.items()
+            if (left := self._turns_left(start, self._TAILWIND_DURATION)) > 0
+        }
+
+        ctx = {
             "turn":             self.game_turn,
             "player_field":     player_field_str,
             "player_bench":     player_bench_str,
@@ -2296,6 +2372,16 @@ class BattleStateTracker:
             "player_names":     player_names,    # RAG 用
             "opponent_names":   opponent_names,  # RAG 用
         }
+        if weather_left > 0:
+            ctx["weather"] = self._weather
+            ctx["weather_turns_left"] = weather_left
+        if screens:
+            ctx["screens"] = screens
+        if trick_room_left > 0:
+            ctx["trick_room_turns_left"] = trick_room_left
+        if tailwind:
+            ctx["tailwind"] = tailwind
+        return ctx
 
 
 # ─── OCR デバッグ画像保存 ────────────────────────────────────────────────────
@@ -2560,13 +2646,14 @@ def _build_bedrock_context(
 
 def _log_bedrock_send(context: dict, battle_state: dict) -> None:
     log.info(
-        "[Bedrock送信] event=%s | 自分=%s | 相手=%s | HP=%s | 技ログ=%s | RAG=%s",
+        "[Bedrock送信] event=%s | 自分=%s | 相手=%s | HP=%s | 技ログ=%s | RAG=%s | タイプ相性ヒント=%s",
         context["event_type"],
         battle_state.get("player_pokemon", "不明"),
         battle_state.get("opponent_pokemon", "不明"),
         context["hp_values"],
         context["detected_moves"],
         " / ".join(context["rag_pokemon_info"]) if context["rag_pokemon_info"] else "なし",
+        battle_state.get("type_hint") or "なし",
     )
 
 
@@ -2730,6 +2817,10 @@ class Pipeline:
         self._dense_scan_start_turn: int | None = None  # dense scan起点ターン（技ログのターン番号固定用）
         self._last_full_ocr_results: list[dict] = []  # メインOCR最新結果（dense scan時の使い手特定に使用）
         self._move_log: list[str] = []   # OCRから検出した「使われた技」のリングバッファ
+        # 技エントリ文字列 → 効果タグ（"バツグン"等）。「（推定）」と同じく表示時
+        # （_move_log_display）にのみ付与し、_move_log 本体は書き換えない
+        # （後付け修正・重複検出が完全一致文字列に依存しているため）
+        self._move_effectiveness: dict[str, str] = {}
         self._tentative_opponent_moves: list[dict] = []  # dense scan フォールバックで仮確定した相手技（後付け修正用）
         self._MAX_MOVE_LOG = 8
         self._speech_thread: threading.Thread | None = None  # 音声再生スレッド
@@ -2791,6 +2882,7 @@ class Pipeline:
         self._end_screen_ocr_texts = []
         self._commentary_history = []
         self._move_log = []
+        self._move_effectiveness = {}
         self._last_ball_yolo = None   # バトル開始時にボール情報をリセット
         self._last_ability_msg = {}   # バトル開始時に特性・道具メッセージをリセット
         self._battle_result = None    # 前試合の勝敗をリセット（連戦動画対策）
@@ -2978,6 +3070,9 @@ class Pipeline:
                     # ── 技使用・交代メッセージの検出（バトル中は常時監視）──────
                     if self._battle_active:
                         self._update_move_log(ocr_results, is_main_ocr=True, frame=frame)
+                        self._update_move_effectiveness(ocr_results)
+                        self._update_battle_conditions(ocr_results)
+                        self._update_mega_evolution(ocr_results)
                         self._update_switch_out(ocr_results)
                         # OCR bbox 位置から状態異常アイコンを検出してトラッカーに反映
                         fh, fw = frame.shape[:2]
@@ -3163,6 +3258,9 @@ class Pipeline:
                     if dense_texts:
                         log.info("[密集OCR] %s", " / ".join(dense_texts[:10]))
                         self._update_move_log(dense_results, frame=frame)
+                        self._update_move_effectiveness(dense_results)
+                        self._update_battle_conditions(dense_results)
+                        self._update_mega_evolution(dense_results)
 
                 self._prev_yolo = yolo_state
 
@@ -3331,6 +3429,12 @@ class Pipeline:
                     prev_fainted, self._battle_tracker.fainted_names())
 
         battle_context = self._battle_tracker.to_context()
+        type_hint = self._compute_type_hint()
+        if type_hint:
+            battle_context["type_hint"] = type_hint
+        condition_hint = self._compute_condition_hint(battle_context)
+        if condition_hint:
+            battle_context["condition_hint"] = condition_hint
         if event_type == "faint":
             battle_context["faint_side"] = faint_side
         # レンダーモード: イベント処理後の戦況をパネル用に記録（v2b）
@@ -3547,8 +3651,12 @@ class Pipeline:
         機能する。各イベントのcontext/battle_stateはスキャン中に捕捉した時点の
         値のままなので、未来の情報が混ざることはない（スポイラー安全性の担保）。
         """
+        render_sink = getattr(self, "_render_sink", None)
+        match_id = render_sink.out_dir.name if render_sink is not None else None
+
         history: list[str] = []
         for ev in self._pending_render_events:
+            self._record_situation_snapshot(match_id, ev)
             bedrock_commentary, bedrock_analysis = _call_bedrock_text(
                 self._ec2_url, ev["game_state"], ev["event_type"], history,
                 ev["battle_context"], self._classifier, ev["move_log"],
@@ -3558,10 +3666,12 @@ class Pipeline:
             else:
                 phi3_context = bedrock_analysis or ev["game_state"]["ocr_text"]
                 try:
+                    # samples=3: PokéLLMon論文の"consistent action generation"に着想。
+                    # ライブ経路は即時性優先でsamples=1（既定）のままにする
                     commentary = _clean_commentary(
                         self._phi3.generate_commentary(
                             ev["game_state"], bedrock_analysis=phi3_context,
-                            battle_context=ev["battle_context"]))
+                            battle_context=ev["battle_context"], samples=3))
                 except Exception as e:
                     log.error(f"Phi-3 エラー（後付け）: {e}")
                     continue
@@ -3588,6 +3698,49 @@ class Pipeline:
                      entry["seq"], ev["event_type"], entry["event_time"],
                      entry["duration"], entry["wav"])
 
+        # データウェアハウスの箱（改善ロードマップ「戦況推論強化」続き・2026-08-04）:
+        # 勝敗が確定していれば記録済みの全イベント行にバックフィルする。降参終了等で
+        # battle_resultが未検出の場合はoutcome=NULLのまま残る（既知の制約・許容）。
+        battle_result = getattr(self, "_battle_result", None)
+        if match_id and battle_result:
+            try:
+                backfill_outcome(match_id, battle_result, db_path=self._situation_db_path)
+            except Exception as e:
+                log.warning(f"戦況ウェアハウス勝敗バックフィルエラー: {e}")
+
+    # データウェアハウスの箱の既定保存先。テストでは実データを汚さないよう
+    # インスタンス属性 self._situation_db_path で上書きすること（tmp_path等）。
+    _situation_db_path = _SITUATION_DEFAULT_DB_PATH
+
+    def _record_situation_snapshot(self, match_id: str | None, ev: dict) -> None:
+        """データウェアハウスの箱（改善ロードマップ「戦況推論強化」続き・2026-08-04）に
+        1イベント分の状況スナップショットを記録する。記録のみで判断ロジックは無い
+        （`src/analytics/situation_warehouse.py`参照）。失敗しても実況生成は止めない。
+        """
+        if not match_id:
+            return
+        battle_context = ev.get("battle_context") or {}
+        try:
+            record_situation({
+                "match_id": match_id,
+                "event_time": ev.get("event_time"),
+                "turn": battle_context.get("turn"),
+                "event_type": ev.get("event_type"),
+                "player_pokemon": battle_context.get("player_pokemon"),
+                "opponent_pokemon": battle_context.get("opponent_pokemon"),
+                "weather": battle_context.get("weather"),
+                "screens_player": (battle_context.get("screens") or {}).get("player"),
+                "screens_opponent": (battle_context.get("screens") or {}).get("opponent"),
+                "trick_room": battle_context.get("trick_room_turns_left"),
+                "tailwind_player": (battle_context.get("tailwind") or {}).get("player"),
+                "tailwind_opponent": (battle_context.get("tailwind") or {}).get("opponent"),
+                "type_hint": battle_context.get("type_hint"),
+                "hp_player": ev.get("game_state", {}).get("hp_values"),
+                "hp_opponent": None,
+            }, db_path=self._situation_db_path)
+        except Exception as e:
+            log.warning(f"戦況ウェアハウス記録エラー: {e}")
+
     def _record_panel_state(self) -> None:
         """レンダーモード時、戦況パネル用スナップショットを states.jsonl に記録する。
 
@@ -3601,6 +3754,111 @@ class Pipeline:
             render_sink.add_state(self._now(), self._battle_tracker.to_panel_state())
         except Exception as e:
             log.error(f"パネル状態記録エラー: {e}")
+
+    # T{turn}:{ポケモン名}の{技名} 形式（self._move_log の生の格納形式・表示用タグは含まない）
+    _MOVE_LOG_ENTRY_RE = re.compile(r"^T\d+:(.+?)の(.+)$")
+    # 「(ポケモン名)の メガシンカ！」形式（改善ロードマップ「戦況推論強化」続き・2026-08-04）
+    _MEGA_EVOLUTION_RE = re.compile(r"(.{2,12})の\s*メガシンカ")
+
+    @staticmethod
+    def _effective_pokemon_types(pokemon, classifier) -> list[str] | None:
+        """メガシンカ済み（`mega_evolved=True`）かつタイプ変化の登録がある場合は
+        そちらを優先し、無ければ図鑑DBの通常タイプを返す（改善ロードマップ
+        「戦況推論強化」続き・2026-08-04）。"""
+        if getattr(pokemon, "mega_evolved", False):
+            override = get_mega_types(pokemon.name)
+            if override:
+                return override
+        return classifier.get_pokemon_types(pokemon.name)
+
+    def _update_mega_evolution(self, ocr_results: list[dict]) -> None:
+        """OCR結果から「〜のメガシンカ」メッセージを検出し、該当ポケモンの
+        `mega_evolved`フラグを立てる（改善ロードマップ「戦況推論強化」続き・2026-08-04）。
+        フォーム名（X/Y等）まで正確にOCRから拾うのは信頼度が低いと想定されるため、
+        「メガシンカした事実」の検出のみ行う。タイプ上書きは`mega_forms.py`に該当
+        エントリがあれば適用され、無ければ通常タイプのまま（段階的な設計）。
+        """
+        joined = "".join(r.get("text", "") for r in ocr_results)
+        m = self._MEGA_EVOLUTION_RE.search(joined)
+        if not m:
+            return
+        slot = self._battle_tracker._find_slot(m.group(1).strip())
+        if slot:
+            slot.mega_evolved = True
+
+    def _latest_move_type_hint(self, classifier, on_field_p: list, on_field_o: list) -> str | None:
+        """直近の技ログエントリから、実際に使われた技のタイプで相性を計算する
+        （2026-08-04追加: 攻撃側の持ちタイプだけでは拾えないカバー技への対応。実機で
+        「メタグロスのじだんだ（じめん技）はドドゲザン（あく/はがね）にバツグンのはずが、
+        メタグロス自身のタイプ（はがね/エスパー）基準のヒントしか無くLLMが誤答した」
+        実例を受けて追加。取得できた場合はこちらを優先表示する）。
+        """
+        move_log = getattr(self, "_move_log", None)
+        if not move_log:
+            return None
+        m = self._MOVE_LOG_ENTRY_RE.match(move_log[-1])
+        if not m:
+            return None
+        pokemon_name, move_name = m.group(1), m.group(2)
+        move_type = classifier.get_move_type(move_name)
+        if not move_type:
+            return None
+        p_names = {p.name for p in on_field_p}
+        o_names = {p.name for p in on_field_o}
+        if pokemon_name in p_names:
+            defenders = on_field_o
+        elif pokemon_name in o_names:
+            defenders = on_field_p
+        else:
+            return None
+        for defender in defenders:
+            d_types = self._effective_pokemon_types(defender, classifier)
+            if not d_types:
+                continue
+            label = describe_matchup(move_type, d_types)
+            if label != "等倍":
+                return f"（実際に使った）{pokemon_name}の{move_name}は{defender.name}に{label}"
+        return None
+
+    def _compute_type_hint(self) -> str | None:
+        """場に出ている自分/相手ポケモンのタイプ相性ヒントを計算する
+        （Cicero型アーキテクチャ・改善ロードマップ「戦況推論強化」2026-08-04）。
+
+        LLMにタイプ相性の計算を推測させず、Python側で確定計算した結果だけを事実として
+        渡すことでハルシネーション対策にする（src/pokedb/type_chart.py参照）。
+        「等倍」は情報量が無いため省略し、目立つ相性（バツグン/いまひとつ/こうかなし等）
+        のみ返す。攻撃側の「持っているタイプ」をそのままSTAB技のタイプ相性として使う
+        簡易計算がベースだが、直近で実際に使われた技が分かる場合は`_latest_move_type_hint`
+        （カバー技にも対応）を優先して先頭に含める。
+        """
+        classifier = getattr(self, "_classifier", None)
+        if classifier is None:
+            return None
+
+        def _matchup_lines(attackers: list, defenders: list) -> list[str]:
+            lines: list[str] = []
+            for attacker in attackers:
+                a_types = self._effective_pokemon_types(attacker, classifier)
+                if not a_types:
+                    continue
+                for defender in defenders:
+                    d_types = self._effective_pokemon_types(defender, classifier)
+                    if not d_types:
+                        continue
+                    labels = {describe_matchup(t, d_types) for t in a_types} - {"等倍"}
+                    for label in labels:
+                        lines.append(f"{attacker.name}の技は{defender.name}に{label}")
+            return lines
+
+        on_field_p = [p for p in self._battle_tracker._player if p.on_field and not p.fainted]
+        on_field_o = [p for p in self._battle_tracker._opponent if p.on_field and not p.fainted]
+        lines = _matchup_lines(on_field_p, on_field_o) + _matchup_lines(on_field_o, on_field_p)
+
+        move_hint = self._latest_move_type_hint(classifier, on_field_p, on_field_o)
+        if move_hint:
+            lines = [move_hint] + lines
+
+        return " / ".join(lines[:4]) if lines else None
 
     def _render_context(self, battle_context: dict | None) -> dict | None:
         """レンダリング素材のマニフェストに記録する戦況サマリーを組み立てる。
@@ -3624,6 +3882,11 @@ class Pipeline:
                 # 改善ロードマップ③（表情連動）用: "勝ち"/"負け"。battle_end時の
                 # 表情（喜び/哀しみ）選択に使う
                 ctx["battle_result"] = battle_context["battle_result"]
+            if "type_hint" in battle_context:
+                # 戦況推論強化（2026-08-04）用: manifest.jsonlで実機確認できるようにする
+                ctx["type_hint"] = battle_context["type_hint"]
+            if "condition_hint" in battle_context:
+                ctx["condition_hint"] = battle_context["condition_hint"]
         return ctx
 
     def _speak_async(self, commentary: str, event_type: str = "unknown",
@@ -3860,12 +4123,143 @@ class Pipeline:
         使い手を特定できず「場の1匹目」フォールバックで仮登録し、まだ後付け修正
         （_update_move_log 冒頭の仮確定エントリ突合）で確定していないエントリには
         「（推定）」を付け、LLM に使い手の確度が低いことを伝える。
+
+        「（バツグン）」等の効果タグ（_update_move_effectiveness が記録）も同様に
+        表示時のみ付与する。_move_log 本体を書き換えると後付け修正・重複検出の
+        完全一致文字列比較が壊れるため。
         """
         tentative_entries = {t["old_entry"] for t in self._tentative_opponent_moves}
-        return [
-            f"{e}（推定）" if e in tentative_entries else e
-            for e in self._move_log[-n:]
-        ]
+        result = []
+        for e in self._move_log[-n:]:
+            eff = self._move_effectiveness.get(e)
+            tag = f"（{eff}）" if eff else ""
+            tag += "（推定）" if e in tentative_entries else ""
+            result.append(f"{e}{tag}")
+        return result
+
+    def _update_move_effectiveness(self, ocr_results: list[dict]) -> None:
+        """OCR結果から効果テキスト（現状「バツグンだ」のみ・_EFFECTIVENESS_TAGS参照）を
+        検出し、直近の技ログエントリに紐付ける（改善ロードマップ・戦況推論強化）。
+
+        既に検出済みで実際に使われている情報（_BATTLE_RESULT_WORDSで名前候補からは
+        除外していたもの）を活用するだけで、新規のセンサー・推測ロジックは不要。
+        """
+        if not self._move_log:
+            return
+        latest = self._move_log[-1]
+        for token, tag in _EFFECTIVENESS_TAGS.items():
+            if any(token in r.get("text", "") for r in ocr_results):
+                self._move_effectiveness[latest] = tag
+                break
+
+    @staticmethod
+    def _condition_message_side(ocr_results: list[dict]) -> str:
+        """壁/おいかぜ発動メッセージがどちら側のものかを判定する（`_FAINT_RE`と同じ
+        「あいて/相手の」プレフィックス有無による簡易判定。位置ROIまでは使わない
+        近似実装）。"""
+        texts = [r.get("text", "") for r in ocr_results]
+        if any("あいて" in t or "相手" in t for t in texts):
+            return "opponent"
+        return "player"
+
+    def _update_battle_conditions(self, ocr_results: list[dict]) -> None:
+        """OCR結果から天候・壁・トリックルーム・おいかぜの発動メッセージを検出し、
+        `BattleStateTracker`に開始ターンを記録する（改善ロードマップ「戦況推論強化」続き・
+        2026-08-04）。"""
+        texts = [r.get("text", "") for r in ocr_results]
+        joined = "".join(texts)
+        tracker = self._battle_tracker
+        turn = tracker.game_turn
+
+        for keywords, weather in _WEATHER_KEYWORDS.items():
+            if all(kw in joined for kw in keywords):
+                tracker._weather = weather
+                tracker._weather_start_turn = turn
+                break
+
+        for keyword, screen in _SCREEN_KEYWORDS.items():
+            if keyword in joined:
+                side = self._condition_message_side(ocr_results)
+                tracker._screens[side] = (screen, turn)
+
+        if all(kw in joined for kw in _TRICK_ROOM_KEYWORDS):
+            tracker._trick_room_start_turn = turn
+
+        if all(kw in joined for kw in _TAILWIND_KEYWORDS):
+            side = self._condition_message_side(ocr_results)
+            tracker._tailwind_start_turn[side] = turn
+
+    def _compute_speed_stage_hint(self) -> str | None:
+        """技ログの直近エントリ（最大8件・`_MAX_MOVE_LOG`）から素早さランク低下技の
+        使用を検出し、自然文のヒントを作る（改善ロードマップ「戦況推論強化」続き・
+        2026-08-04）。能力ランクを`FieldPokemon`に永続フィールドとして持たせる
+        設計にはしていない（交代時のリセット処理を既存の場退出コード9箇所すべてに
+        差し込む必要がありリスクが高いため）。move_logの直近ウィンドウ内だけで
+        有効な近似実装として割り切っている。
+        """
+        move_log = getattr(self, "_move_log", None)
+        if not move_log:
+            return None
+        on_field_p = {p.name for p in self._battle_tracker._player if p.on_field and not p.fainted}
+        on_field_o = {p.name for p in self._battle_tracker._opponent if p.on_field and not p.fainted}
+
+        stage_deltas: dict[str, int] = {}
+        for entry in move_log:
+            m = self._MOVE_LOG_ENTRY_RE.match(entry)
+            if not m:
+                continue
+            user_name, move_name = m.group(1), m.group(2)
+            delta = _SPEED_STAGE_MOVES.get(move_name)
+            if delta is None:
+                continue
+            if user_name in on_field_p:
+                targets = on_field_o
+            elif user_name in on_field_o:
+                targets = on_field_p
+            else:
+                continue
+            for target_name in targets:
+                stage_deltas[target_name] = stage_deltas.get(target_name, 0) + delta
+
+        lines = []
+        for name, total in stage_deltas.items():
+            total = max(-6, min(6, total))
+            if total < 0:
+                lines.append(f"{name}の素早さが{abs(total)}段階下がっている")
+            elif total > 0:
+                lines.append(f"{name}の素早さが{total}段階上がっている")
+        return " / ".join(lines) if lines else None
+
+    def _compute_condition_hint(self, battle_context: dict) -> str | None:
+        """天候・壁・トリックルーム・おいかぜ・素早さランク変化を自然文の事実として
+        まとめる（Cicero型アーキテクチャ・改善ロードマップ「戦況推論強化」続き・
+        2026-08-04）。`battle_context`は`BattleStateTracker.to_context()`の戻り値
+        （呼び出し側で計算済みのものをそのまま渡す・二重計算を避ける）。
+        """
+        lines = []
+        if battle_context.get("weather"):
+            lines.append(
+                f"{battle_context['weather']}が{battle_context.get('weather_turns_left', '?')}"
+                "ターン継続中")
+
+        for side, name in (battle_context.get("screens") or {}).items():
+            side_label = "自分" if side == "player" else "相手"
+            lines.append(f"{side_label}側に{name}が張られている")
+
+        if battle_context.get("trick_room_turns_left"):
+            lines.append(
+                f"トリックルーム中（あと{battle_context['trick_room_turns_left']}ターン・"
+                "素早さの遅い方が先に動く）")
+
+        for side, left in (battle_context.get("tailwind") or {}).items():
+            side_label = "自分" if side == "player" else "相手"
+            lines.append(f"{side_label}側におい風（あと{left}ターン・素早さ2倍）")
+
+        speed_hint = self._compute_speed_stage_hint()
+        if speed_hint:
+            lines.append(speed_hint)
+
+        return " / ".join(lines) if lines else None
 
     def _dispatch_move_commentary(
         self,
@@ -3895,6 +4289,12 @@ class Pipeline:
         side_prefix = f"{side}の" if side else ""
         game_state["move_focus"] = f"{side_prefix}{pokemon_name}の{move_name}"
         battle_context = self._battle_tracker.to_context()
+        type_hint = self._compute_type_hint()
+        if type_hint:
+            battle_context["type_hint"] = type_hint
+        condition_hint = self._compute_condition_hint(battle_context)
+        if condition_hint:
+            battle_context["condition_hint"] = condition_hint
         attempt_bedrock = bool(
             self._ec2_url and "move_single" in BEDROCK_EVENTS and self._battle_active)
         self._dispatch_commentary(

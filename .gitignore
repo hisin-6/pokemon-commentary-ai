@@ -27,6 +27,9 @@ data/pokeapi_cache/
 # PokeDB（build_pokedb.pyで再生成可能なバイナリ）
 data/pokedb.sqlite
 
+# 戦況ウェアハウス（データウェアハウスの箱・蓄積されるユーザー固有データ）
+data/battle_situations.sqlite
+
 # VS Code ワークスペース設定
 .vscode/
 

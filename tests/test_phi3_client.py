@@ -107,3 +107,76 @@ class TestGenerateCommentary:
                   side_effect=requests.exceptions.ConnectionError()):
             with pytest.raises(requests.exceptions.ConnectionError):
                 client.generate_commentary({"event_type": "move_used"})
+
+
+class TestAttributionError:
+    """_has_attribution_error: 2026-08-04・phi3.5が「我がイッカネズミ」（相手のポケモンを
+    自分呼ばわり）した実機事故を受けて追加した簡易検証（PokéLLMon論文のconsistent action
+    generationに着想）。"""
+
+    _CONTEXT = {"player_names": ["メタグロス"], "opponent_names": ["イッカネズミ"]}
+
+    def test_opponent_pokemon_called_self_is_error(self):
+        assert Phi3Client._has_attribution_error("我がイッカネズミが頑張る！", self._CONTEXT)
+
+    def test_player_pokemon_called_opponent_is_error(self):
+        assert Phi3Client._has_attribution_error("相手のメタグロスが炸裂！", self._CONTEXT)
+
+    def test_correct_attribution_is_not_error(self):
+        text = "我がメタグロスと相手のイッカネズミの対決だ！"
+        assert not Phi3Client._has_attribution_error(text, self._CONTEXT)
+
+    def test_no_battle_context_is_not_error(self):
+        assert not Phi3Client._has_attribution_error("我がイッカネズミが頑張る！", None)
+
+    def test_missing_names_fields_is_not_error(self):
+        assert not Phi3Client._has_attribution_error("我がイッカネズミが頑張る！", {"turn": 1})
+
+
+class TestSamplesVoting:
+    """generate_commentary(samples=N): 帰属エラーの無いサンプルを採用する多数決
+    （2026-08-04・改善ロードマップ「戦況推論強化」フェーズ3）。"""
+
+    _CONTEXT = {"player_names": ["メタグロス"], "opponent_names": ["イッカネズミ"]}
+
+    def _mock_response(self, text):
+        r = MagicMock()
+        r.json.return_value = {"response": text}
+        r.raise_for_status.return_value = None
+        return r
+
+    def test_default_samples_is_one_call(self, client):
+        with patch("src.commentary.phi3_client.requests.post",
+                  return_value=self._mock_response("正常な実況文")) as mock_post:
+            client.generate_commentary({"event_type": "move_used"}, battle_context=self._CONTEXT)
+        assert mock_post.call_count == 1
+
+    def test_first_clean_sample_is_returned_without_extra_calls(self, client):
+        with patch("src.commentary.phi3_client.requests.post",
+                  return_value=self._mock_response("我がメタグロスが炸裂！")) as mock_post:
+            result = client.generate_commentary(
+                {"event_type": "move_used"}, battle_context=self._CONTEXT, samples=3)
+        assert result == "我がメタグロスが炸裂！"
+        assert mock_post.call_count == 1  # 1発目がクリーンなので追加生成しない
+
+    def test_retries_until_clean_sample_found(self, client):
+        responses = [
+            self._mock_response("我がイッカネズミが頑張る！"),  # 帰属エラー
+            self._mock_response("相手のメタグロスが来た！"),      # 帰属エラー
+            self._mock_response("我がメタグロスが炸裂！"),        # クリーン
+        ]
+        with patch("src.commentary.phi3_client.requests.post", side_effect=responses) as mock_post:
+            result = client.generate_commentary(
+                {"event_type": "move_used"}, battle_context=self._CONTEXT, samples=3)
+        assert result == "我がメタグロスが炸裂！"
+        assert mock_post.call_count == 3
+
+    def test_all_samples_dirty_falls_back_to_first(self, client):
+        responses = [
+            self._mock_response("我がイッカネズミが頑張る！"),
+            self._mock_response("相手のメタグロスが来た！"),
+        ]
+        with patch("src.commentary.phi3_client.requests.post", side_effect=responses):
+            result = client.generate_commentary(
+                {"event_type": "move_used"}, battle_context=self._CONTEXT, samples=2)
+        assert result == "我がイッカネズミが頑張る！"  # 先頭のサンプルを採用

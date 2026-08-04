@@ -13,7 +13,7 @@ pipeline.py の純粋ロジック単体テスト
 import sys
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -981,6 +981,212 @@ class TestBattleStateTracker:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 場のコンディション（天候・壁・トリックルーム・おいかぜ）2026-08-04新規
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTurnsLeft:
+    def setup_method(self):
+        self.tracker = BattleStateTracker()
+
+    def test_none_start_turn_returns_zero(self):
+        assert self.tracker._turns_left(None, 5) == 0
+
+    def test_full_duration_at_start_turn(self):
+        self.tracker.game_turn = 3
+        assert self.tracker._turns_left(3, 5) == 5
+
+    def test_decreases_as_turns_pass(self):
+        self.tracker.game_turn = 6
+        assert self.tracker._turns_left(3, 5) == 2
+
+    def test_clamped_to_zero_when_expired(self):
+        self.tracker.game_turn = 20
+        assert self.tracker._turns_left(3, 5) == 0
+
+
+class TestToContextConditions:
+    def setup_method(self):
+        self.tracker = BattleStateTracker()
+        self.tracker.game_turn = 2
+
+    def test_weather_included_while_active(self):
+        self.tracker._weather = "あまごい"
+        self.tracker._weather_start_turn = 2
+        ctx = self.tracker.to_context()
+        assert ctx["weather"] == "あまごい"
+        assert ctx["weather_turns_left"] == 5
+
+    def test_weather_omitted_when_expired(self):
+        self.tracker._weather = "あまごい"
+        self.tracker._weather_start_turn = 2
+        self.tracker.game_turn = 20
+        ctx = self.tracker.to_context()
+        assert "weather" not in ctx
+
+    def test_screens_included_while_active(self):
+        self.tracker._screens = {"player": ("リフレクター", 2)}
+        ctx = self.tracker.to_context()
+        assert ctx["screens"] == {"player": "リフレクター"}
+
+    def test_expired_screen_excluded(self):
+        self.tracker._screens = {"player": ("リフレクター", 2), "opponent": ("ひかりのかべ", -20)}
+        ctx = self.tracker.to_context()
+        assert ctx["screens"] == {"player": "リフレクター"}
+
+    def test_trick_room_included_while_active(self):
+        self.tracker._trick_room_start_turn = 2
+        ctx = self.tracker.to_context()
+        assert ctx["trick_room_turns_left"] == 5
+
+    def test_tailwind_per_side(self):
+        self.tracker._tailwind_start_turn = {"opponent": 2}
+        ctx = self.tracker.to_context()
+        assert ctx["tailwind"] == {"opponent": 4}
+
+    def test_no_conditions_means_no_keys(self):
+        ctx = self.tracker.to_context()
+        for key in ("weather", "screens", "trick_room_turns_left", "tailwind"):
+            assert key not in ctx
+
+
+class TestConditionMessageSide:
+    def test_opponent_prefix_detected(self):
+        ocr = [{"text": "あいての リフレクターの効果で", "confidence": 0.9}]
+        assert Pipeline._condition_message_side(ocr) == "opponent"
+
+    def test_no_prefix_defaults_to_player(self):
+        ocr = [{"text": "リフレクターの効果で", "confidence": 0.9}]
+        assert Pipeline._condition_message_side(ocr) == "player"
+
+
+class TestUpdateBattleConditions:
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._battle_tracker.game_turn = 3
+
+    def _ocr(self, *texts):
+        return [{"text": t, "confidence": 0.9} for t in texts]
+
+    def test_weather_detected(self):
+        Pipeline._update_battle_conditions(self.runner, self._ocr("あめが", "ふりはじめた！"))
+        assert self.runner._battle_tracker._weather == "あまごい"
+        assert self.runner._battle_tracker._weather_start_turn == 3
+
+    def test_screen_detected_with_side(self):
+        Pipeline._update_battle_conditions(
+            self.runner, self._ocr("あいての", "リフレクターの効果で"))
+        assert self.runner._battle_tracker._screens["opponent"] == ("リフレクター", 3)
+
+    def test_screen_defaults_to_player_side(self):
+        Pipeline._update_battle_conditions(self.runner, self._ocr("リフレクターの効果で"))
+        assert self.runner._battle_tracker._screens["player"] == ("リフレクター", 3)
+
+    def test_trick_room_detected(self):
+        Pipeline._update_battle_conditions(self.runner, self._ocr("空間が", "ゆがんだ！"))
+        assert self.runner._battle_tracker._trick_room_start_turn == 3
+
+    def test_tailwind_detected(self):
+        Pipeline._update_battle_conditions(self.runner, self._ocr("追い風が", "ふきはじめた！"))
+        assert self.runner._battle_tracker._tailwind_start_turn["player"] == 3
+
+    def test_no_match_leaves_state_untouched(self):
+        Pipeline._update_battle_conditions(self.runner, self._ocr("メタグロスのアイアンヘッド"))
+        assert self.runner._battle_tracker._weather is None
+        assert self.runner._battle_tracker._screens == {}
+        assert self.runner._battle_tracker._trick_room_start_turn is None
+
+
+class TestComputeSpeedStageHint:
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._move_log = []
+
+    def _add(self, side, name, on_field=True):
+        slots = self.runner._battle_tracker._player if side == "player" else self.runner._battle_tracker._opponent
+        slots.append(FieldPokemon(name=name, on_field=on_field))
+
+    def test_no_move_log_returns_none(self):
+        assert self.runner._compute_speed_stage_hint() is None
+
+    def test_speed_lowering_move_reported(self):
+        self._add("player", "ペリッパー")
+        self._add("opponent", "ドドゲザン")
+        self.runner._move_log = ["T1:ペリッパーのこごえるかぜ"]
+        hint = self.runner._compute_speed_stage_hint()
+        assert hint == "ドドゲザンの素早さが1段階下がっている"
+
+    def test_two_stage_move_reported(self):
+        self._add("player", "ペリッパー")
+        self._add("opponent", "ドドゲザン")
+        self.runner._move_log = ["T1:ペリッパーのわたほうし"]
+        hint = self.runner._compute_speed_stage_hint()
+        assert hint == "ドドゲザンの素早さが2段階下がっている"
+
+    def test_stacking_moves_accumulate(self):
+        self._add("player", "ペリッパー")
+        self._add("opponent", "ドドゲザン")
+        self.runner._move_log = ["T1:ペリッパーのこごえるかぜ", "T2:ペリッパーのこごえるかぜ"]
+        hint = self.runner._compute_speed_stage_hint()
+        assert hint == "ドドゲザンの素早さが2段階下がっている"
+
+    def test_clamped_to_six_stages(self):
+        self._add("player", "ペリッパー")
+        self._add("opponent", "ドドゲザン")
+        self.runner._move_log = [f"T{i}:ペリッパーのわたほうし" for i in range(5)]
+        hint = self.runner._compute_speed_stage_hint()
+        assert hint == "ドドゲザンの素早さが6段階下がっている"
+
+    def test_non_speed_move_ignored(self):
+        self._add("player", "ペリッパー")
+        self._add("opponent", "ドドゲザン")
+        self.runner._move_log = ["T1:ペリッパーのウェザーボール"]
+        assert self.runner._compute_speed_stage_hint() is None
+
+    def test_unknown_user_side_ignored(self):
+        self.runner._move_log = ["T1:謎のポケモンのこごえるかぜ"]
+        assert self.runner._compute_speed_stage_hint() is None
+
+
+class TestComputeConditionHint:
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._move_log = []
+
+    def test_empty_context_returns_none(self):
+        assert self.runner._compute_condition_hint({}) is None
+
+    def test_weather_line(self):
+        hint = self.runner._compute_condition_hint(
+            {"weather": "あまごい", "weather_turns_left": 4})
+        assert hint == "あまごいが4ターン継続中"
+
+    def test_screens_lines_per_side(self):
+        hint = self.runner._compute_condition_hint(
+            {"screens": {"player": "リフレクター", "opponent": "ひかりのかべ"}})
+        assert "自分側にリフレクターが張られている" in hint
+        assert "相手側にひかりのかべが張られている" in hint
+
+    def test_trick_room_line(self):
+        hint = self.runner._compute_condition_hint({"trick_room_turns_left": 3})
+        assert "トリックルーム中（あと3ターン" in hint
+
+    def test_tailwind_line(self):
+        hint = self.runner._compute_condition_hint({"tailwind": {"player": 2}})
+        assert "自分側におい風（あと2ターン" in hint
+
+    def test_combines_with_speed_stage_hint(self):
+        self.runner._battle_tracker._player.append(FieldPokemon(name="ペリッパー", on_field=True))
+        self.runner._battle_tracker._opponent.append(FieldPokemon(name="ドドゲザン", on_field=True))
+        self.runner._move_log = ["T1:ペリッパーのこごえるかぜ"]
+        hint = self.runner._compute_condition_hint({"weather": "あまごい", "weather_turns_left": 4})
+        assert "あまごいが4ターン継続中" in hint
+        assert "ドドゲザンの素早さが1段階下がっている" in hint
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # BattleMessageParser（同名ミラー戦のサイド誤帰属の回帰ガード）
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1473,6 +1679,7 @@ class TestMoveSingleDispatch:
         self.runner._battle_active = True
         self.runner._dense_scan_start_turn = None
         self.runner._move_log = []
+        self.runner._move_effectiveness = {}
         self.runner._MAX_MOVE_LOG = 8
         self.runner._dense_scan_remaining = 0
         self.runner._last_full_ocr_results = []
@@ -1604,6 +1811,7 @@ class TestMoveLogDisplay:
     def setup_method(self):
         self.runner = Pipeline.__new__(Pipeline)
         self.runner._move_log = ["T1:オオニューラのわるだくみ", "T2:リキキリンのけたぐり"]
+        self.runner._move_effectiveness = {}
 
     def test_confirmed_entry_has_no_marker(self):
         self.runner._tentative_opponent_moves = []
@@ -1621,6 +1829,293 @@ class TestMoveLogDisplay:
             "T1:オオニューラのわるだくみ", "T2:リキキリンのけたぐり（推定）",
         ]
 
+    def test_effectiveness_tag_shown(self):
+        """2026-08-04: _update_move_effectivenessが記録した効果タグの表示。"""
+        self.runner._tentative_opponent_moves = []
+        self.runner._move_effectiveness = {"T2:リキキリンのけたぐり": "バツグン"}
+        assert self.runner._move_log_display(5) == [
+            "T1:オオニューラのわるだくみ", "T2:リキキリンのけたぐり（バツグン）",
+        ]
+
+    def test_effectiveness_and_tentative_tags_combine(self):
+        self.runner._tentative_opponent_moves = [
+            {"old_entry": "T2:リキキリンのけたぐり", "move_name": "けたぐり",
+             "turn_label": "2", "fallback_pokemon": "リキキリン"},
+        ]
+        self.runner._move_effectiveness = {"T2:リキキリンのけたぐり": "バツグン"}
+        assert self.runner._move_log_display(5) == [
+            "T1:オオニューラのわるだくみ", "T2:リキキリンのけたぐり（バツグン）（推定）",
+        ]
+
+
+class TestUpdateMoveEffectiveness:
+    """_update_move_effectiveness: OCRの効果テキストを直近の技ログエントリに紐付ける
+    （改善ロードマップ・戦況推論強化 2026-08-04）。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._move_log = ["T1:メタグロスのアイアンヘッド"]
+        self.runner._move_effectiveness = {}
+
+    def test_batsugun_tags_latest_entry(self):
+        ocr = [{"text": "バツグンだ！", "confidence": 0.9}]
+        Pipeline._update_move_effectiveness(self.runner, ocr)
+        assert self.runner._move_effectiveness == {"T1:メタグロスのアイアンヘッド": "バツグン"}
+
+    def test_no_keyword_leaves_untouched(self):
+        ocr = [{"text": "メタグロスのアイアンヘッド", "confidence": 0.9}]
+        Pipeline._update_move_effectiveness(self.runner, ocr)
+        assert self.runner._move_effectiveness == {}
+
+    def test_empty_move_log_is_noop(self):
+        self.runner._move_log = []
+        ocr = [{"text": "バツグンだ！", "confidence": 0.9}]
+        Pipeline._update_move_effectiveness(self.runner, ocr)
+        assert self.runner._move_effectiveness == {}
+
+    def test_imamahitotsu_not_tagged_yet(self):
+        """いまひとつ/こうかなしは技選択UIにも出るため、Phase 1では対象外
+        （_EFFECTIVENESS_TAGSにバツグンだのみ収録）。誤タグ付けを防ぐための意図的な仕様。"""
+        ocr = [{"text": "いまひとつのようだ", "confidence": 0.9}]
+        Pipeline._update_move_effectiveness(self.runner, ocr)
+        assert self.runner._move_effectiveness == {}
+
+    def test_second_move_tags_new_latest_entry_independently(self):
+        ocr1 = [{"text": "バツグンだ！", "confidence": 0.9}]
+        Pipeline._update_move_effectiveness(self.runner, ocr1)
+        self.runner._move_log.append("T2:ペリッパーのウェザーボール")
+        ocr2 = [{"text": "なにも起きなかった", "confidence": 0.9}]
+        Pipeline._update_move_effectiveness(self.runner, ocr2)
+        assert self.runner._move_effectiveness == {"T1:メタグロスのアイアンヘッド": "バツグン"}
+
+
+class TestComputeTypeHint:
+    """_compute_type_hint: 場のポケモンのタイプ相性ヒントを計算する
+    （Cicero型アーキテクチャ・戦況推論強化 2026-08-04）。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._move_log = []
+        self._types = {}
+        self._move_types = {}
+        clf = MagicMock()
+        clf.get_pokemon_types.side_effect = lambda name: self._types.get(name)
+        clf.get_move_type.side_effect = lambda name: self._move_types.get(name)
+        self.runner._classifier = clf
+
+    def _add(self, side, name, types, on_field=True):
+        slots = self.runner._battle_tracker._player if side == "player" else self.runner._battle_tracker._opponent
+        slots.append(FieldPokemon(name=name, on_field=on_field))
+        self._types[name] = types
+
+    def test_no_classifier_returns_none(self):
+        self.runner._classifier = None
+        assert self.runner._compute_type_hint() is None
+
+    def test_no_on_field_pokemon_returns_none(self):
+        assert self.runner._compute_type_hint() is None
+
+    def test_super_effective_matchup_reported(self):
+        # はがね技はいわに2倍（バツグン）
+        self._add("player", "メタグロス", ["はがね", "エスパー"])
+        self._add("opponent", "イワーク", ["いわ"])
+        hint = self.runner._compute_type_hint()
+        assert "メタグロスの技はイワークにバツグン" in hint
+
+    def test_neutral_matchup_omitted(self):
+        self._add("player", "ピカチュウ", ["でんき"])
+        self._add("opponent", "カビゴン", ["ノーマル"])
+        assert self.runner._compute_type_hint() is None
+
+    def test_opponent_side_matchup_also_included(self):
+        """自分→相手だけでなく相手→自分方向の相性（脅威）も返す。"""
+        self._add("player", "コータス", ["ほのお"])
+        self._add("opponent", "ペリッパー", ["みず", "ひこう"])
+        hint = self.runner._compute_type_hint()
+        assert "ペリッパーの技はコータスにバツグン" in hint
+
+    def test_fainted_pokemon_excluded(self):
+        self.runner._battle_tracker._player.append(
+            FieldPokemon(name="メタグロス", on_field=True, fainted=True))
+        self._types["メタグロス"] = ["はがね"]
+        self._add("opponent", "コータス", ["ほのお"])
+        assert self.runner._compute_type_hint() is None
+
+    def test_unknown_pokemon_type_skipped_gracefully(self):
+        self._add("player", "図鑑に無いポケモン", [])  # get_pokemon_typesがNoneを返す想定
+        self._types["図鑑に無いポケモン"] = None
+        self._add("opponent", "コータス", ["ほのお"])
+        assert self.runner._compute_type_hint() is None
+
+    def test_lines_capped_at_four(self):
+        for i in range(3):
+            self._add("player", f"炎{i}", ["ほのお"])
+        for i in range(3):
+            self._add("opponent", f"草{i}", ["くさ"])
+        hint = self.runner._compute_type_hint()
+        assert hint is not None
+        assert len(hint.split(" / ")) <= 4
+
+    def test_covering_move_type_prioritized_over_own_type_guess(self):
+        """2026-08-04実機で発見: メタグロス(はがね/エスパー)のじだんだ（じめん技）が
+        ドドゲザン（あく/はがね）にバツグンのはずが、メタグロス自身のタイプ基準の
+        ヒントしか無くLLMが「いまひとつ」と誤答した実例の再発防止。
+        実際に使われた技（move_log）のタイプを優先して先頭に出す。"""
+        self._add("player", "メタグロス", ["はがね", "エスパー"])
+        self._add("opponent", "ドドゲザン", ["あく", "はがね"])
+        self.runner._move_log = ["T3:メタグロスのじだんだ"]
+        self._move_types["じだんだ"] = "じめん"
+        hint = self.runner._compute_type_hint()
+        assert hint.startswith("（実際に使った）メタグロスのじだんだはドドゲザンにバツグン")
+
+    def test_covering_move_hint_omitted_when_move_type_unknown(self):
+        self._add("player", "メタグロス", ["はがね", "エスパー"])
+        self._add("opponent", "コータス", ["ほのお"])
+        self.runner._move_log = ["T3:メタグロスの謎の技"]
+        # self._move_types に登録しない → get_move_typeがNoneを返す想定
+        hint = self.runner._compute_type_hint()
+        assert "実際に使った" not in hint
+
+    def test_covering_move_hint_omitted_when_no_move_log(self):
+        self._add("player", "メタグロス", ["はがね", "エスパー"])
+        self._add("opponent", "イワーク", ["いわ"])
+        hint = self.runner._compute_type_hint()
+        assert "実際に使った" not in hint
+        assert "メタグロスの技はイワークにバツグン" in hint
+
+    def test_covering_move_hint_neutral_falls_back_to_own_type_lines(self):
+        """実際の技が等倍だった場合は（情報量が無いので）own-type由来の相性行を使う。"""
+        self._add("player", "メタグロス", ["はがね", "エスパー"])
+        self._add("opponent", "イワーク", ["いわ"])
+        self.runner._move_log = ["T3:メタグロスの10まんボルト"]
+        self._move_types["10まんボルト"] = "でんき"  # イワークに等倍（でんきはいわに特に効果なし）
+        hint = self.runner._compute_type_hint()
+        assert "実際に使った" not in hint
+        assert "メタグロスの技はイワークにバツグン" in hint
+
+
+class TestUpdateMegaEvolution:
+    """_update_mega_evolution: 「〜のメガシンカ」検出でmega_evolvedフラグを立てる
+    （改善ロードマップ「戦況推論強化」続き・2026-08-04）。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._battle_tracker._player.append(FieldPokemon(name="リザードン", on_field=True))
+        self.runner._battle_tracker._opponent.append(FieldPokemon(name="ミュウツー", on_field=True))
+
+    def _ocr(self, *texts):
+        return [{"text": t, "confidence": 0.9} for t in texts]
+
+    def test_mega_evolution_flag_set_on_match(self):
+        self.runner._update_mega_evolution(self._ocr("リザードンの", "メガシンカ！"))
+        slot = self.runner._battle_tracker._player[0]
+        assert slot.mega_evolved is True
+
+    def test_opponent_side_also_matched(self):
+        self.runner._update_mega_evolution(self._ocr("ミュウツーの", "メガシンカ！"))
+        slot = self.runner._battle_tracker._opponent[0]
+        assert slot.mega_evolved is True
+
+    def test_no_match_leaves_flag_false(self):
+        self.runner._update_mega_evolution(self._ocr("リザードンのかえんほうしゃ"))
+        assert self.runner._battle_tracker._player[0].mega_evolved is False
+
+    def test_unknown_pokemon_does_not_crash(self):
+        self.runner._update_mega_evolution(self._ocr("謎のポケモンの", "メガシンカ！"))
+        assert self.runner._battle_tracker._player[0].mega_evolved is False
+
+
+class TestEffectivePokemonTypes:
+    """_effective_pokemon_types: メガシンカ後のタイプ上書き（2026-08-04新規）。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.clf = MagicMock()
+        self.clf.get_pokemon_types.side_effect = lambda name: {
+            "リザードン": ["ほのお", "ひこう"], "ピカチュウ": ["でんき"],
+        }.get(name)
+
+    def test_non_mega_uses_normal_types(self):
+        p = FieldPokemon(name="リザードン", on_field=True, mega_evolved=False)
+        assert self.runner._effective_pokemon_types(p, self.clf) == ["ほのお", "ひこう"]
+
+    def test_mega_with_override_uses_mega_types(self):
+        p = FieldPokemon(name="リザードン", on_field=True, mega_evolved=True)
+        assert self.runner._effective_pokemon_types(p, self.clf) == ["ほのお", "ドラゴン"]
+
+    def test_mega_without_override_falls_back_to_normal(self):
+        """メガシンカしてもタイプ変化の登録が無い種（例: ピカチュウは実際はメガ進化不可だが
+        テスト用に仮定）は通常タイプのまま。"""
+        p = FieldPokemon(name="ピカチュウ", on_field=True, mega_evolved=True)
+        assert self.runner._effective_pokemon_types(p, self.clf) == ["でんき"]
+
+
+class TestTypeHintUsesMegaEvolution:
+    """_compute_type_hint: メガシンカ後はタイプ相性計算にも反映される（統合テスト）。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._move_log = []
+        self._types = {"リザードン": ["ほのお", "ひこう"], "オンバーン": ["ひこう", "ドラゴン"]}
+        clf = MagicMock()
+        clf.get_pokemon_types.side_effect = lambda name: self._types.get(name)
+        clf.get_move_type.side_effect = lambda name: None
+        self.runner._classifier = clf
+
+    def test_mega_charizard_x_becomes_weak_to_dragon(self):
+        # メガリザードンX（ほのお/ドラゴン）はオンバーン（ひこう/ドラゴン）のドラゴン技にバツグン
+        self.runner._battle_tracker._player.append(
+            FieldPokemon(name="リザードン", on_field=True, mega_evolved=True))
+        self.runner._battle_tracker._opponent.append(FieldPokemon(name="オンバーン", on_field=True))
+        hint = self.runner._compute_type_hint()
+        assert "オンバーンの技はリザードンにバツグン" in hint
+
+
+class TestRecordSituationSnapshot:
+    """_record_situation_snapshot: データウェアハウスの箱への記録（2026-08-04新規）。
+    記録失敗が実況生成を止めないこと・match_id無しでは記録しないことを確認する。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+
+    def test_no_match_id_skips_recording(self):
+        with patch("src.pipeline.record_situation") as mock_record:
+            self.runner._record_situation_snapshot(None, {"event_type": "move_used"})
+        mock_record.assert_not_called()
+
+    def test_records_with_expected_fields(self):
+        ev = {
+            "event_time": 12.3,
+            "event_type": "move_used",
+            "battle_context": {
+                "turn": 2, "player_pokemon": "場: A", "opponent_pokemon": "場: B",
+                "type_hint": "Aの技はBにバツグン",
+            },
+            "game_state": {"hp_values": "150/200"},
+        }
+        with patch("src.pipeline.record_situation") as mock_record:
+            self.runner._record_situation_snapshot("match1", ev)
+        mock_record.assert_called_once()
+        snapshot = mock_record.call_args[0][0]
+        assert snapshot["match_id"] == "match1"
+        assert snapshot["turn"] == 2
+        assert snapshot["type_hint"] == "Aの技はBにバツグン"
+        assert snapshot["hp_player"] == "150/200"
+
+    def test_missing_battle_context_does_not_crash(self):
+        with patch("src.pipeline.record_situation") as mock_record:
+            self.runner._record_situation_snapshot(
+                "match1", {"event_type": "move_used", "game_state": {}})
+        mock_record.assert_called_once()
+
+    def test_exception_from_record_is_swallowed(self):
+        with patch("src.pipeline.record_situation", side_effect=RuntimeError("boom")):
+            # 例外が外に漏れなければOK
+            self.runner._record_situation_snapshot("match1", {"event_type": "move_used"})
+
 
 class TestRenderContextFaintSide:
     """_render_context: 改善ロードマップ③（表情連動）用の faint_side 伝播。
@@ -1630,6 +2125,7 @@ class TestRenderContextFaintSide:
     def setup_method(self):
         self.runner = Pipeline.__new__(Pipeline)
         self.runner._move_log = []
+        self.runner._move_effectiveness = {}
         self.runner._tentative_opponent_moves = []
         self.runner._render_sink = MagicMock()  # None でなければ良い（ダミー）
 
@@ -1653,6 +2149,16 @@ class TestRenderContextFaintSide:
     def test_battle_result_omitted_when_not_battle_end(self):
         ctx = self.runner._render_context({"turn": 3})
         assert "battle_result" not in ctx
+
+    def test_type_hint_included_when_present(self):
+        """2026-08-04: 戦況推論強化のtype_hintをmanifest.jsonlで実機確認できるように伝播する。"""
+        ctx = self.runner._render_context(
+            {"turn": 3, "type_hint": "メタグロスの技はコータスにいまひとつ"})
+        assert ctx["type_hint"] == "メタグロスの技はコータスにいまひとつ"
+
+    def test_type_hint_omitted_when_absent(self):
+        ctx = self.runner._render_context({"turn": 3})
+        assert "type_hint" not in ctx
 
     def test_returns_none_without_render_sink(self):
         self.runner._render_sink = None
