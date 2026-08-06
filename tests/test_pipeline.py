@@ -1083,12 +1083,21 @@ class TestUpdateBattleConditions:
         assert self.runner._battle_tracker._screens["player"] == ("リフレクター", 3)
 
     def test_trick_room_detected(self):
-        Pipeline._update_battle_conditions(self.runner, self._ocr("空間が", "ゆがんだ！"))
+        # 技名そのものを直接検出する方式（2026-08-07修正）。フレーバー文の推測
+        # キーワードだと実際のゲーム文言と食い違い一度も検出できないバグがあった。
+        Pipeline._update_battle_conditions(self.runner, self._ocr("バンギラスの", "トリックルーム！"))
         assert self.runner._battle_tracker._trick_room_start_turn == 3
 
     def test_tailwind_detected(self):
-        Pipeline._update_battle_conditions(self.runner, self._ocr("追い風が", "ふきはじめた！"))
+        # トリックルームと同様、技名そのものを直接検出する方式に統一（2026-08-07）。
+        # おいかぜは現状特性発動がないため技名検出のみで足りる（ユーザー判断）。
+        Pipeline._update_battle_conditions(self.runner, self._ocr("エルフーンの", "おいかぜ！"))
         assert self.runner._battle_tracker._tailwind_start_turn["player"] == 3
+
+    def test_tailwind_detected_opponent_side(self):
+        Pipeline._update_battle_conditions(
+            self.runner, self._ocr("あいての", "エルフーンの", "おいかぜ！"))
+        assert self.runner._battle_tracker._tailwind_start_turn["opponent"] == 3
 
     def test_no_match_leaves_state_untouched(self):
         Pipeline._update_battle_conditions(self.runner, self._ocr("メタグロスのアイアンヘッド"))
@@ -2087,6 +2096,10 @@ class TestRecordSituationSnapshot:
         mock_record.assert_not_called()
 
     def test_records_with_expected_fields(self):
+        # game_state の hp_player_by_slot/hp_opponent_by_slot は実際には list[str]
+        # （例: ["87%", "45%"]）。2026-08-06実機検証で、旧実装が生の hp_values
+        # （list・自他混在）をそのまま渡していたため sqlite3 が
+        # 「type 'list' is not supported」で全件記録失敗していたことが発覚（修正済み）。
         ev = {
             "event_time": 12.3,
             "event_type": "move_used",
@@ -2094,7 +2107,10 @@ class TestRecordSituationSnapshot:
                 "turn": 2, "player_pokemon": "場: A", "opponent_pokemon": "場: B",
                 "type_hint": "Aの技はBにバツグン",
             },
-            "game_state": {"hp_values": "150/200"},
+            "game_state": {
+                "hp_player_by_slot": ["150/200"],
+                "hp_opponent_by_slot": ["80/120", "60/90"],
+            },
         }
         with patch("src.pipeline.record_situation") as mock_record:
             self.runner._record_situation_snapshot("match1", ev)
@@ -2104,6 +2120,19 @@ class TestRecordSituationSnapshot:
         assert snapshot["turn"] == 2
         assert snapshot["type_hint"] == "Aの技はBにバツグン"
         assert snapshot["hp_player"] == "150/200"
+        assert snapshot["hp_opponent"] == "80/120 / 60/90"
+
+    def test_records_none_hp_when_slots_empty(self):
+        ev = {
+            "event_type": "move_used",
+            "battle_context": {"turn": 1},
+            "game_state": {},
+        }
+        with patch("src.pipeline.record_situation") as mock_record:
+            self.runner._record_situation_snapshot("match1", ev)
+        snapshot = mock_record.call_args[0][0]
+        assert snapshot["hp_player"] is None
+        assert snapshot["hp_opponent"] is None
 
     def test_missing_battle_context_does_not_crash(self):
         with patch("src.pipeline.record_situation") as mock_record:

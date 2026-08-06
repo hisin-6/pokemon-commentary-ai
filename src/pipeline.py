@@ -161,8 +161,13 @@ _WEATHER_KEYWORDS: dict[tuple[str, ...], str] = {
 }
 _SCREEN_KEYWORDS = {"リフレクター": "リフレクター", "ひかりのかべ": "ひかりのかべ",
                     "オーロラベール": "オーロラベール"}
-_TRICK_ROOM_KEYWORDS = ("空間が", "ゆがんだ")
-_TAILWIND_KEYWORDS = ("追い風が", "ふき")
+# トリックルーム/おいかぜは演出フレーバー文の推測キーワードだと実際のゲーム文言と
+# 食い違い一度も検出できないバグがあった（2026-08-06発見）。壁（_SCREEN_KEYWORDS）と
+# 同じ「技名そのもの」を直接マッチする方式に統一（2026-08-07・ユーザー判断）。
+# おいかぜは現状特性発動がないため技名検出のみで足りる（天候はひでり等アビリティ
+# 発動もあるため_WEATHER_KEYWORDSは対象外・据え置き）。
+_TRICK_ROOM_KEYWORD = "トリックルーム"
+_TAILWIND_KEYWORD = "おいかぜ"
 
 # 素早さのランクを下げる技 → 段階数（マイナス）。全て相手対象の技のみ収録
 # （2026-08-04ユーザー提供リストより。まひ状態にする技/でんじは等はFieldPokemon.status
@@ -3720,6 +3725,12 @@ class Pipeline:
         if not match_id:
             return
         battle_context = ev.get("battle_context") or {}
+        game_state = ev.get("game_state") or {}
+        # hp_player_by_slot/hp_opponent_by_slot は自分/相手で分離済みの list[str]（例: ["87%", "45%"]）。
+        # sqlite3 は list を直接バインドできない（TypeError: type 'list' is not supported）ため
+        # 文字列へ結合してから渡す（実機検証2026-08-06で発覚したバグの修正）。
+        hp_player_list = game_state.get("hp_player_by_slot") or []
+        hp_opponent_list = game_state.get("hp_opponent_by_slot") or []
         try:
             record_situation({
                 "match_id": match_id,
@@ -3735,8 +3746,8 @@ class Pipeline:
                 "tailwind_player": (battle_context.get("tailwind") or {}).get("player"),
                 "tailwind_opponent": (battle_context.get("tailwind") or {}).get("opponent"),
                 "type_hint": battle_context.get("type_hint"),
-                "hp_player": ev.get("game_state", {}).get("hp_values"),
-                "hp_opponent": None,
+                "hp_player": " / ".join(hp_player_list) if hp_player_list else None,
+                "hp_opponent": " / ".join(hp_opponent_list) if hp_opponent_list else None,
             }, db_path=self._situation_db_path)
         except Exception as e:
             log.warning(f"戦況ウェアハウス記録エラー: {e}")
@@ -4182,10 +4193,10 @@ class Pipeline:
                 side = self._condition_message_side(ocr_results)
                 tracker._screens[side] = (screen, turn)
 
-        if all(kw in joined for kw in _TRICK_ROOM_KEYWORDS):
+        if _TRICK_ROOM_KEYWORD in joined:
             tracker._trick_room_start_turn = turn
 
-        if all(kw in joined for kw in _TAILWIND_KEYWORDS):
+        if _TAILWIND_KEYWORD in joined:
             side = self._condition_message_side(ocr_results)
             tracker._tailwind_start_turn[side] = turn
 
