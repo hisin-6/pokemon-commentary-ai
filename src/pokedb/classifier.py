@@ -317,6 +317,19 @@ class PokeClassifier:
         ).fetchone()
         return row["type"] if row else None
 
+    def get_move_category(self, move_name_ja: str) -> str | None:
+        """技名（日本語）から分類（物理/特殊/変化）を取得する。見つからない場合はNone。
+
+        `_latest_move_type_hint`（pipeline.py）が「変化」技（リフレクター等の
+        ダメージを与えない技）にもタイプ相性（バツグン/いまひとつ等）を計算して
+        しまい、Bedrockが「4分の1」等の意味不明な文言を誤解釈してハルシネーション
+        を起こすバグの修正用（2026-08-07・renders/07-03-23-34-29_condition_check_fix
+        の実機検証で発覚）。"""
+        row = self._conn.execute(
+            "SELECT category FROM moves WHERE name_ja = ?", (move_name_ja,)
+        ).fetchone()
+        return row["category"] if row else None
+
     def _get_moves_for_pokemon(self, pokemon_id: int) -> list[str]:
         """pokemon_moves テーブルから代表技リストを取得する。"""
         rows = self._conn.execute(

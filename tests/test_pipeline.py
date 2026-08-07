@@ -1024,14 +1024,16 @@ class TestToContextConditions:
         assert "weather" not in ctx
 
     def test_screens_included_while_active(self):
+        # 残りターン数もctx["screens"]に持たせる（2026-08-07修正・以前は名前だけで
+        # 「あと○ターン」が実況に出せなかった実装漏れがあった）。
         self.tracker._screens = {"player": ("リフレクター", 2)}
         ctx = self.tracker.to_context()
-        assert ctx["screens"] == {"player": "リフレクター"}
+        assert ctx["screens"] == {"player": ("リフレクター", 5)}
 
     def test_expired_screen_excluded(self):
         self.tracker._screens = {"player": ("リフレクター", 2), "opponent": ("ひかりのかべ", -20)}
         ctx = self.tracker.to_context()
-        assert ctx["screens"] == {"player": "リフレクター"}
+        assert ctx["screens"] == {"player": ("リフレクター", 5)}
 
     def test_trick_room_included_while_active(self):
         self.tracker._trick_room_start_turn = 2
@@ -1173,10 +1175,12 @@ class TestComputeConditionHint:
         assert hint == "あまごいが4ターン継続中"
 
     def test_screens_lines_per_side(self):
+        # screensの値は(名前, 残りターン)のtuple（2026-08-07〜。残りターン数が
+        # 表示されない実装漏れを修正・renders/07-03-23-34-29_condition_checkで確認）。
         hint = self.runner._compute_condition_hint(
-            {"screens": {"player": "リフレクター", "opponent": "ひかりのかべ"}})
-        assert "自分側にリフレクターが張られている" in hint
-        assert "相手側にひかりのかべが張られている" in hint
+            {"screens": {"player": ("リフレクター", 3), "opponent": ("ひかりのかべ", 2)}})
+        assert "自分側にリフレクターが張られている（あと3ターン）" in hint
+        assert "相手側にひかりのかべが張られている（あと2ターン）" in hint
 
     def test_trick_room_line(self):
         hint = self.runner._compute_condition_hint({"trick_room_turns_left": 3})
@@ -1908,9 +1912,13 @@ class TestComputeTypeHint:
         self.runner._move_log = []
         self._types = {}
         self._move_types = {}
+        self._move_categories = {}
         clf = MagicMock()
         clf.get_pokemon_types.side_effect = lambda name: self._types.get(name)
         clf.get_move_type.side_effect = lambda name: self._move_types.get(name)
+        # 既定は物理/特殊扱い（変化技でないもの）。変化技を明示的にテストする箇所だけ
+        # self._move_categories["技名"] = "変化" を設定する。
+        clf.get_move_category.side_effect = lambda name: self._move_categories.get(name, "物理")
         self.runner._classifier = clf
 
     def _add(self, side, name, types, on_field=True):
@@ -1986,6 +1994,21 @@ class TestComputeTypeHint:
         hint = self.runner._compute_type_hint()
         assert "実際に使った" not in hint
 
+    def test_status_move_omitted_from_type_hint(self):
+        """2026-08-07発見: 変化技（リフレクター等）はダメージを与えないため
+        タイプ相性という概念自体が無意味なのに、判定なしで計算すると「フシギバナの
+        リフレクターはメタグロスに4分の1」のような意味不明な文言をBedrockに渡して
+        しまい、壁が弱まった/消えたと誤解釈するハルシネーションを誘発していた
+        （renders/07-03-23-34-29_condition_check_fixの実機検証で確認）。
+        変化技は_latest_move_type_hintから除外することを確認する。"""
+        self._add("player", "メタグロス", ["はがね", "エスパー"])
+        self._add("opponent", "フシギバナ", ["くさ", "どく"])
+        self.runner._move_log = ["T2:フシギバナのリフレクター"]
+        self._move_types["リフレクター"] = "エスパー"
+        self._move_categories["リフレクター"] = "変化"
+        hint = self.runner._compute_type_hint()
+        assert hint is None or "実際に使った" not in hint
+
     def test_covering_move_hint_omitted_when_no_move_log(self):
         self._add("player", "メタグロス", ["はがね", "エスパー"])
         self._add("opponent", "イワーク", ["いわ"])
@@ -2005,8 +2028,12 @@ class TestComputeTypeHint:
 
 
 class TestUpdateMegaEvolution:
-    """_update_mega_evolution: 「〜のメガシンカ」検出でmega_evolvedフラグを立てる
-    （改善ロードマップ「戦況推論強化」続き・2026-08-04）。"""
+    """_update_mega_evolution: 「〜はメガ〜にメガシンカした!」検出でmega_evolvedフラグを
+    立てる（改善ロードマップ「戦況推論強化」続き・2026-08-04）。
+
+    ⚠️旧パターン「(ポケモン)の メガシンカ」は推測に留まり実機OCRの実文言と食い違って
+    一度も発火していなかったバグを2026-08-07に修正（renders/18-12-45_condition_checkの
+    実機ログで確認した実文言に合わせ「は」〜「に」構造へ変更）。"""
 
     def setup_method(self):
         self.runner = Pipeline.__new__(Pipeline)
@@ -2018,12 +2045,14 @@ class TestUpdateMegaEvolution:
         return [{"text": t, "confidence": 0.9} for t in texts]
 
     def test_mega_evolution_flag_set_on_match(self):
-        self.runner._update_mega_evolution(self._ocr("リザードンの", "メガシンカ！"))
+        self.runner._update_mega_evolution(
+            self._ocr("リザードンは", "メガリザードンに", "メガシンカした！"))
         slot = self.runner._battle_tracker._player[0]
         assert slot.mega_evolved is True
 
     def test_opponent_side_also_matched(self):
-        self.runner._update_mega_evolution(self._ocr("ミュウツーの", "メガシンカ！"))
+        self.runner._update_mega_evolution(
+            self._ocr("ミュウツーは", "メガミュウツーに", "メガシンカした！"))
         slot = self.runner._battle_tracker._opponent[0]
         assert slot.mega_evolved is True
 
@@ -2032,7 +2061,8 @@ class TestUpdateMegaEvolution:
         assert self.runner._battle_tracker._player[0].mega_evolved is False
 
     def test_unknown_pokemon_does_not_crash(self):
-        self.runner._update_mega_evolution(self._ocr("謎のポケモンの", "メガシンカ！"))
+        self.runner._update_mega_evolution(
+            self._ocr("謎のポケモンは", "メガ謎のポケモンに", "メガシンカした！"))
         assert self.runner._battle_tracker._player[0].mega_evolved is False
 
 
@@ -2133,6 +2163,24 @@ class TestRecordSituationSnapshot:
         snapshot = mock_record.call_args[0][0]
         assert snapshot["hp_player"] is None
         assert snapshot["hp_opponent"] is None
+
+    def test_screens_tuple_extracted_to_name_only(self):
+        # battle_context["screens"]の値は(名前, 残りターン)のtuple（2026-08-07〜）。
+        # hp_playerと同種のバグ（TEXT列にtuple/listを直接バインドしてsqlite3エラー）を
+        # 防ぐため、名前だけ取り出して渡すことを確認する。
+        ev = {
+            "event_type": "move_used",
+            "battle_context": {
+                "turn": 3,
+                "screens": {"player": ("リフレクター", 4), "opponent": ("ひかりのかべ", 2)},
+            },
+            "game_state": {},
+        }
+        with patch("src.pipeline.record_situation") as mock_record:
+            self.runner._record_situation_snapshot("match1", ev)
+        snapshot = mock_record.call_args[0][0]
+        assert snapshot["screens_player"] == "リフレクター"
+        assert snapshot["screens_opponent"] == "ひかりのかべ"
 
     def test_missing_battle_context_does_not_crash(self):
         with patch("src.pipeline.record_situation") as mock_record:

@@ -181,6 +181,17 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context(), [], self._battle_state())
         assert "場のコンディション" not in prompt
 
+    def test_condition_hint_overrides_transient_ocr_text(self):
+        """2026-08-07: renders/07-03-23-34-29_condition_checkの実機検証で、
+        condition_hintが「壁が張られている」と言ってるのにBedrockが「壁が消えた」と
+        矛盾する実況をする不具合を発見。生OCRの一時的な演出テキストより
+        condition_hintを優先する指示を追加したことを確認する。"""
+        prompt = _build_vision_prompt(
+            self._context(), [],
+            self._battle_state(condition_hint="相手側にリフレクターが張られている（あと3ターン）"))
+        assert "画面テキストに「壁が消えた」等の記述や過去の発動演出が見えても" in prompt
+        assert "それより必ずこちらを優先すること" in prompt
+
     def test_persona_self_name_and_perspective(self):
         """自称くれぴ（花圓の誤読対策）と自分側視点の固定（2026-07-30視聴fb#1・#3）。"""
         prompt = _build_vision_prompt(self._context(), [], self._battle_state())

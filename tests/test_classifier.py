@@ -448,7 +448,8 @@ class TestGetMoveType:
               (1, 'ピカチュウ', 'Pikachu', 'でんき', NULL, 'せいでんき', 'ひらいしん', 'かえんほう');
             INSERT INTO moves VALUES
               (1, 'かみなり', 'Thunder', 'でんき', '特殊', 110),
-              (2, 'アイアンヘッド', 'Iron Head', 'はがね', '物理', 80);
+              (2, 'アイアンヘッド', 'Iron Head', 'はがね', '物理', 80),
+              (3, 'リフレクター', 'Reflect', 'エスパー', '変化', NULL);
         """)
         conn.commit()
         conn.close()
@@ -460,6 +461,17 @@ class TestGetMoveType:
 
     def test_unknown_move_returns_none(self, clf_with_move_types):
         assert clf_with_move_types.get_move_type("存在しない技12345") is None
+
+    def test_get_move_category_known_moves(self, clf_with_move_types):
+        """get_move_category: 2026-08-07新設。_latest_move_type_hint（pipeline.py）が
+        変化技（ダメージを与えない技）にもタイプ相性を計算してしまい、Bedrockが
+        意味不明な文言をハルシネーションする原因になっていたバグの修正用。"""
+        assert clf_with_move_types.get_move_category("かみなり") == "特殊"
+        assert clf_with_move_types.get_move_category("アイアンヘッド") == "物理"
+        assert clf_with_move_types.get_move_category("リフレクター") == "変化"
+
+    def test_get_move_category_unknown_move_returns_none(self, clf_with_move_types):
+        assert clf_with_move_types.get_move_category("存在しない技12345") is None
 
 
 class TestIsMoveLearnable:

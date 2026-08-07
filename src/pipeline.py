@@ -2353,9 +2353,12 @@ class BattleStateTracker:
         opponent_names = [p.name for p in sorted(self._opponent, key=lambda p: -p.confidence)]
 
         weather_left = self._turns_left(self._weather_start_turn, self._WEATHER_DURATION)
+        # 残りターン数はフィルタ判定にしか使わず辞書に残していなかった実装漏れを修正
+        # （2026-08-07・トリックルーム/おいかぜ/天候と違って壁だけ「あと○ターン」が
+        # 表示されないバグ。renders/07-03-23-34-29_condition_checkの実機ログで確認）。
         screens = {
-            side: name for side, (name, start) in self._screens.items()
-            if self._turns_left(start, self._SCREEN_DURATION) > 0
+            side: (name, left) for side, (name, start) in self._screens.items()
+            if (left := self._turns_left(start, self._SCREEN_DURATION)) > 0
         }
         trick_room_left = self._turns_left(self._trick_room_start_turn, self._TRICK_ROOM_DURATION)
         tailwind = {
@@ -3731,6 +3734,11 @@ class Pipeline:
         # 文字列へ結合してから渡す（実機検証2026-08-06で発覚したバグの修正）。
         hp_player_list = game_state.get("hp_player_by_slot") or []
         hp_opponent_list = game_state.get("hp_opponent_by_slot") or []
+        # screens は (名前, 残りターン) のtuple（2026-08-07〜）。TEXT列にはtuple型を
+        # 直接バインドできない（hp_player修正と同種のsqlite3エラーになる）ため名前だけ取り出す。
+        screens_ctx = battle_context.get("screens") or {}
+        screens_player = screens_ctx.get("player")
+        screens_opponent = screens_ctx.get("opponent")
         try:
             record_situation({
                 "match_id": match_id,
@@ -3740,8 +3748,8 @@ class Pipeline:
                 "player_pokemon": battle_context.get("player_pokemon"),
                 "opponent_pokemon": battle_context.get("opponent_pokemon"),
                 "weather": battle_context.get("weather"),
-                "screens_player": (battle_context.get("screens") or {}).get("player"),
-                "screens_opponent": (battle_context.get("screens") or {}).get("opponent"),
+                "screens_player": screens_player[0] if screens_player else None,
+                "screens_opponent": screens_opponent[0] if screens_opponent else None,
                 "trick_room": battle_context.get("trick_room_turns_left"),
                 "tailwind_player": (battle_context.get("tailwind") or {}).get("player"),
                 "tailwind_opponent": (battle_context.get("tailwind") or {}).get("opponent"),
@@ -3769,7 +3777,11 @@ class Pipeline:
     # T{turn}:{ポケモン名}の{技名} 形式（self._move_log の生の格納形式・表示用タグは含まない）
     _MOVE_LOG_ENTRY_RE = re.compile(r"^T\d+:(.+?)の(.+)$")
     # 「(ポケモン名)の メガシンカ！」形式（改善ロードマップ「戦況推論強化」続き・2026-08-04）
-    _MEGA_EVOLUTION_RE = re.compile(r"(.{2,12})の\s*メガシンカ")
+    # 旧パターン「(ポケモン)の メガシンカ」は推測に留まり、実機OCRの実文言
+    # 「(ポケモン)はメガ(ポケモン)にメガシンカした!」（「の」ではなく「は」〜「に」）
+    # と食い違って一度も発火していなかった（2026-08-07・トリックルーム/おいかぜと
+    # 同種のバグ。renders/18-12-45_condition_checkの実機ログで確認）。
+    _MEGA_EVOLUTION_RE = re.compile(r"(.{2,12})は.{0,12}メガシンカ")
 
     @staticmethod
     def _effective_pokemon_types(pokemon, classifier) -> list[str] | None:
@@ -3811,6 +3823,13 @@ class Pipeline:
         if not m:
             return None
         pokemon_name, move_name = m.group(1), m.group(2)
+        # 変化技（リフレクター/おいかぜ/トリックルーム/まもる等）はダメージを与えない
+        # ためタイプ相性という概念自体が無意味。判定なしで計算すると「フシギバナの
+        # リフレクターはメタグロスに4分の1」のような意味不明な文言をBedrockに渡して
+        # しまい、壁が弱まった/消えたと誤解釈するハルシネーションを誘発していた
+        # （2026-08-07発見・renders/07-03-23-34-29_condition_check_fixの実機検証）。
+        if classifier.get_move_category(move_name) == "変化":
+            return None
         move_type = classifier.get_move_type(move_name)
         if not move_type:
             return None
@@ -4253,9 +4272,9 @@ class Pipeline:
                 f"{battle_context['weather']}が{battle_context.get('weather_turns_left', '?')}"
                 "ターン継続中")
 
-        for side, name in (battle_context.get("screens") or {}).items():
+        for side, (name, left) in (battle_context.get("screens") or {}).items():
             side_label = "自分" if side == "player" else "相手"
-            lines.append(f"{side_label}側に{name}が張られている")
+            lines.append(f"{side_label}側に{name}が張られている（あと{left}ターン）")
 
         if battle_context.get("trick_room_turns_left"):
             lines.append(
