@@ -1070,10 +1070,25 @@ class TestUpdateBattleConditions:
     def _ocr(self, *texts):
         return [{"text": t, "confidence": 0.9} for t in texts]
 
-    def test_weather_detected(self):
-        Pipeline._update_battle_conditions(self.runner, self._ocr("あめが", "ふりはじめた！"))
+    def test_weather_detected_by_move_name(self):
+        # 2026-08-07修正: 演出フレーバー文の推測ではなく技名/特性名そのものを直接
+        # マッチする方式に変更（renders/2026-07-03-23-26-22の実機ログで、旧キーワード
+        # 「ひざしが」「つよく」が実際の文言「ひざ日差しがつよ強くなった」に一致しない
+        # バグを確認）。
+        Pipeline._update_battle_conditions(self.runner, self._ocr("アシレーヌの", "あまごい！"))
         assert self.runner._battle_tracker._weather == "あまごい"
         assert self.runner._battle_tracker._weather_start_turn == 3
+
+    def test_weather_detected_by_ability_name(self):
+        # 技だけでなく特性発動（例: ペリッパーのあめふらし）でも同じキーワードで拾える
+        # ことを確認する（天候は技/特性どちらでも発動メッセージが共通のため）。
+        Pipeline._update_battle_conditions(self.runner, self._ocr("ペリッパーの", "あめふらし"))
+        assert self.runner._battle_tracker._weather == "あまごい"
+        assert self.runner._battle_tracker._weather_start_turn == 3
+
+    def test_sunny_day_detected_by_move_or_ability(self):
+        Pipeline._update_battle_conditions(self.runner, self._ocr("コータスの", "ひでり"))
+        assert self.runner._battle_tracker._weather == "にほんばれ"
 
     def test_screen_detected_with_side(self):
         Pipeline._update_battle_conditions(
