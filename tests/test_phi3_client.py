@@ -79,6 +79,54 @@ class TestBuildPrompt:
         prompt = client._build_prompt({"event_type": "move_used"}, None, None)
         assert "直前の実況（繰り返さないこと）: さっきの実況文" in prompt
 
+    def test_move_single_hint_embeds_move_focus(self, client):
+        """技ごとの実況（move_single）: move_focus に積んだ「陣営の＋ポケモン＋の＋技」を
+        プロンプトに埋め込み、この技1つだけに焦点を絞らせる。
+
+        2026-08-08発見: server.py（Bedrock）側は元々move_focusを使っていたが、
+        Phi3Client（ローカルLLMフォールバック）側だけ配線が漏れており、move_singleの
+        実況が直近の技ログ全体から古い技を拾って話してしまうバグがあった。"""
+        game_state = {"event_type": "move_single", "move_focus": "自分のガブリアスのじしん"}
+        prompt = client._build_prompt(game_state, None, None)
+        assert "自分のガブリアスのじしん" in prompt
+        assert "1つだけに反応する" in prompt
+
+    def test_move_single_hint_handles_missing_move_focus(self, client):
+        """move_focus が無くても例外にならない（指示行を追加しないだけ）。"""
+        prompt = client._build_prompt({"event_type": "move_single"}, None, None)
+        assert "1つだけに反応する" not in prompt
+
+    def test_non_move_single_event_has_no_move_focus_hint(self, client):
+        """move_single以外のイベントではmove_focusが渡っていても指示行を追加しない。"""
+        game_state = {"event_type": "move_used", "move_focus": "自分のガブリアスのじしん"}
+        prompt = client._build_prompt(game_state, None, None)
+        assert "1つだけに反応する" not in prompt
+
+    def test_type_hint_included_when_present(self, client):
+        """2026-08-08: server.py（Bedrock）側には既にあったタイプ相性ヒントの配線が
+        Phi3Client側だけ漏れていたバグの修正確認。"""
+        battle_context = {"type_hint": "メタグロスの技はコータスにバツグン"}
+        prompt = client._build_prompt({"event_type": "move_used"}, None, battle_context)
+        assert "メタグロスの技はコータスにバツグン" in prompt
+        assert "信頼して有利不利の実況に使ってよい" in prompt
+
+    def test_type_hint_omitted_when_absent(self, client):
+        prompt = client._build_prompt({"event_type": "move_used"}, None, {"turn": 1})
+        assert "タイプ相性ヒント" not in prompt
+
+    def test_condition_hint_included_when_present(self, client):
+        """2026-08-08: 天候「にほんばれ」下でウェザーボールが炎技になることを
+        ローカルLLMが知らず「水技」と誤って実況したバグ（renders/2026-06-07_12-48-22の
+        実機検証で発見）の根本原因＝condition_hintの配線漏れの修正確認。"""
+        battle_context = {"condition_hint": "にほんばれが5ターン継続中"}
+        prompt = client._build_prompt({"event_type": "move_single"}, None, battle_context)
+        assert "にほんばれが5ターン継続中" in prompt
+        assert "信頼して有利不利の実況に使ってよい" in prompt
+
+    def test_condition_hint_omitted_when_absent(self, client):
+        prompt = client._build_prompt({"event_type": "move_used"}, None, {"turn": 1})
+        assert "場のコンディション" not in prompt
+
 
 class TestGenerateCommentary:
     def test_success_returns_stripped_text_and_updates_history(self, client):

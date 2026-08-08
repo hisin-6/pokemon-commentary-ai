@@ -50,6 +50,7 @@ from src.capture.yolo_detector import BattleState, YoloDetector
 from src.analytics.situation_warehouse import (
     DEFAULT_DB_PATH as _SITUATION_DEFAULT_DB_PATH,
     backfill_outcome,
+    clear_match,
     record_situation,
 )
 from src.commentary.phi3_client import Phi3Client
@@ -166,6 +167,14 @@ _WEATHER_KEYWORDS = {
 }
 _SCREEN_KEYWORDS = {"リフレクター": "リフレクター", "ひかりのかべ": "ひかりのかべ",
                     "オーロラベール": "オーロラベール"}
+# ウェザーボールは天候下で技タイプが変わる（無天候時はノーマル・DB値のまま）。
+# 2026-08-08発見: 天候「にほんばれ」中にペリッパーのウェザーボールが実際は炎技になる
+# ことをLLMが自力で結びつけられず「水技」と誤って実況していた（renders/2026-06-07_12-48-22
+# 実機検証）。タイプ相性ヒントと同じCicero型アーキテクチャ（Python側で確定計算）に倣い、
+# ここで確定させてから_latest_move_type_hintに渡す。
+_WEATHER_BALL_TYPE_BY_WEATHER = {
+    "にほんばれ": "ほのお", "あまごい": "みず", "すなあらし": "いわ", "ゆき": "こおり",
+}
 # トリックルーム/おいかぜは演出フレーバー文の推測キーワードだと実際のゲーム文言と
 # 食い違い一度も検出できないバグがあった（2026-08-06発見）。壁（_SCREEN_KEYWORDS）と
 # 同じ「技名そのもの」を直接マッチする方式に統一（2026-08-07・ユーザー判断）。
@@ -2862,6 +2871,17 @@ class Pipeline:
         self._FAINT_PENDING_TIMEOUT: float = 75.0  # この秒数内にmove_usedが来なければ単独送信
         self._skip_next_turn_start: bool = False  # faint統合でgame_turnを繰り上げた後、直後のturn_startをスキップするフラグ
 
+        # battle_start保留送信: ダブルスで味方2匹目のOCR登録がbattle_start発火に間に
+        # 合わない場合（実機2026-06-03 22-57-11で確認: 2匹目が2秒遅れて登録され、
+        # battle_start実況のcontextに1匹しか載らなかった）、実況生成を次のイベントまで
+        # 保留し、その時点の戦況（battle_context）を使って生成する。event_timeは
+        # battle_start検知時点のまま保持し、動画内の音声配置がずれないようにする。
+        self._pending_battle_start_time: float | None = None
+        self._pending_battle_start_frame: "np.ndarray | None" = None
+        self._pending_battle_start_game_state: dict | None = None
+        self._pending_battle_start_move_log: list[str] | None = None
+        self._pending_battle_start_attempt_bedrock: bool = False
+
         # PokeDB 分類器（DB がなければ None でフォールバック動作）
         log.info("PokeClassifier 初期化中（game_mode=%s）...", game_mode)
         try:
@@ -3295,6 +3315,11 @@ class Pipeline:
             log.info(f"終了します（総ターン数: {turn}）")
         finally:
             cap.release()
+            # 保留中のbattle_startがあれば安全弁として最終戦況で確定させる
+            # （通常は次のイベントで即座に確定するが、battle_start直後に動画が
+            # 終わるような極端なケースでも実況を取りこぼさないための保険）。
+            if self._pending_battle_start_time is not None:
+                self._flush_pending_battle_start(self._battle_tracker.to_context())
             # 動画モードの後付け実況生成（ADR-009追記）: スキャン完了後にまとめて
             # 実況文を生成する。画像は使わず、スキャン中に蓄積した構造化データのみを根拠にする。
             if self._posthoc_mode and self._pending_render_events:
@@ -3449,6 +3474,13 @@ class Pipeline:
             battle_context["condition_hint"] = condition_hint
         if event_type == "faint":
             battle_context["faint_side"] = faint_side
+
+        # 保留中のbattle_startがあれば、今のイベントより先に（＝時刻順を保って）
+        # 現在の戦況で実況を確定させる。次のイベントまで待てば大抵は味方2匹目の
+        # 登録が間に合っているため、ここでのbattle_contextを使う。
+        if event_type != "battle_start" and self._pending_battle_start_time is not None:
+            self._flush_pending_battle_start(battle_context)
+
         # レンダーモード: イベント処理後の戦況をパネル用に記録（v2b）
         self._record_panel_state()
         log.info(
@@ -3535,8 +3567,17 @@ class Pipeline:
         # ── 実況文の生成・再生（ライブ）／後付け生成用バッファへの追加（動画モード）──
         # event_time はこのハンドラが処理中のフレームの動画内時刻（同期実行なので
         # _now() はイベント検知時点と同値）
-        self._dispatch_commentary(event_type, frame, game_state, battle_context,
-                                   self._move_log_display(5), attempt_bedrock)
+        if event_type == "battle_start" and self._battle_start_roster_incomplete():
+            log.info("[戦況] battle_start: 場のポケモン数が左右で不揃い → "
+                     "実況を保留し次のイベントまで登録を待つ")
+            self._pending_battle_start_time = self._now()
+            self._pending_battle_start_frame = frame
+            self._pending_battle_start_game_state = game_state
+            self._pending_battle_start_move_log = self._move_log_display(5)
+            self._pending_battle_start_attempt_bedrock = attempt_bedrock
+        else:
+            self._dispatch_commentary(event_type, frame, game_state, battle_context,
+                                       self._move_log_display(5), attempt_bedrock)
 
         # バトル終了後にアクティブフラグをリセット（Bedrock呼び出し後）
         if event_type == "battle_end":
@@ -3628,6 +3669,39 @@ class Pipeline:
         self._speak_async(commentary, event_type=event_type, event_time=event_time,
                           context=self._render_context(battle_context))
 
+    def _battle_start_roster_incomplete(self) -> bool:
+        """ダブルスで片側だけ1匹しか場に登録されていない状態かを判定する。
+
+        battle_start発火の瞬間はOCRの都合で味方2匹目（まれに相手2匹目）の名前が
+        まだ登録されていないことがある（実機確認: 2秒遅れ）。相手/自分どちらかが
+        既に2匹確認できているのにもう片方が1匹以下なら「登録待ち」とみなす。
+        シングルバトルでは両側とも1匹で揃うため誤検出しない。
+        """
+        panel = self._battle_tracker.to_panel_state()
+        p, o = len(panel["player"]), len(panel["opponent"])
+        return max(p, o) >= 2 and min(p, o) < 2
+
+    def _flush_pending_battle_start(self, battle_context: dict) -> None:
+        """保留中のbattle_start実況を、引数の（＝現時点の）戦況で確定させる。
+
+        event_timeはbattle_start検知時点のまま使う（音声の配置がずれないように）。
+        """
+        if self._pending_battle_start_time is None:
+            return
+        frame        = self._pending_battle_start_frame
+        game_state   = self._pending_battle_start_game_state
+        move_log     = self._pending_battle_start_move_log
+        pending_time = self._pending_battle_start_time
+        attempt_bedrock = self._pending_battle_start_attempt_bedrock
+        self._pending_battle_start_time = None
+        self._pending_battle_start_frame = None
+        self._pending_battle_start_game_state = None
+        self._pending_battle_start_move_log = None
+        self._pending_battle_start_attempt_bedrock = False
+
+        self._dispatch_commentary("battle_start", frame, game_state, battle_context,
+                                   move_log, attempt_bedrock, event_time=pending_time)
+
     def _flush_pending_faint(self) -> None:
         """タイムアウトした保留faintを単独でBedrock送信して実況する。"""
         if self._pending_faint_state is None:
@@ -3665,6 +3739,18 @@ class Pipeline:
         """
         render_sink = getattr(self, "_render_sink", None)
         match_id = render_sink.out_dir.name if render_sink is not None else None
+
+        # 同じ動画（match_id=render_dir名）の再実行に備え、記録開始前に既存行を
+        # 一度だけクリアする（RenderSinkの「前回素材の自動クリア」と同じ狙い。
+        # record_situationは追記のみのため、これが無いと再実行のたびに新旧の
+        # スナップショットが同じmatch_idの下に混在する）。
+        if match_id:
+            try:
+                cleared = clear_match(match_id, db_path=self._situation_db_path)
+                if cleared:
+                    log.info(f"[戦況ウェアハウス] 再実行によるクリア: match_id={match_id} {cleared}行")
+            except Exception as e:
+                log.warning(f"戦況ウェアハウス クリアエラー: {e}")
 
         history: list[str] = []
         for ev in self._pending_render_events:
@@ -3835,6 +3921,19 @@ class Pipeline:
         if classifier.get_move_category(move_name) == "変化":
             return None
         move_type = classifier.get_move_type(move_name)
+        # ウェザーボール: 天候下ではDBのベース値（ノーマル）ではなく実際に発動する
+        # タイプに上書きする（無天候時はDB値のまま）。効果が「等倍」でタイプ相性の
+        # 行が出ない場合でも、タイプ自体は必ず伝える（weather_type_note）。
+        # LLMは天候情報を渡されても「ウェザーボールは天候でタイプが変わる」という
+        # 知識までは自力で結びつけてくれるとは限らない（実機確認・renders/2026-06-07_12-48-22
+        # で「水のウェザーボール」と誤って実況していた）ため、事実として明示する。
+        weather_type_note: str | None = None
+        if move_name == "ウェザーボール":
+            weather = getattr(self._battle_tracker, "_weather", None)
+            resolved = _WEATHER_BALL_TYPE_BY_WEATHER.get(weather)
+            if resolved:
+                move_type = resolved
+                weather_type_note = f"天候「{weather}」により{move_name}は{resolved}タイプになっている"
         if not move_type:
             return None
         p_names = {p.name for p in on_field_p}
@@ -3844,15 +3943,16 @@ class Pipeline:
         elif pokemon_name in o_names:
             defenders = on_field_p
         else:
-            return None
+            return weather_type_note
         for defender in defenders:
             d_types = self._effective_pokemon_types(defender, classifier)
             if not d_types:
                 continue
             label = describe_matchup(move_type, d_types)
             if label != "等倍":
-                return f"（実際に使った）{pokemon_name}の{move_name}は{defender.name}に{label}"
-        return None
+                matchup = f"（実際に使った）{pokemon_name}の{move_name}は{defender.name}に{label}"
+                return f"{weather_type_note} / {matchup}" if weather_type_note else matchup
+        return weather_type_note
 
     def _compute_type_hint(self) -> str | None:
         """場に出ている自分/相手ポケモンのタイプ相性ヒントを計算する
@@ -4331,6 +4431,15 @@ class Pipeline:
             battle_context["condition_hint"] = condition_hint
         attempt_bedrock = bool(
             self._ec2_url and "move_single" in BEDROCK_EVENTS and self._battle_active)
+
+        # move_single は _process_event を経由しない別経路のため、保留中の
+        # battle_startがあればここでも確定させる必要がある（さもないと次に
+        # _process_event を通るイベント＝多くの場合battle_endまで持ち越され、
+        # 進行しきった戦況でbattle_start実況が生成される事故になる。
+        # 実機2026-06-03 22-57-11で確認）。
+        if getattr(self, "_pending_battle_start_time", None) is not None:
+            self._flush_pending_battle_start(battle_context)
+
         self._dispatch_commentary(
             "move_single", frame, game_state, battle_context,
             self._move_log_display(5), attempt_bedrock, event_time=self._now())

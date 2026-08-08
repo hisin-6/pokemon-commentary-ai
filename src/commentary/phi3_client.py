@@ -139,6 +139,15 @@ class Phi3Client:
         lines.append("")
 
         lines += ["【今回の対戦状況】", f"今回のイベント種別: {game_state.get('event_type', '不明')}"]
+        # move_single: ターン全体ではなく「今まさに使われた技1つ」だけに焦点を絞らせる。
+        # move_focus はpipeline側で組み立てた「陣営の＋ポケモン名＋の＋技名」の文字列
+        # （server.py の Bedrock 用プロンプトと同じ指示。従来ここが抜けており、
+        # 直近の技ログ全体から古い技を今起きたことのように話してしまうバグがあった）
+        if game_state.get("event_type") == "move_single" and game_state.get("move_focus"):
+            lines.append(
+                f"今まさに使われた技「{game_state['move_focus']}」1つだけに反応する"
+                "短い実況をする（ターン全体のまとめや他の技には触れず、この技への即時リアクションに徹すること）"
+            )
         if battle_context:
             lines += [
                 f"ターン数: {battle_context.get('turn', '不明')}",
@@ -148,6 +157,25 @@ class Phi3Client:
             event_log = battle_context.get("event_log")
             if event_log:
                 lines.append(f"直近の出来事: {event_log}")
+
+            # タイプ相性ヒント・場のコンディション（天候・壁・素早さ操作）:
+            # 改善ロードマップ「戦況推論強化」（2026-08-04）でserver.py（Bedrock）側の
+            # プロンプトには追加済みだったが、Phi3Client側は配線が漏れていた
+            # （2026-08-08発見: 天候「にほんばれ」下でウェザーボールが炎技になる
+            # ことをローカルLLMが知らず「水技」と誤って実況していた）。文言は
+            # server.pyの_build_vision_promptと合わせている。
+            type_hint = battle_context.get("type_hint")
+            if type_hint:
+                lines.append(
+                    f"タイプ相性ヒント（Python側で計算済みの確定結果。"
+                    f"信頼して有利不利の実況に使ってよい）: {type_hint}"
+                )
+            condition_hint = battle_context.get("condition_hint")
+            if condition_hint:
+                lines.append(
+                    f"場のコンディション（天候・壁・素早さ操作。Python側で計算済みの確定結果。"
+                    f"信頼して有利不利の実況に使ってよい）: {condition_hint}"
+                )
 
         # Bedrock 分析結果がある場合のみ補足として使う
         if bedrock_analysis and not bedrock_analysis.startswith("（テキスト未検出）"):

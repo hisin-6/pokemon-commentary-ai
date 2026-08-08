@@ -76,6 +76,28 @@ def record_situation(snapshot: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
         conn.close()
 
 
+def clear_match(match_id: str, db_path: Path = DEFAULT_DB_PATH) -> int:
+    """指定match_idの既存行を全て削除する（同じ動画の再実行に備えた事前クリア）。
+
+    record_situationは追記のみのため、同じmatch_id（render_dir名）で
+    パス1を再実行すると新旧のスナップショットが同じmatch_idの下に混在してしまう
+    （RenderSinkが同種の事故を「前回素材の自動クリア」で防いでいるのと同じ問題。
+    2026-08-08発見: バグ修正の検証で同じ動画を3回実行したところ、本来5行のところ
+    20行に膨れ、未修正・一部修正・全修正の3世代が同一match_idの下に混在していた）。
+    呼び出し側（`Pipeline._generate_posthoc_commentary`）が、1試合分の記録を
+    開始する前に一度だけ呼ぶ想定。
+
+    Returns: 削除した行数。
+    """
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute("DELETE FROM situations WHERE match_id = ?", (match_id,))
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
 def backfill_outcome(match_id: str, outcome: str, db_path: Path = DEFAULT_DB_PATH) -> int:
     """指定match_idの全行にoutcome（"勝ち"/"負け"等）を後付けする。
 

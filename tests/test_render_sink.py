@@ -10,6 +10,7 @@ render_sink.py（実況動画レンダリング素材出力・ADR-009 パス1）
 
 import io
 import json
+import sqlite3
 import sys
 import wave
 from pathlib import Path
@@ -283,6 +284,77 @@ class TestDispatchCommentaryPosthocMode:
         assert p._pending_render_events[0]["event_time"] == 10.0  # p._video_now
 
 
+class TestPendingBattleStart:
+    """battle_start保留送信（2026-08-08追加）。
+
+    ダブルスで味方2匹目のOCR登録がbattle_start発火に間に合わない場合
+    （実機2026-06-03 22-57-11で確認: 2秒遅れで登録され、battle_start実況の
+    contextに1匹しか載らなかった）、実況生成を次のイベントまで保留し、
+    その時点のより完全な戦況（battle_context）で確定させる。
+    """
+
+    def _make_pipeline(self, tmp_path):
+        p = _make_posthoc_pipeline(tmp_path)
+        p._render_context = MagicMock(return_value=None)
+        p._battle_tracker = MagicMock()
+        p._pending_battle_start_time = None
+        p._pending_battle_start_frame = None
+        p._pending_battle_start_game_state = None
+        p._pending_battle_start_move_log = None
+        p._pending_battle_start_attempt_bedrock = False
+        return p
+
+    def _panel(self, player_count: int, opponent_count: int) -> dict:
+        return {"player": [{"name": "x"}] * player_count,
+                "opponent": [{"name": "y"}] * opponent_count}
+
+    def test_roster_incomplete_when_sides_asymmetric(self, tmp_path):
+        """片側2匹・もう片側1匹以下＝ダブルスの登録待ちとみなす。"""
+        p = self._make_pipeline(tmp_path)
+        p._battle_tracker.to_panel_state.return_value = self._panel(1, 2)
+        assert p._battle_start_roster_incomplete() is True
+
+    def test_roster_complete_for_singles(self, tmp_path):
+        """シングル（両側1匹）は誤検出しない。"""
+        p = self._make_pipeline(tmp_path)
+        p._battle_tracker.to_panel_state.return_value = self._panel(1, 1)
+        assert p._battle_start_roster_incomplete() is False
+
+    def test_roster_complete_for_full_doubles(self, tmp_path):
+        """両側2匹揃っていれば登録待ちではない。"""
+        p = self._make_pipeline(tmp_path)
+        p._battle_tracker.to_panel_state.return_value = self._panel(2, 2)
+        assert p._battle_start_roster_incomplete() is False
+
+    def test_flush_uses_original_event_time_and_fresh_context(self, tmp_path):
+        """flush時、event_timeはbattle_start検知時点のまま・contextは引数の
+        （＝flush時点の、より完全な）ものを使う。"""
+        p = self._make_pipeline(tmp_path)
+        stale_context = {"player_pokemon": "場: クレッフィ / 控え: なし"}
+        fresh_context = {"player_pokemon": "場: クレッフィ / ブリジュラス / 控え: なし"}
+        p._pending_battle_start_time = 41.0  # battle_start検知時点（保留開始）
+        p._pending_battle_start_frame = None
+        p._pending_battle_start_game_state = {"ocr_text": "", "event_type": "battle_start"}
+        p._pending_battle_start_move_log = []
+        p._pending_battle_start_attempt_bedrock = False
+        p._video_now = 46.5  # flushが呼ばれる「今」（次のイベント時刻）
+
+        p._flush_pending_battle_start(fresh_context)
+
+        assert len(p._pending_render_events) == 1
+        ev = p._pending_render_events[0]
+        assert ev["event_time"] == 41.0  # flush時点(46.5)ではなく検知時点
+        assert ev["battle_context"] == fresh_context
+        assert ev["battle_context"] != stale_context
+        # 保留状態はクリアされる
+        assert p._pending_battle_start_time is None
+
+    def test_flush_is_noop_when_nothing_pending(self, tmp_path):
+        p = self._make_pipeline(tmp_path)
+        p._flush_pending_battle_start({"player_pokemon": "場: クレッフィ / 控え: なし"})
+        assert p._pending_render_events == []
+
+
 class TestDispatchCommentaryLiveMode:
     """posthoc_mode=False（ライブ経路）は従来どおり即座にBedrock/Phi-3→再生する
     （既存の即時実況経路は無変更・リグレッションガード）。"""
@@ -467,3 +539,29 @@ class TestGeneratePosthocCommentary:
         # 音声も差し替え後テキストで合成される（字幕と音声の不一致防止）
         synthesized = p._voicevox.generate_wav.call_args[0][0]
         assert synthesized == entry["commentary"]
+
+    def test_rerun_clears_previous_situation_warehouse_rows(self, tmp_path, monkeypatch):
+        """同じ動画（match_id=render_dir名）を再実行しても、戦況ウェアハウスに
+        新旧のスナップショットが混在しない（2026-08-08発見・record_situationは
+        追記のみのため、これまでは再実行のたびに重複していた。実機で同じ動画を
+        3回実行した際、本来5行のところ20行に膨れ3世代が混在していた）。"""
+        p = self._make_pipeline(tmp_path)
+        match_id = p._render_sink.out_dir.name
+        # 前回実行分の“古い”行をあらかじめ仕込んでおく
+        from src.analytics.situation_warehouse import record_situation
+        record_situation({"match_id": match_id, "turn": "0", "weather": "旧データ"},
+                         db_path=p._situation_db_path)
+
+        p._pending_render_events = [
+            {"event_time": 1.0, "event_type": "battle_start", "game_state": {"ocr_text": ""},
+             "battle_context": {}, "move_log": [], "render_context": None},
+        ]
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", lambda *a, **k: ("実況", "a"))
+
+        p._generate_posthoc_commentary()
+
+        conn = sqlite3.connect(p._situation_db_path)
+        rows = conn.execute(
+            "SELECT weather FROM situations WHERE match_id = ?", (match_id,)).fetchall()
+        conn.close()
+        assert rows == [(None,)]  # 旧データは消え、今回分の1行だけが残る

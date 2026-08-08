@@ -8,6 +8,7 @@ import pytest
 
 from src.analytics.situation_warehouse import (
     backfill_outcome,
+    clear_match,
     count_situations,
     record_situation,
 )
@@ -66,6 +67,41 @@ class TestBackfillOutcome:
     def test_unknown_match_id_updates_nothing(self, db_path):
         record_situation({"match_id": "m1"}, db_path=db_path)
         assert backfill_outcome("does-not-exist", "勝ち", db_path=db_path) == 0
+
+
+class TestClearMatch:
+    """2026-08-08追加: 同じ動画（match_id）の再実行で新旧スナップショットが
+    混在する事故（RenderSinkの「前回素材の自動クリア」と同種の問題）への対策。"""
+
+    def test_removes_only_rows_for_given_match(self, db_path):
+        for i in range(3):
+            record_situation({"match_id": "m1", "turn": str(i)}, db_path=db_path)
+        record_situation({"match_id": "m2", "turn": "0"}, db_path=db_path)
+
+        removed = clear_match("m1", db_path=db_path)
+
+        assert removed == 3
+        assert count_situations(db_path=db_path) == 1
+        conn = sqlite3.connect(db_path)
+        remaining = conn.execute("SELECT match_id FROM situations").fetchall()
+        conn.close()
+        assert remaining == [("m2",)]
+
+    def test_unknown_match_id_removes_nothing(self, db_path):
+        record_situation({"match_id": "m1"}, db_path=db_path)
+        assert clear_match("does-not-exist", db_path=db_path) == 0
+        assert count_situations(db_path=db_path) == 1
+
+    def test_clear_then_reinsert_leaves_only_new_rows(self, db_path):
+        """再実行のシナリオ: クリア→新しいスナップショットで入れ直す。"""
+        record_situation({"match_id": "m1", "turn": "0", "weather": "旧データ"}, db_path=db_path)
+        clear_match("m1", db_path=db_path)
+        record_situation({"match_id": "m1", "turn": "0", "weather": "新データ"}, db_path=db_path)
+
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("SELECT weather FROM situations WHERE match_id = 'm1'").fetchall()
+        conn.close()
+        assert rows == [("新データ",)]
 
 
 class TestCountSituations:

@@ -1783,6 +1783,33 @@ class TestMoveSingleDispatch:
         assert self.runner._move_log == ["T0:ガブリアスのじしん"]
         self.runner._dispatch_commentary.assert_not_called()
 
+    def test_flushes_pending_battle_start_before_own_dispatch(self):
+        """move_singleは_process_event経由のbattle_startとは別経路のため、保留中の
+        battle_startがあれば自分の実況より先にflushする必要がある。
+
+        2026-08-08発見: このflushが漏れていたため、保留中battle_startが
+        move_singleでは解消されず、次に_process_eventを通るイベント（多くの場合
+        battle_end）まで持ち越され、進行しきった戦況でbattle_start実況が
+        生成される事故があった（実機2026-06-03 22-57-11）。
+        """
+        self.runner._battle_tracker._player.append(FieldPokemon(name="ガブリアス", on_field=True))
+        self._set_classifier(moves={"じしん"}, pokemon={"ガブリアス": "ガブリアス"})
+        self.runner._pending_battle_start_time = 41.0
+        self.runner._pending_battle_start_frame = None
+        self.runner._pending_battle_start_game_state = {"event_type": "battle_start"}
+        self.runner._pending_battle_start_move_log = []
+        self.runner._pending_battle_start_attempt_bedrock = False
+
+        events = [_ocr("ガブリアスの", y_center=800.0), _ocr("じしん!", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+
+        assert self.runner._dispatch_commentary.call_count == 2
+        flush_call, own_call = self.runner._dispatch_commentary.call_args_list
+        assert flush_call.args[0] == "battle_start"
+        assert flush_call.kwargs["event_time"] == 41.0  # 検知時点のまま（flush実行時刻ではない）
+        assert own_call.args[0] == "move_single"
+        assert self.runner._pending_battle_start_time is None  # 保留状態はクリアされる
+
 
 class TestResetBattleState:
     """_reset_battle_state: battle_start／遅延起動共通のリセット処理。
@@ -2030,6 +2057,41 @@ class TestComputeTypeHint:
         hint = self.runner._compute_type_hint()
         assert "実際に使った" not in hint
         assert "メタグロスの技はイワークにバツグン" in hint
+
+    def test_weather_ball_type_overridden_by_weather(self):
+        """2026-08-08発見: ウェザーボールは天候で技タイプが変わるが、天候情報
+        （condition_hint）を渡すだけではLLMが自力で結びつけてくれず「水技」等と
+        誤答していた（renders/2026-06-07_12-48-22実機検証）。DBのベース値
+        （ノーマル）ではなく、Python側で天候から確定計算したタイプを使う。"""
+        self._add("player", "ペリッパー", ["みず", "ひこう"])
+        self._add("opponent", "フシギバナ", ["くさ", "どく"])
+        self.runner._battle_tracker._weather = "にほんばれ"
+        self.runner._move_log = ["T1:ペリッパーのウェザーボール"]
+        self._move_types["ウェザーボール"] = "ノーマル"  # DBのベース値（無天候時）
+        hint = self.runner._compute_type_hint()
+        assert "天候「にほんばれ」によりウェザーボールはほのおタイプになっている" in hint
+        assert "フシギバナにバツグン" in hint  # ほのお技はくさにバツグン
+
+    def test_weather_ball_type_disclosed_even_on_neutral_matchup(self):
+        """タイプ相性が「等倍」で相性行が出ない場合でも、天候で変わった
+        技タイプ自体は必ず伝える（省略すると誤ったタイプのまま実況されるため）。"""
+        self._add("player", "ペリッパー", ["みず", "ひこう"])
+        self._add("opponent", "カビゴン", ["ノーマル"])  # ほのおはノーマルに等倍
+        self.runner._battle_tracker._weather = "にほんばれ"
+        self.runner._move_log = ["T1:ペリッパーのウェザーボール"]
+        self._move_types["ウェザーボール"] = "ノーマル"
+        hint = self.runner._compute_type_hint()
+        assert "天候「にほんばれ」によりウェザーボールはほのおタイプになっている" in hint
+
+    def test_weather_ball_uses_db_type_without_weather(self):
+        """無天候時はDBのベース値（ノーマル）のまま・上書きしない。"""
+        self._add("player", "ペリッパー", ["みず", "ひこう"])
+        self._add("opponent", "リキキリン", ["でんき"])
+        self.runner._battle_tracker._weather = None
+        self.runner._move_log = ["T1:ペリッパーのウェザーボール"]
+        self._move_types["ウェザーボール"] = "ノーマル"
+        hint = self.runner._compute_type_hint()
+        assert "天候" not in (hint or "")
 
     def test_covering_move_hint_neutral_falls_back_to_own_type_lines(self):
         """実際の技が等倍だった場合は（情報量が無いので）own-type由来の相性行を使う。"""
