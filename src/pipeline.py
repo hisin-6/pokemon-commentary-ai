@@ -3738,9 +3738,14 @@ class Pipeline:
         値のままなので、未来の情報が混ざることはない（スポイラー安全性の担保）。
         """
         render_sink = getattr(self, "_render_sink", None)
-        match_id = render_sink.out_dir.name if render_sink is not None else None
+        # match_idは元動画ファイル名（拡張子なし）を使う。render_dir名（--render-out）
+        # だと同じ動画でも出力先フォルダ名を変えて再実行した場合（例:
+        # renders/foo → renders/foo_fix）に別match_id扱いとなり、clear_matchが
+        # 効かず同じ試合が複数レコードとしてDBに残ってしまう
+        # （2026-08-09発見。動画ファイル名なら再実行のたびに同一値になるため防げる）。
+        match_id = Path(self._video_path).stem if render_sink is not None and self._video_path else None
 
-        # 同じ動画（match_id=render_dir名）の再実行に備え、記録開始前に既存行を
+        # 同じ動画（match_id=動画ファイル名）の再実行に備え、記録開始前に既存行を
         # 一度だけクリアする（RenderSinkの「前回素材の自動クリア」と同じ狙い。
         # record_situationは追記のみのため、これが無いと再実行のたびに新旧の
         # スナップショットが同じmatch_idの下に混在する）。

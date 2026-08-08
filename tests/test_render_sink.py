@@ -434,6 +434,7 @@ class TestGeneratePosthocCommentary:
     def _make_pipeline(self, tmp_path):
         p = Pipeline.__new__(Pipeline)
         p._render_sink = RenderSink(tmp_path)
+        p._video_path = str(tmp_path / "battle.mp4")
         p._ec2_url = "http://ec2.example"
         p._classifier = None
         p._phi3 = MagicMock()
@@ -541,12 +542,12 @@ class TestGeneratePosthocCommentary:
         assert synthesized == entry["commentary"]
 
     def test_rerun_clears_previous_situation_warehouse_rows(self, tmp_path, monkeypatch):
-        """同じ動画（match_id=render_dir名）を再実行しても、戦況ウェアハウスに
+        """同じ動画（match_id=動画ファイル名）を再実行しても、戦況ウェアハウスに
         新旧のスナップショットが混在しない（2026-08-08発見・record_situationは
         追記のみのため、これまでは再実行のたびに重複していた。実機で同じ動画を
         3回実行した際、本来5行のところ20行に膨れ3世代が混在していた）。"""
         p = self._make_pipeline(tmp_path)
-        match_id = p._render_sink.out_dir.name
+        match_id = Path(p._video_path).stem
         # 前回実行分の“古い”行をあらかじめ仕込んでおく
         from src.analytics.situation_warehouse import record_situation
         record_situation({"match_id": match_id, "turn": "0", "weather": "旧データ"},
@@ -565,3 +566,52 @@ class TestGeneratePosthocCommentary:
             "SELECT weather FROM situations WHERE match_id = ?", (match_id,)).fetchall()
         conn.close()
         assert rows == [(None,)]  # 旧データは消え、今回分の1行だけが残る
+
+    def test_rerun_with_different_render_dir_still_dedupes(self, tmp_path, monkeypatch):
+        """同じ動画を、出力先フォルダ名（--render-out）を変えて再実行しても
+        重複しない（2026-08-09発見: match_idがrender_dir名ベースだった頃は
+        renders/foo → renders/foo_fix のように出力先だけ変えて再実行すると
+        別match_id扱いとなり、clear_matchが効かず同じ試合が複数レコード残っていた。
+        match_idを動画ファイル名ベースに変更して解消）。"""
+        video_path = str(tmp_path / "battle.mp4")
+
+        p1 = Pipeline.__new__(Pipeline)
+        p1._render_sink = RenderSink(tmp_path / "out1")
+        p1._video_path = video_path
+        p1._ec2_url = "http://ec2.example"
+        p1._classifier = None
+        p1._phi3 = MagicMock()
+        p1._voicevox = MagicMock()
+        p1._voicevox.generate_wav.return_value = _make_wav(0.3)
+        p1._pending_render_events = [
+            {"event_time": 1.0, "event_type": "battle_start", "game_state": {"ocr_text": ""},
+             "battle_context": {}, "move_log": [], "render_context": None},
+        ]
+        db_path = tmp_path / "test_situations.sqlite"
+        p1._situation_db_path = db_path
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", lambda *a, **k: ("実況1", "a"))
+        p1._generate_posthoc_commentary()
+
+        # 同じ動画を別のrender_outフォルダ名で再実行
+        p2 = Pipeline.__new__(Pipeline)
+        p2._render_sink = RenderSink(tmp_path / "out2_fix")
+        p2._video_path = video_path
+        p2._ec2_url = "http://ec2.example"
+        p2._classifier = None
+        p2._phi3 = MagicMock()
+        p2._voicevox = MagicMock()
+        p2._voicevox.generate_wav.return_value = _make_wav(0.3)
+        p2._pending_render_events = [
+            {"event_time": 1.0, "event_type": "battle_start", "game_state": {"ocr_text": ""},
+             "battle_context": {}, "move_log": [], "render_context": None},
+        ]
+        p2._situation_db_path = db_path
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", lambda *a, **k: ("実況2", "a"))
+        p2._generate_posthoc_commentary()
+
+        match_id = Path(video_path).stem
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT match_id FROM situations WHERE match_id = ?", (match_id,)).fetchall()
+        conn.close()
+        assert len(rows) == 1  # フォルダ名を変えて2回実行しても1行だけ残る

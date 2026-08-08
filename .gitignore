@@ -120,3 +120,4 @@ scripts/vrm_bone_reader.py
 scripts/compute_vmd_retarget_correction.py
 scripts/compute_bone_local_frames.py
 scripts/visualize_vmd_stick_figure.py
+data/battle_situations.sqlite.bak_20260809
