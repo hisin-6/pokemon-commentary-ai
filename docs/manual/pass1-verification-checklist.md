@@ -3,6 +3,13 @@
 未処理の録画（`D:\ゲーム録画\`）を1本ずつ使って、パス1（状態抽出＋実況テキスト）の
 精度をBedrock課金なしで確認し、不具合があれば直す作業のためのチェックリスト。
 
+**対象動画リスト・進捗管理は `docs/manual/pass1-verification-video-list.md` を参照**
+（尺の短い順に並んだ全対象動画のチェックボックス一覧。この作業をする際は必ず
+先にそちらを見て、次にどの動画をやるか確認すること）。
+
+**NGが見つかったら、この時点では直さず `docs/manual/pass1-verification-ng-findings.md`
+に集約する**（2026-08-10〜運用。ある程度パターンが溜まってからまとめて対応する方針）。
+
 ## 目的・スコープ
 
 - 対象は **パス1のみ**（`renders/<動画名>/manifest.jsonl` / `timeline.jsonl` / `states.jsonl`）。
@@ -59,12 +66,11 @@ venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\<動画フ�
 3. `states.jsonl` / `timeline.jsonl` を見て A1〜A9 をチェック
    - 気になる時刻があれば元動画のフレームを確認:
      `ffmpeg -y -ss <秒> -i "D:\ゲーム録画\<動画>.mp4" -frames:v 1 frame.png`
-4. 誤りを見つけたら:
-   - 単純な検出漏れ・誤検出 → 原因コード（`BattleStateTracker`/`BattlePhaseClassifier`/
-     `BattleMessageParser`等）を特定してから修正方針を相談
-   - Phi-3特有のテキスト破綻 → プロンプト（`Phi3Client`側）の調整を検討
-5. 直したら同じ動画で再実行して回帰確認（同じ`--render-out`への再実行は前回素材を
-   自動クリアするので上書きでOK）
+4. NGを見つけたら（**2026-08-10〜運用: この時点では直さず収集フェーズ**）:
+   - `docs/manual/pass1-verification-ng-findings.md` に1行追記
+   - `manifest.jsonl`/`timeline.jsonl`/`states.jsonl`を見て、構造化データ側が正しいか
+     生成テキスト側の問題かを切り分け、「原因分類」を埋める
+   - 修正はしない。パターンが溜まってから、まとめて優先度をつけて対応する
 
 ## 関連
 
