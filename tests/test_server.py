@@ -133,6 +133,31 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context("faint"), [], self._battle_state())
         assert "倒れた" in prompt or "HP=0" in prompt
 
+    def test_faint_focus_switches_to_inferred_hint(self):
+        """合成faint（ボール数減少推定）: 画面に0%表示が無いため「HP=0のポケモンを
+        特定」ではなく確定済みの対象を直接指示するevent_hintに差し替える。"""
+        prompt = _build_vision_prompt(
+            self._context("faint", faint_focus="相手のリキキリン"), [], self._battle_state())
+        assert "相手のリキキリン" in prompt
+        assert "残りポケモン数の減少から確定" in prompt
+        assert "HP=0のポケモンを特定すること" not in prompt
+
+    def test_faint_focus_ignored_for_other_events(self):
+        """faint以外のイベントではevent_hintを差し替えない（状況セクションへの
+        faint_focus行追加は行われるため、event_hint固有の文言で判定する）。"""
+        prompt = _build_vision_prompt(
+            self._context("move_used", faint_focus="相手のリキキリン"), [], self._battle_state())
+        assert "倒れたことに今気づいた体で" not in prompt
+        assert "今ターンで使われた技とその効果を実況する" in prompt
+
+    def test_faint_context_included_when_present(self):
+        """faint→move_used統合時のfaint_contextはpipeline側から送信されていたのに
+        プロンプトで一度も使われていなかった配線漏れ（2026-08-10発見）の修正確認。"""
+        prompt = _build_vision_prompt(
+            self._context("move_used", faint_context="場(自)=ピカチュウ | 場(相)=エルフーン"),
+            [], self._battle_state())
+        assert "場(自)=ピカチュウ | 場(相)=エルフーン" in prompt
+
     def test_prompt_contains_ocr_text(self):
         prompt = _build_vision_prompt(self._context(ocr_text="ピカチュウのかみなり"), [], self._battle_state())
         assert "ピカチュウのかみなり" in prompt

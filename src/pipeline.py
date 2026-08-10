@@ -2660,6 +2660,7 @@ def _build_bedrock_context(
         "rag_pokemon_info":         rag_info,
         "detected_moves":           " / ".join(move_log) if move_log else "なし",
         "faint_context":            game_state.get("faint_context", ""),  # 直前のfaint情報（統合時のみ）
+        "faint_focus":              game_state.get("faint_focus", ""),  # ボール数推定で確定した気絶の対象（合成faintのみ）
         "battle_result":            game_state.get("battle_result", ""),  # 勝敗（battle_endのみ・"勝ち"/"負け"）
         "move_focus":               game_state.get("move_focus", ""),  # 実況対象の1技（move_singleのみ）
     }
@@ -2870,6 +2871,10 @@ class Pipeline:
         self._pending_faint_game_turn: int = 0   # faint保留時点の game_turn（統合時に繰り上げ要否を判断）
         self._FAINT_PENDING_TIMEOUT: float = 75.0  # この秒数内にmove_usedが来なければ単独送信
         self._skip_next_turn_start: bool = False  # faint統合でgame_turnを繰り上げた後、直後のturn_startをスキップするフラグ
+        # 気絶実況の重複防止: faintイベント（OCRの0%表示）または合成faint
+        # （ボール数減少推定）で既に実況済みのポケモン名。0%表示がサンプリング
+        # から漏れた気絶をボール数確定時に合成実況するとき、両経路の二重言及を防ぐ
+        self._announced_faints: set[str] = set()
 
         # battle_start保留送信: ダブルスで味方2匹目のOCR登録がbattle_start発火に間に
         # 合わない場合（実機2026-06-03 22-57-11で確認: 2匹目が2秒遅れて登録され、
@@ -2918,6 +2923,7 @@ class Pipeline:
         self._last_ball_yolo = None   # バトル開始時にボール情報をリセット
         self._last_ability_msg = {}   # バトル開始時に特性・道具メッセージをリセット
         self._battle_result = None    # 前試合の勝敗をリセット（連戦動画対策）
+        self._announced_faints = set()  # 前試合の気絶実況済み名をリセット
 
     def run(self) -> None:
         _is_video = self._video_path is not None
@@ -3458,12 +3464,15 @@ class Pipeline:
                 self._pre_battle_player.clear()
 
         faint_side: str | None = None
+        inferred_faints: list[str] = []
         if self._battle_active:
             prev_fainted = self._battle_tracker.fainted_names()
             self._battle_tracker.update(game_state, event_type)
+            curr_fainted = self._battle_tracker.fainted_names()
             if event_type == "faint":
                 faint_side = self._battle_tracker.diff_fainted_side(
-                    prev_fainted, self._battle_tracker.fainted_names())
+                    prev_fainted, curr_fainted)
+            inferred_faints = self._track_new_faints(curr_fainted, event_type)
 
         battle_context = self._battle_tracker.to_context()
         type_hint = self._compute_type_hint()
@@ -3495,6 +3504,12 @@ class Pipeline:
             battle_context["player_bench"],
             battle_context["opponent_bench"],
         )
+
+        # ── 気絶実況の合成（ボール数推定で新規確定した相手の気絶）──────────────
+        # 現行イベントの実況より先にディスパッチし、時系列順（気絶→現行イベント）を保つ
+        if inferred_faints:
+            self._announced_faints.update(inferred_faints)
+            self._dispatch_faint_inferred(inferred_faints, frame, game_state, battle_context)
 
         # ── Bedrock Vision（バトル中のみ・対象イベントのみ・EC2 URL が設定されている場合）──
         # _battle_active = False の間（選出画面等）は Bedrock を呼ばない
@@ -4399,6 +4414,69 @@ class Pipeline:
             lines.append(speed_hint)
 
         return " / ".join(lines) if lines else None
+
+    def _track_new_faints(
+        self,
+        curr_fainted: tuple[set[str], set[str]],
+        event_type: str,
+    ) -> list[str]:
+        """現在のfainted_names()と実況済み集合の差分から、合成faint実況の対象を返す。
+
+        faintイベント（OCRの0%表示由来）の気絶は既存経路が実況するため
+        _announced_faints への登録のみ行い、空リストを返す。それ以外のイベントでは、
+        faintイベントを経ずに確定した相手の未実況気絶を返す。呼び出し側が実況合成時に
+        _announced_faints へ登録する（重複実況防止）。
+
+        「更新前後のdiff」ではなく「現在の気絶−実況済み」で判定するのは、気絶確定が
+        _battle_tracker.update()（ボール数減少推定）以外の経路でも起きるため:
+        「たおれた」メッセージ由来（_apply_message_events→confirm_*_faint_by_name）は
+        フレーム処理中＝イベント間に立つので、update()前後のdiffでは常に空になり
+        取りこぼす（実機2026-06-07 12-48-22のリキキリンで確認。0%表示も2Hz
+        サンプリングから漏れており、diff方式では一度も実況されなかった）。
+        """
+        if event_type == "faint":
+            self._announced_faints |= curr_fainted[0] | curr_fainted[1]
+            return []
+        return sorted(curr_fainted[1] - self._announced_faints)
+
+    def _dispatch_faint_inferred(
+        self,
+        names: list[str],
+        frame: "np.ndarray | None",
+        game_state: dict,
+        battle_context: dict,
+    ) -> None:
+        """ボール数減少推定で気絶が新規確定した瞬間に、単独のfaint実況イベントを合成する。
+
+        通常のfaint実況はOCRで「0%」等が映ったフレーム（_HP_ZERO_RE）でのみ発火するため、
+        2Hzサンプリングから0%表示が漏れると気絶が一度も実況されない。ボール数推定は
+        サンプリング漏れに強い（ボールアイコンは常時表示）ので、こちらの確定タイミングで
+        実況を補完する。誤ひんし推定がOCR再検出で後から解除されるケースは誤実況として
+        残るが、取りこぼし削減を優先する（move_singleのtentative実況と同方針・ユーザー決定）。
+
+        既存の_pending_faint_*保留・統合機構は意図的に使わない（faint統合のgame_turn
+        繰り上げが、コマンド画面検知タイミングの合成faintでは誤作動するため）。
+
+        テストが部分構築のPipeline（Pipeline.__new__）から呼ぶケースがあるため、
+        _ec2_url 等が未設定なら何もしない（早期return・_dispatch_move_commentaryと同様）。
+        """
+        if not hasattr(self, "_ec2_url"):
+            return
+        if not self._battle_active:
+            return
+        game_state = dict(game_state)
+        # コピー元は現行イベント（turn_start等）のgame_stateのため、event_typeを
+        # faintに上書きする（phi3_client/_build_bedrock_contextはこのキーで分岐する）
+        game_state["event_type"] = "faint"
+        game_state["faint_focus"] = "相手の" + "と".join(names)
+        battle_context = dict(battle_context)
+        # 表情連動（manifest.jsonlのcontext.faint_side）が既存経路でそのまま効く
+        battle_context["faint_side"] = "opponent"
+        attempt_bedrock = bool(
+            self._ec2_url and "faint" in BEDROCK_EVENTS and self._battle_active)
+        self._dispatch_commentary(
+            "faint", frame, game_state, battle_context,
+            self._move_log_display(5), attempt_bedrock, event_time=self._now())
 
     def _dispatch_move_commentary(
         self,

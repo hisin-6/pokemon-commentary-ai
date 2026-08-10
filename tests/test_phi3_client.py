@@ -127,6 +127,32 @@ class TestBuildPrompt:
         prompt = client._build_prompt({"event_type": "move_used"}, None, {"turn": 1})
         assert "場のコンディション" not in prompt
 
+    def test_faint_focus_embeds_inferred_faint_hint(self, client):
+        """合成faint（ボール数減少推定）: 画面に0%表示が無いため、確定済みの対象を
+        直接指示する。server.py側と同時配線（move_focus/type_hintで過去2回あった
+        片側配線漏れの再発防止）。"""
+        game_state = {"event_type": "faint", "faint_focus": "相手のリキキリン"}
+        prompt = client._build_prompt(game_state, None, None)
+        assert "相手のリキキリン" in prompt
+        assert "残りポケモン数の減少から確定" in prompt
+
+    def test_faint_without_focus_has_no_inferred_hint(self, client):
+        """通常のfaint（OCRの0%表示由来）ではfaint_focusが無く、指示行を追加しない。"""
+        prompt = client._build_prompt({"event_type": "faint"}, None, None)
+        assert "残りポケモン数の減少から確定" not in prompt
+
+    def test_non_faint_event_has_no_faint_focus_hint(self, client):
+        game_state = {"event_type": "move_used", "faint_focus": "相手のリキキリン"}
+        prompt = client._build_prompt(game_state, None, None)
+        assert "残りポケモン数の減少から確定" not in prompt
+
+    def test_faint_context_included_when_present(self, client):
+        """faint→move_used統合時の直前気絶情報（faint_context）の配線確認。"""
+        game_state = {"event_type": "move_used",
+                      "faint_context": "場(自)=ガブリアス | 場(相)=リキキリン"}
+        prompt = client._build_prompt(game_state, None, None)
+        assert "場(自)=ガブリアス | 場(相)=リキキリン" in prompt
+
 
 class TestGenerateCommentary:
     def test_success_returns_stripped_text_and_updates_history(self, client):

@@ -1811,6 +1811,127 @@ class TestMoveSingleDispatch:
         assert self.runner._pending_battle_start_time is None  # 保留状態はクリアされる
 
 
+class TestTrackNewFaints:
+    """_track_new_faints: 気絶実況の重複防止と合成実況対象の選別。
+
+    通常のfaint実況はOCRの0%表示フレーム（_HP_ZERO_RE）でのみ発火するため、
+    2Hzサンプリングから漏れると気絶が一度も実況されない（実機2026-06-07
+    12-48-22のリキキリン）。faintイベントを経ずに確定した相手の気絶を
+    「現在の気絶−実況済み」方式で拾い、合成実況の対象として返す。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._announced_faints = set()
+
+    def test_faint_event_registers_both_sides_and_returns_empty(self):
+        """OCRの0%表示由来の気絶は既存faint経路が実況するため、登録のみ行う。"""
+        curr = ({"ガブリアス"}, {"リキキリン"})
+        result = Pipeline._track_new_faints(self.runner, curr, "faint")
+        assert result == []
+        assert self.runner._announced_faints == {"ガブリアス", "リキキリン"}
+
+    def test_non_faint_event_returns_unannounced_opponent_faints(self):
+        """ボール数減少推定（update()内）で確定した相手の気絶を合成対象として返す。"""
+        result = Pipeline._track_new_faints(
+            self.runner, (set(), {"リキキリン"}), "turn_start")
+        assert result == ["リキキリン"]
+
+    def test_message_derived_faint_between_events_is_picked_up(self):
+        """「たおれた」メッセージ由来（_apply_message_events経由）の気絶は
+        _battle_tracker.update()の外＝イベント間に立つため、「更新前後のdiff」方式では
+        次のイベント時点でprev/curr両方に含まれてしまい常に取りこぼしていた
+        （実機2026-06-07 12-48-22の再検証1回目で発覚）。「現在の気絶−実況済み」方式なら
+        どの経路で立った気絶でも次のイベント処理時に必ず検出される。"""
+        # メッセージ由来でfaintedが立った後の、通常イベント処理時点の状態を再現
+        # （prev相当のスナップショットにも既に含まれている状況）
+        result = Pipeline._track_new_faints(
+            self.runner, (set(), {"リキキリン"}), "move_used")
+        assert result == ["リキキリン"]
+        # 実況合成後（呼び出し側で登録）は二度と返さない
+        self.runner._announced_faints.add("リキキリン")
+        result = Pipeline._track_new_faints(
+            self.runner, (set(), {"リキキリン"}), "battle_end")
+        assert result == []
+
+    def test_already_announced_not_returned(self):
+        """faintイベントで実況済みのポケモンは合成対象にしない（二重言及防止）。"""
+        self.runner._announced_faints = {"リキキリン"}
+        result = Pipeline._track_new_faints(
+            self.runner, (set(), {"リキキリン"}), "move_used")
+        assert result == []
+
+    def test_player_side_not_synthesized(self):
+        """自分側の気絶は合成対象外（相手側のみ・スコープ決定済み）。"""
+        result = Pipeline._track_new_faints(
+            self.runner, ({"ガブリアス"}, set()), "turn_start")
+        assert result == []
+
+    def test_no_faints_returns_empty(self):
+        result = Pipeline._track_new_faints(self.runner, (set(), set()), "move_used")
+        assert result == []
+
+
+class TestFaintInferredDispatch:
+    """_dispatch_faint_inferred: ボール数減少推定で確定した気絶の合成実況イベント。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._battle_active = True
+        self.runner._ec2_url = "http://fake-ec2:5000"
+        self.runner._move_log = []
+        self.runner._move_effectiveness = {}
+        self.runner._tentative_opponent_moves = []
+        self.runner._video_now = 456.0
+        self.runner._announced_faints = set()
+        self.runner._dispatch_commentary = MagicMock()
+
+    def test_dispatches_synthesized_faint_event(self):
+        game_state = {"event_type": "turn_start", "ocr_text": "コマンド画面"}
+        battle_context = {"player_field": "ガブリアス"}
+        Pipeline._dispatch_faint_inferred(
+            self.runner, ["リキキリン"], None, game_state, battle_context)
+
+        self.runner._dispatch_commentary.assert_called_once()
+        args, kwargs = self.runner._dispatch_commentary.call_args
+        event_type, _frame, sent_state, sent_context, _move_log, attempt_bedrock = args
+        assert event_type == "faint"
+        assert sent_state["event_type"] == "faint"  # コピー元のturn_startを上書きすること
+        assert sent_state["faint_focus"] == "相手のリキキリン"
+        assert sent_context["faint_side"] == "opponent"  # 表情連動（manifest経由）用
+        assert attempt_bedrock is True
+        assert kwargs["event_time"] == 456.0
+
+    def test_does_not_mutate_caller_dicts(self):
+        """現行イベント（コピー元）のgame_state/battle_contextを汚さないこと。"""
+        game_state = {"event_type": "turn_start"}
+        battle_context = {"player_field": "ガブリアス"}
+        Pipeline._dispatch_faint_inferred(
+            self.runner, ["リキキリン"], None, game_state, battle_context)
+        assert game_state == {"event_type": "turn_start"}
+        assert battle_context == {"player_field": "ガブリアス"}
+
+    def test_multiple_names_joined(self):
+        """2匹同時倒れ（ボールが一段階しか減らないケースの後追い確定含む）。"""
+        Pipeline._dispatch_faint_inferred(
+            self.runner, ["ヘイラッシャ", "リキキリン"], None,
+            {"event_type": "turn_start"}, {})
+        sent_state = self.runner._dispatch_commentary.call_args.args[2]
+        assert sent_state["faint_focus"] == "相手のヘイラッシャとリキキリン"
+
+    def test_partial_pipeline_without_ec2_url_does_not_raise(self):
+        """_ec2_url未設定（他の既存テストの部分構築Pipeline）では何もせず早期returnする。"""
+        del self.runner._ec2_url
+        Pipeline._dispatch_faint_inferred(
+            self.runner, ["リキキリン"], None, {"event_type": "turn_start"}, {})
+        self.runner._dispatch_commentary.assert_not_called()
+
+    def test_not_battle_active_early_returns(self):
+        self.runner._battle_active = False
+        Pipeline._dispatch_faint_inferred(
+            self.runner, ["リキキリン"], None, {"event_type": "turn_start"}, {})
+        self.runner._dispatch_commentary.assert_not_called()
+
+
 class TestResetBattleState:
     """_reset_battle_state: battle_start／遅延起動共通のリセット処理。
     遅延起動が前試合ロスターのまま走り新試合の繰り出しで eviction 連発していた

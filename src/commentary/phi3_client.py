@@ -148,6 +148,19 @@ class Phi3Client:
                 f"今まさに使われた技「{game_state['move_focus']}」1つだけに反応する"
                 "短い実況をする（ターン全体のまとめや他の技には触れず、この技への即時リアクションに徹すること）"
             )
+        # 合成faint（ボール数減少推定・パイプライン側で確定済み）: 画面にHP=0表示は
+        # 映っていないため、確定済みの対象を直接指示する（server.py側と同じ文言。
+        # move_focus/type_hintで過去2回あった片側配線漏れの再発防止として同時に配線）
+        if game_state.get("event_type") == "faint" and game_state.get("faint_focus"):
+            lines.append(
+                f"「{game_state['faint_focus']}」が倒れたことが残りポケモン数の減少から確定した"
+                "（画面にHP=0の表示は映っていない）。倒れたことに今気づいた体で、"
+                "このポケモンが倒れたことだけを実況する"
+            )
+        if game_state.get("faint_context"):
+            lines.append(
+                f"直前に起きた気絶の時点の戦況（この直後に下記の技が使われた）: {game_state['faint_context']}"
+            )
         if battle_context:
             lines += [
                 f"ターン数: {battle_context.get('turn', '不明')}",

@@ -151,6 +151,14 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
             f"今まさに使われた技「{context.get('move_focus', '')}」1つだけに反応する"
             "短い実況をする（ターン全体のまとめや他の技には触れず、この技への即時リアクションに徹すること）"
         )
+    elif event_type == "faint" and context.get("faint_focus"):
+        # 合成faint（ボール数減少推定）: 画面にHP=0表示は映っていないため、
+        # 「HP=0のポケモンを特定」ではなく確定済みの対象を直接指示する
+        event_hint = (
+            f"「{context.get('faint_focus', '')}」が倒れたことが残りポケモン数の減少から確定した"
+            "（画面にHP=0の表示は映っていない）。倒れたことに今気づいた体で、"
+            "このポケモンが倒れたことだけを実況する"
+        )
     else:
         event_hint = {
             "battle_start": "バトル開始！両者のポケモンを紹介して試合への期待感を高める実況をする",
@@ -276,6 +284,14 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
         "  ↑ このターンで実際に使われた技として最優先で参照すること",
         "  （「（推定）」付きの場合、技自体は使われたが使い手の名前は断定せず「相手」等に留めること）",
     ]
+    if context.get("faint_focus"):
+        lines.append(
+            f"倒れたことが確定したポケモン（残りポケモン数の減少から確定・信頼度高）: {context['faint_focus']}"
+        )
+    if context.get("faint_context"):
+        lines.append(
+            f"直前に起きた気絶の時点の戦況（この直後に下記の技が使われた）: {context['faint_context']}"
+        )
     rag_info: list = context.get("rag_pokemon_info", [])
     if rag_info:
         lines += [
