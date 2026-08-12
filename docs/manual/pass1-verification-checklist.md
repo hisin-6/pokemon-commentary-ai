@@ -10,6 +10,18 @@
 **NGが見つかったら、この時点では直さず `docs/manual/pass1-verification-ng-findings.md`
 に集約する**（2026-08-10〜運用。ある程度パターンが溜まってからまとめて対応する方針）。
 
+**2026-08-11〜: 目視の前に `scripts/screen_pass1.py` で自動一次スクリーニングをかけること。**
+既知NGパターン（move_log空での技実況・battle_result未検出でのbattle_end・絵文字混入・
+グリッチ差し替え漏れ・選出画面限定登場ポケモン・HP0%検出漏れ）を機械的に検出し、
+`renders/<動画名>/screening_report.md` に出力する。フラグが立った箇所を優先して
+目視確認し、フラグが少ない/ゼロの動画は軽めのスポットチェックで済ませてよい
+（詳細は下記「手順」参照）。
+
+**2026-08-12〜: 絵文字混入（③）は`_clean_commentary`で生成時点の自動除去に対策済み**
+（サンプリング25本で83件と突出して多かったため、収集フェーズの原則を例外的に外して
+先に恒久対策。詳細は`pass1-verification-ng-findings.md`参照）。以降`screen_pass1.py`が
+③をフラグしたら「対策漏れの再発」を意味するので、他パターンより優先して原因を確認すること。
+
 ## 目的・スコープ
 
 - 対象は **パス1のみ**（`renders/<動画名>/manifest.jsonl` / `timeline.jsonl` / `states.jsonl`）。
@@ -62,11 +74,20 @@ venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\<動画フ�
 ## C. 手順
 
 1. `--ec2-url` なしでパス1を実行（上記コマンド）
-2. `renders/<動画名>/manifest.jsonl` を時系列で通し読みして B1〜B5 をチェック
-3. `states.jsonl` / `timeline.jsonl` を見て A1〜A9 をチェック
+2. `python3 scripts/screen_pass1.py renders/<動画名>` で自動一次スクリーニングを実行
+   （**2026-08-11〜運用**。122本を毎回フルで目視する負荷を減らすため）
+   - `screening_report.md` の総フラグ数を見て、以下のどちらで進めるか判断する:
+     - **フラグあり**: フラグの立った時刻・イベントを中心に、周辺だけ重点的に目視確認する
+       （必要に応じて`generate_review_checklist.py`のターン単位チェックリストも併用）
+     - **フラグなし/わずか**: 全文通し読みではなく、動画を軽く早送りしながらの
+       スポットチェック（大きな破綻がないかの確認）で切り上げてよい
+   - ⚠️自動検出は「疑い」の一次検出であり確定判定ではない。フラグゼロ＝無罪ではなく
+     「既知パターンには該当しなかった」という意味（未知の新パターンは目視でしか拾えない）
+3. `renders/<動画名>/manifest.jsonl` を通し読みして B1〜B5 をチェック（スクリーニング結果に応じて濃淡をつける）
+4. `states.jsonl` / `timeline.jsonl` を見て A1〜A9 をチェック（同上）
    - 気になる時刻があれば元動画のフレームを確認:
      `ffmpeg -y -ss <秒> -i "D:\ゲーム録画\<動画>.mp4" -frames:v 1 frame.png`
-4. NGを見つけたら（**2026-08-10〜運用: この時点では直さず収集フェーズ**）:
+5. NGを見つけたら（**2026-08-10〜運用: この時点では直さず収集フェーズ**）:
    - `docs/manual/pass1-verification-ng-findings.md` に1行追記
    - `manifest.jsonl`/`timeline.jsonl`/`states.jsonl`を見て、構造化データ側が正しいか
      生成テキスト側の問題かを切り分け、「原因分類」を埋める

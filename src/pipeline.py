@@ -2475,14 +2475,22 @@ def _save_ocr_debug_image(frame: np.ndarray | None, ocr_results: list[dict], tur
 
 # ─── 実況文クリーンアップ ────────────────────────────────────────────────────
 
+# 絵文字ブロック（U+1F300-1FAFF）はMeiryoにグリフが無く字幕が豆腐（□）化する
+# 既知バグ（video-commentary SKILL.md参照）。♪♡等（U+2600-27BF）は問題ないので対象外。
+# パス1検証で25本中83件と頻発が判明したため、手動除去（レビュー後にregexを都度適用）
+# ではなく生成時点で自動除去する（2026-08-12）。
+_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF]")
+
+
 def _clean_commentary(text: str) -> str:
     """
-    Phi-3 mini が出力するゴミ（プロンプトの漏れ・追跡質問など）を除去する。
+    Bedrock/Phi-3 mini が出力するゴミ（プロンプトの漏れ・追跡質問など）を除去する。
     - "---" / "【" 以降を切り捨て
     - "指示" / "質問" / "注:" を含む行以降を切り捨て
     - 各行頭の "- " "・ " を除去
     - 鉤括弧「」を除去
     - 最初の 2 文だけ残す（。！？で区切る）
+    - 絵文字ブロック（U+1F300-1FAFF）を除去（字幕豆腐化バグ対策）
     """
     # "---" 以降を除去
     text = text.split("---")[0]
@@ -2514,6 +2522,12 @@ def _clean_commentary(text: str) -> str:
     # 最初の 2 文だけ残す（。！？で区切る）
     sentences = re.split(r"(?<=[。！？])", text)
     text = "".join(sentences[:2]).strip()
+
+    # 絵文字ブロック（U+1F300-1FAFF）を除去（字幕豆腐化バグ対策）
+    stripped = _EMOJI_RE.sub("", text)
+    if stripped != text:
+        log.info(f"[実況クリーンアップ] 絵文字を除去: 「{text}」→「{stripped}」")
+        text = stripped
 
     return text
 

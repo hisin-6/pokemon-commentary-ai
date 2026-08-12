@@ -121,6 +121,26 @@ class TestCleanCommentary:
         result = _clean_commentary(text)
         assert "エルフーン" in result
 
+    def test_removes_emoji_block(self):
+        # 字幕豆腐化バグ対策（U+1F300-1FAFF）。パス1検証で25本中83件と頻発判明→自動除去化
+        text = "クレッフィが混乱するのもありかも💦♪"
+        result = _clean_commentary(text)
+        assert "💦" not in result
+        assert "クレッフィ" in result
+
+    def test_keeps_musical_note_and_heart(self):
+        # ♪♡等（U+2600-27BF）はMeiryoにグリフがあるので除去対象外
+        text = "いい勝負だったね♪えらいえらい♡"
+        result = _clean_commentary(text)
+        assert "♪" in result
+        assert "♡" in result
+
+    def test_removes_multiple_emoji(self):
+        text = "やったね🎉🔥すごい試合だった！"
+        result = _clean_commentary(text)
+        assert "🎉" not in result
+        assert "🔥" not in result
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 勝敗検出（battle_end実況の勝敗明言・2026-07-30視聴fb#4）
