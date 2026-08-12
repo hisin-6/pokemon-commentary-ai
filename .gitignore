@@ -24,6 +24,9 @@ comparison_*.json
 # PokeAPI キャッシュ（336MB、scripts/build_pokedb.pyが生成）
 data/pokeapi_cache/
 
+# 別プロジェクト構想の下書き（git管理対象外にする方針・ユーザー指示2026-08-12）
+docs/design/game-ai-architecture-draft.md
+
 # PokeDB（build_pokedb.pyで再生成可能なバイナリ）
 data/pokedb.sqlite
 

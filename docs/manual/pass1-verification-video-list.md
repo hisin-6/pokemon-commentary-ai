@@ -22,7 +22,7 @@
 
 - 全録画: **132本**
 - 実況動画として完成済み（対象外）: **6本**
-- 無課金パス1検証 判定済み: **5本**
+- 無課金パス1検証 判定済み: **14本**（サンプリング25本中14本完了・残り11本）
 - 無課金パス1検証 対象（サンプリング後）: **25本**
 - サンプリング対象外（15分超）: **9本**
 - サンプリング対象外（15分以内・非選出）: **87本**
@@ -50,6 +50,15 @@
 | 3 | 2:59 | `2026-04-13 06-22-25.mp4` | `renders/2026-04-13_06-22-25/review_checklist.md`（NG2件） |
 | 4 | 3:03 | `2026-04-14 21-44-43.mp4` | `renders/2026-04-14_21-44-43/review_checklist.md`（NG3件） |
 | 5 | 3:04 | `2026-06-03 21-35-48.mp4` | `renders/2026-06-03_21-35-48/review_checklist.md`（NG5件・自動スクリーニング初実戦投入） |
+| 6 | 3:20 | `2026-04-14 08-39-39.mp4` | `renders/2026-04-14_08-39-39/review_checklist.md`（NG3件・ユーザー目視） |
+| 7 | 3:56 | `2026-04-12 17-12-38.mp4` | `renders/2026-04-12_17-12-38/review_checklist.md`（NG7件・ユーザー目視） |
+| 8 | 4:41 | `2026-04-14 21-40-01.mp4` | `renders/2026-04-14_21-40-01/review_checklist.md`（NG7件・ユーザー目視） |
+| 9 | 4:58 | `2026-06-07 12-07-11.mp4` | `renders/2026-06-07_12-07-11/review_checklist.md`（NG9件・ユーザー目視） |
+| 10 | 5:06 | `2026-06-06 17-30-38.mp4` | `renders/2026-06-06_17-30-38/review_checklist.md`（NG7件・ユーザー目視） |
+| 11 | 9:25 | `2026-06-27 12-13-37.mp4` | `renders/2026-06-27_12-13-37/review_checklist.md`（NG20件・ユーザー目視） |
+| 12 | 10:25 | `2026-04-13 06-34-11.mp4` | `renders/2026-04-13_06-34-11/review_checklist.md`（NG15件・ユーザー目視） |
+| 13 | 11:32 | `2026-07-03 21-06-34.mp4` | `renders/2026-07-03_21-06-34/review_checklist.md`（NG29件・ユーザー目視） |
+| 14 | 14:42 | `2026-07-03 21-54-06.mp4` | `renders/2026-07-03_21-54-06/review_checklist.md`（NG22件・ユーザー目視） |
 
 ## サンプリング方針（2026-08-11決定）
 
@@ -73,31 +82,31 @@
 追記すること。各項目のコマンドはそのままコピペで実行可能（1個目=パス1実行・
 2個目=レビューMarkdown生成・3個目=自動スクリーニング。いずれもWindows側で続けて実行）。
 
-- [ ] 1. 3:20 — `2026-04-14 08-39-39.mp4`
+- [x ] 1. 3:20 — `2026-04-14 08-39-39.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-04-14 08-39-39.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-04-14_08-39-39
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-04-14_08-39-39
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-04-14_08-39-39
   ```
-- [ ] 2. 3:56 — `2026-04-12 17-12-38.mp4`
+- [x ] 2. 3:56 — `2026-04-12 17-12-38.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-04-12 17-12-38.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-04-12_17-12-38
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-04-12_17-12-38
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-04-12_17-12-38
   ```
-- [ ] 3. 4:41 — `2026-04-14 21-40-01.mp4`
+- [x ] 3. 4:41 — `2026-04-14 21-40-01.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-04-14 21-40-01.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-04-14_21-40-01
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-04-14_21-40-01
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-04-14_21-40-01
   ```
-- [ ] 4. 4:58 — `2026-06-07 12-07-11.mp4`
+- [ x] 4. 4:58 — `2026-06-07 12-07-11.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-06-07 12-07-11.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-06-07_12-07-11
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-06-07_12-07-11
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-06-07_12-07-11
   ```
-- [ ] 5. 5:06 — `2026-06-06 17-30-38.mp4`
+- [x ] 5. 5:06 — `2026-06-06 17-30-38.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-06-06 17-30-38.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-06-06_17-30-38
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-06-06_17-30-38
@@ -199,25 +208,25 @@
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-06-06_20-22-10
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-06-06_20-22-10
   ```
-- [ ] 22. 9:25 — `2026-06-27 12-13-37.mp4`
+- [ x] 22. 9:25 — `2026-06-27 12-13-37.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-06-27 12-13-37.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-06-27_12-13-37
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-06-27_12-13-37
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-06-27_12-13-37
   ```
-- [ ] 23. 10:25 — `2026-04-13 06-34-11.mp4`
+- [x ] 23. 10:25 — `2026-04-13 06-34-11.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-04-13 06-34-11.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-04-13_06-34-11
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-04-13_06-34-11
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-04-13_06-34-11
   ```
-- [ ] 24. 11:32 — `2026-07-03 21-06-34.mp4`
+- [x ] 24. 11:32 — `2026-07-03 21-06-34.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-07-03 21-06-34.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-07-03_21-06-34
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-07-03_21-06-34
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-07-03_21-06-34
   ```
-- [ ] 25. 14:42 — `2026-07-03 21-54-06.mp4`
+- [ x] 25. 14:42 — `2026-07-03 21-54-06.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-07-03 21-54-06.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-07-03_21-54-06
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-07-03_21-54-06
