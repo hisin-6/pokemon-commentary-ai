@@ -2485,7 +2485,8 @@ _EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF]")
 def _clean_commentary(text: str) -> str:
     """
     Bedrock/Phi-3 mini が出力するゴミ（プロンプトの漏れ・追跡質問など）を除去する。
-    - "---" / "【" 以降を切り捨て
+    - "---" / "```"（コードフェンス） / "【" 以降を切り捨て
+    - HTMLタグ（</span>等）を除去
     - "指示" / "質問" / "注:" を含む行以降を切り捨て
     - 各行頭の "- " "・ " を除去
     - 鉤括弧「」を除去
@@ -2495,10 +2496,19 @@ def _clean_commentary(text: str) -> str:
     # "---" 以降を除去
     text = text.split("---")[0]
 
+    # "```"（Markdownコードフェンス）以降を除去。パス1検証で発見（2026-08-12）:
+    # Phi-3が「```python # 処理例: move_used[...] ```」のような生コード片を
+    # 出力してそのままVOICEVOXが読み上げる形になっていた
+    text = text.split("```")[0]
+
     # 先頭の「【...】」ラベルを除去（例: 「【バトル開始！】テキスト」→「テキスト」）
     text = re.sub(r'^(【[^】]*】\s*)+', '', text)
     # 中間に残った「【」以降を除去（Phi-3 の「【画面分析】...」が漏れてくる場合）
     text = text.split("【")[0]
+
+    # HTMLタグ（</span> </td> </tr> </table> </br> 等）を除去。上記と同じ実例で
+    # 「</span>」も一緒に混入していた（コードフェンス除去では拾えない別経路の漏れ）
+    text = re.sub(r"<[^>]*>", "", text)
 
     # "指示" "質問" "注:" を含む行以降を除去
     lines = text.splitlines()
@@ -2562,6 +2572,34 @@ def _check_end_screen_ocr(texts: list[str]) -> tuple[bool, str | None]:
     if not any(kw in joined for kw in _END_SCREEN_OCR_KEYWORDS):
         return False, None
     return True, _detect_battle_result(joined)
+
+
+def _detect_result_from_win_lose_ocr(ocr_results: list[dict], frame_width: int) -> str | None:
+    """降参終了の勝敗確定に使うWIN/LOSEロゴ画面の判定（2026-08-12実機フレーム確認で追加）。
+
+    「降参が選ばれました」画面には勝敗を示すテキストが無いが、その約10秒後に
+    自分・相手が左右に並んだ「WIN」「LOSE」ロゴ画面が表示される。自分側は常に
+    画面右半分に表示される仕様（実機2本で確認: ラベルが「トレーナー」の試合・
+    実際のユーザー名「xammer」の試合のどちらも右=自分だった）。
+
+    OCRのbboxで中心x座標を求め、画面右半分に見つかった方の語で自分の勝敗を判定する。
+    判定不能なら None（呼び出し側でタイムアウト＝未検出のまま発行にフォールバックする）。
+    """
+    for r in ocr_results:
+        text = (r.get("text") or "").upper()
+        bbox = r.get("bbox")
+        if not bbox:
+            continue
+        is_win = "WIN" in text
+        is_lose = "LOSE" in text
+        if not is_win and not is_lose:
+            continue
+        cx = sum(pt[0] for pt in bbox) / len(bbox)
+        is_self_side = cx >= frame_width / 2
+        if is_win:
+            return "勝ち" if is_self_side else "負け"
+        return "負け" if is_self_side else "勝ち"
+    return None
 
 
 # ─── AIグリッチ差し替え（Bedrock保留・困惑応答対策） ─────────────────────────
@@ -2837,6 +2875,12 @@ class Pipeline:
         self._end_screen_ocr_texts: list[str] = []  # 連続確認中の各フレームOCRを蓄積（勝敗テキストの取りこぼし対策）
         self._battle_active_since: float = 0.0  # battle_start の時刻
         self._MIN_BATTLE_DURATION = 25.0  # バトル開始からこの秒数は終了画面チェックをスキップ
+        # 降参終了（「降参が選ばれました」）は勝敗を判定できるテキストが無く、
+        # 約10秒後に出るWIN/LOSEロゴ画面まで待つ必要がある（2026-08-12発見・実機フレーム確認済み）。
+        # battle_endの発行自体をこの分だけ遅延させ、キューに積む時点で正しいbattle_resultを持たせる。
+        self._end_screen_pending_turn: int | None = None      # WIN/LOSE待ち中に発行予定のturn番号
+        self._end_screen_pending_deadline: float | None = None  # 待ちのタイムアウト時刻（self._now()基準）
+        self._END_SCREEN_WIN_LOSE_TIMEOUT = 15.0  # 降参検出後にWIN/LOSE画面を待つ最大秒数
         self._prev_yolo: BattleState | None = None
         self._last_ball_yolo: BattleState | None = None  # ボールが見えたフレームの最新 YOLO 結果
         self._last_ability_msg: dict[str, str] = {}     # 最後に検出した特性・道具発動メッセージ
@@ -2938,6 +2982,8 @@ class Pipeline:
         self._last_ability_msg = {}   # バトル開始時に特性・道具メッセージをリセット
         self._battle_result = None    # 前試合の勝敗をリセット（連戦動画対策）
         self._announced_faints = set()  # 前試合の気絶実況済み名をリセット
+        self._end_screen_pending_turn = None       # 前試合のWIN/LOSE待ち状態をリセット
+        self._end_screen_pending_deadline = None
 
     def run(self) -> None:
         _is_video = self._video_path is not None
@@ -3020,6 +3066,7 @@ class Pipeline:
                 _battle_elapsed = self._now() - self._battle_active_since
                 if (self._battle_active
                         and not self._phase_classifier._is_processing
+                        and self._end_screen_pending_deadline is None
                         and _battle_elapsed >= self._MIN_BATTLE_DURATION):
                     if self._yolo.detect_end_screen(frame):
                         self._end_screen_count += 1
@@ -3037,6 +3084,17 @@ class Pipeline:
                                 log.info(f"[YOLO] 終了画面{self._end_screen_count}回検出 → OCRキーワード不一致のため誤発火と判定 (OCR: {''.join(self._end_screen_ocr_texts)[:60]})")
                                 self._end_screen_count = 0
                                 self._end_screen_ocr_texts = []
+                            elif _result is None:
+                                # 降参終了（「降参が選ばれました」）: このテキストには勝敗情報が
+                                # 無いため即発行せず、約10秒後に出るWIN/LOSEロゴ画面を待つ
+                                # （2026-08-12実機フレーム確認で発見。パス1検証25本中12本で頻発）。
+                                log.info(f"[YOLO] 終了画面を{self._end_screen_count}回連続検出（降参・勝敗未確定）→ WIN/LOSE画面を最大{self._END_SCREEN_WIN_LOSE_TIMEOUT:.0f}秒待機")
+                                self._end_screen_count = 0
+                                self._end_screen_ocr_texts = []
+                                turn += 1
+                                self._end_screen_pending_turn = turn
+                                self._end_screen_pending_deadline = self._now() + self._END_SCREEN_WIN_LOSE_TIMEOUT
+                                continue
                             else:
                                 log.info(f"[YOLO] 終了画面を{self._end_screen_count}回連続検出 + OCR確認済 → battle_end")
                                 # YOLO経路のbattle_endはocr_results=[]で発行するため
@@ -3059,6 +3117,33 @@ class Pipeline:
                     else:
                         self._end_screen_count = 0
                         self._end_screen_ocr_texts = []
+
+                # ── 降参終了のWIN/LOSE画面待ち（毎フレーム・保留中のみ）─────
+                # 上のブロックで「降参が選ばれました」を確認済み（誤発火ではない）なので、
+                # ここでは勝敗確定 or タイムアウトを待つだけ。battle_endの発行自体を
+                # ここまで遅らせることで、キューに積む時点で正しいbattle_resultを持たせる。
+                if self._end_screen_pending_deadline is not None:
+                    _wl_ocr = run_ocr(self._reader, frame)
+                    _wl_result = _detect_result_from_win_lose_ocr(_wl_ocr, frame.shape[1])
+                    _wl_timed_out = self._now() >= self._end_screen_pending_deadline
+                    if _wl_result is not None or _wl_timed_out:
+                        if _wl_result is not None:
+                            if self._battle_result is None:
+                                self._battle_result = _wl_result
+                            log.info(f"[終了画面] WIN/LOSE画面から勝敗を検出: {_wl_result}")
+                        else:
+                            log.warning("[終了画面] WIN/LOSE画面がタイムアウトまでに検出できず。battle_result未検出のまま発行")
+                        _pending_turn = self._end_screen_pending_turn
+                        self._end_screen_pending_turn = None
+                        self._end_screen_pending_deadline = None
+                        self._phase_classifier.set_processing(True)
+                        try:
+                            self._process_event(frame, yolo_state, [], "battle_end", _pending_turn)
+                        finally:
+                            self._phase_classifier.set_processing(False)
+                            self._phase_classifier._battle_started = False
+                            self._phase_classifier._last_event_time["turn_start"] = self._now()
+                        continue
 
                 # ── HPバーピクセル解析（バトル中は毎フレーム）────────────────
                 # 軽量なピクセル処理のためOCRサイクルに依存させない。

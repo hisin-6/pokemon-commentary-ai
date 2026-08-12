@@ -29,6 +29,7 @@ from src.pipeline import (
     _clean_commentary,
     _detect_battle_result,
     _detect_glitch_cause,
+    _detect_result_from_win_lose_ocr,
     _extract_structured_info,
     _is_battle_screen,
     _ocr_results_to_text,
@@ -141,6 +142,30 @@ class TestCleanCommentary:
         assert "🎉" not in result
         assert "🔥" not in result
 
+    def test_removes_code_fence(self):
+        # パス1検証で発見（2026-08-12・2026-04-14_21-40-01 66.0s）: Phi-3が生コード片を
+        # 出力してそのままVOICEVOXに渡っていた
+        text = ("相手は何を打ってきたかしら？ 緊張感MAXだよ～   "
+                "```python # Python側での処理例: move_used[（テキスト未検出）] "
+                "の部分に、対戦相手の技の情報を記述 move_used[でんきショック / プテラ ] ```")
+        result = _clean_commentary(text)
+        assert "```" not in result
+        assert "move_used" not in result
+        assert "緊張感MAX" in result
+
+    def test_removes_html_tags(self):
+        # 同実例で"</span>"も一緒に混入していた（コードフェンス除去とは別経路の漏れ）
+        text = "ロトムが出たから、マニューラで一気に攻め込むのもありだよね </td>"
+        result = _clean_commentary(text)
+        assert "</td>" not in result
+        assert "マニューラ" in result
+
+    def test_removes_various_html_tags(self):
+        text = "威力も高そうで怖いよぉ～ </br> </br>"
+        result = _clean_commentary(text)
+        assert "<" not in result
+        assert ">" not in result
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 勝敗検出（battle_end実況の勝敗明言・2026-07-30視聴fb#4）
@@ -210,6 +235,58 @@ class TestCheckEndScreenOcr:
         matched, result = _check_end_screen_ocr(["降参が選ばれました"])
         assert matched is True
         assert result is None
+
+
+class TestDetectResultFromWinLoseOcr:
+    """降参終了時、「降参が選ばれました」の約10秒後に出るWIN/LOSEロゴ画面から
+    勝敗を判定する_detect_result_from_win_lose_ocr（2026-08-12実機フレーム確認で追加）。
+    自分は常に画面右半分に表示される仕様。"""
+
+    FRAME_W = 1920
+
+    def _bbox(self, cx: float):
+        # 中心x座標cxの適当な矩形bboxを作る（幅100想定）
+        return [[cx - 50, 500], [cx + 50, 500], [cx + 50, 560], [cx - 50, 560]]
+
+    def test_win_on_right_means_self_wins(self):
+        ocr = [{"text": "WIN", "bbox": self._bbox(1500), "confidence": 0.9}]
+        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "勝ち"
+
+    def test_win_on_left_means_self_loses(self):
+        """自分（右）がLOSE側だと、WINは相手（左）に出る。"""
+        ocr = [{"text": "WIN", "bbox": self._bbox(400), "confidence": 0.9}]
+        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "負け"
+
+    def test_lose_on_right_means_self_loses(self):
+        ocr = [{"text": "LOSE", "bbox": self._bbox(1500), "confidence": 0.9}]
+        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "負け"
+
+    def test_lose_on_left_means_self_wins(self):
+        ocr = [{"text": "LOSE", "bbox": self._bbox(400), "confidence": 0.9}]
+        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "勝ち"
+
+    def test_both_win_and_lose_present_uses_first_match(self):
+        """通常は両方同時に出る（自分側と相手側）。どちらから見ても矛盾しない結果になる。"""
+        ocr = [
+            {"text": "LOSE", "bbox": self._bbox(400), "confidence": 0.9},
+            {"text": "WIN", "bbox": self._bbox(1500), "confidence": 0.9},
+        ]
+        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "勝ち"
+
+    def test_no_win_lose_text_returns_none(self):
+        ocr = [{"text": "ヒシン", "bbox": self._bbox(400), "confidence": 0.9}]
+        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) is None
+
+    def test_empty_ocr_returns_none(self):
+        assert _detect_result_from_win_lose_ocr([], self.FRAME_W) is None
+
+    def test_missing_bbox_is_skipped(self):
+        ocr = [{"text": "WIN", "bbox": None, "confidence": 0.9}]
+        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) is None
+
+    def test_case_insensitive(self):
+        ocr = [{"text": "win", "bbox": self._bbox(1500), "confidence": 0.9}]
+        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "勝ち"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
