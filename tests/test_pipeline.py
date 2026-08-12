@@ -721,6 +721,40 @@ class TestBattlePhaseClassifier:
         event = clf.detect(self._ocr_list("バツグンだ"))  # move_used
         assert event == "move_used"
 
+    def test_no_move_used_before_battle_started_on_communication_exit(self):
+        """バトル開始前の「対戦準備中」画面で move_used が誤発火しない（2026-08-12修正）。
+
+        「対戦準備中」画面の各プレイヤー準備完了ステータス「待機中」が単独OCR片として
+        検出され、_COMM_RE の `^待機中$` 枝に一致して communication フェーズと誤判定
+        →直後のポケモン入場演出への遷移で move_used が誤発火していた
+        （実機フレーム＋実OCRで確認: 2026-04-13_06-34-11・2026-04-13_21-46-08で実証。
+        パス1検証①の「ゴウカザーが地面技を」「バンギラスがいばるを連発」捏造NGの根本原因）。
+        battle_start（初回command_select）より前はこの誤発火を起こさないことを確認する。
+        """
+        t = {"now": 0.0}
+        clf = BattlePhaseClassifier(debounce_seconds=0.0, clock=lambda: t["now"])
+        # battle_start前: 「対戦準備中」画面の「待機中」ラベル（communication誤判定）
+        clf.detect(self._ocr_list("待機中"))
+        t["now"] = 1.0
+        clf.detect(self._ocr_list("待機中"))  # 連続0.7秒以上 → communication確定
+        t["now"] = 5.0
+        # ポケモン入場演出へ遷移（「待機中」表示が消える）
+        event = clf.detect(self._ocr_list("ヒシン"))
+        assert event is None  # battle_started=False なので move_used は発火しない
+
+    def test_move_used_still_fires_after_battle_started_with_taikichu_alone(self):
+        """battle_start後は「待機中」単独一致でも通常通りmove_usedが発火する（回帰防止）。"""
+        t = {"now": 0.0}
+        clf = BattlePhaseClassifier(debounce_seconds=0.0, clock=lambda: t["now"])
+        clf.detect(self._ocr_list("たたかう"))    # battle_start
+        t["now"] = 10.0
+        clf.detect(self._ocr_list("待機中"))
+        t["now"] = 11.0
+        clf.detect(self._ocr_list("待機中"))      # 連続0.7秒以上 → communication確定
+        t["now"] = 15.0
+        event = clf.detect(self._ocr_list("バツグンだ"))
+        assert event == "move_used"
+
     def test_detect_switch_on_command_to_switch_select(self):
         self.clf.detect(self._ocr_list("たたかう"))
         event = self.clf.detect(self._ocr_list("こうたい"))

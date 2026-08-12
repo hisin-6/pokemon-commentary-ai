@@ -830,9 +830,20 @@ class BattlePhaseClassifier:
             # _allow_turn_start=False（1匹目→2匹目コマンド選択中）はここでスキップされる。
             # debounceに依存しないため、操作が何秒かかっても余分なturn_startは発火しない。
             event = "turn_start"
-        elif prev == "communication" and curr not in ("communication", "battle_end"):
+        elif (prev == "communication" and curr not in ("communication", "battle_end")
+              and self._battle_started):
             # 通信待機中終了 = 全コマンド確定後にアニメーション開始
             # Champions特有: ダブルバトルで双方の全コマンドが揃ったことを示す唯一の信頼できるシグナル。
+            #
+            # self._battle_started ガード（2026-08-12追加・パス1検証で発見）:
+            # バトル開始前の「対戦準備中」画面には各プレイヤーの準備完了ステータスとして
+            # 「待機中」が単独で表示される。_COMM_RE の `^待機中$` 枝（「通信待機中」の
+            # OCR誤読対策）がこれにも一致してしまい、この画面を communication フェーズと
+            # 誤判定→直後のポケモン入場演出への遷移で「通信フェーズ終了」と誤認識され、
+            # ロスター未確定（情報収集中）のままmove_usedが発火していた（実機フレーム＋
+            # 実OCRで確認: renders/2026-04-13_06-34-11・2026-04-13_21-46-08で実証）。
+            # battle_start（初回command_select）は必ずこの準備画面より後に来るため、
+            # battle_started済みであることを要求すれば試合前の誤発火だけを弾ける。
             event = "move_used"
         elif curr == "faint" and prev != "faint" and faint_rearmed:
             # エッジトリガ: 相手を見るパネル等で「0/211」が長時間残り、OCRのチラつきで
