@@ -299,6 +299,25 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context(), [], self._battle_state())
         assert "くれぴ" in prompt
 
+    def test_persona_kurepi_default(self):
+        """2026-08-14新設: personaキー未指定時は従来通りkurepi扱い（回帰ガード）。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "花圓くれぴ" in prompt
+
+    def test_persona_neutral_excludes_kurepi(self):
+        """3Dモデル一時差し替え検証用（--persona neutral）。"""
+        prompt = _build_vision_prompt(
+            self._context(persona="neutral"), [], self._battle_state())
+        assert "くれぴ" not in prompt
+        assert "花圓" not in prompt
+
+    def test_persona_missing_defaults_to_kurepi(self):
+        """contextにpersonaキーが無い旧クライアントとの後方互換確認。"""
+        ctx = self._context()
+        ctx.pop("persona", None)
+        prompt = _build_vision_prompt(ctx, [], self._battle_state())
+        assert "花圓くれぴ" in prompt
+
     def test_prompt_contains_turn_history_when_present(self):
         prompt = _build_vision_prompt(
             self._context(), [],
@@ -702,6 +721,18 @@ class TestBuildScriptPrompt:
         prompt = _build_script_prompt(payload["gap"], payload["events"])
         assert "くれぴ" in prompt
 
+    def test_persona_neutral_excludes_kurepi(self):
+        """2026-08-14新設: 3Dモデル一時差し替え検証用（--persona neutral）。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"], persona="neutral")
+        assert "くれぴ" not in prompt
+        assert "花圓" not in prompt
+
+    def test_persona_default_is_kurepi(self):
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "花圓くれぴ" in prompt
+
     def test_future_events_excluded_from_prompt(self):
         """区間より未来のeventsはプロンプトに一切含まれない（ネタバレ構造対策・最重要）。"""
         payload = _valid_script_payload()  # gap=78〜131 / battle_start@63(過去) / faint@133.2(未来)
@@ -825,6 +856,46 @@ class TestScriptEndpoint:
         data = resp.get_json()
         assert data["success"] is True
         assert data["fillers"] == [{"time": 30.0, "text": "さあ試合開始が近いぞ"}]
+
+    def test_persona_neutral_excludes_kurepi_from_bedrock_prompt(self, client):
+        """2026-08-14新設: persona="neutral"を送るとBedrockに渡すプロンプトから
+        「くれぴ」が除外される（3Dモデル一時差し替え検証用）。"""
+        mock_response_body = {
+            "content": [{"text": '[{"time": 30.0, "text": "さあ試合開始が近いぞ"}]'}],
+            "usage": {"input_tokens": 500, "output_tokens": 80},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(
+                read=MagicMock(return_value=json.dumps(mock_response_body).encode())
+            )
+        }
+        with patch.object(server_module.bedrock_script, "invoke_model",
+                           return_value=mock_bedrock_response) as mock_invoke:
+            resp = client.post("/api/script", json=_valid_script_payload(persona="neutral"))
+        assert resp.status_code == 200
+        sent_body = json.loads(mock_invoke.call_args.kwargs["body"])
+        prompt_text = sent_body["messages"][0]["content"][0]["text"]
+        assert "くれぴ" not in prompt_text
+        assert "花圓" not in prompt_text
+
+    def test_persona_missing_defaults_to_kurepi_in_bedrock_prompt(self, client):
+        """personaキー未送信時は従来通りkurepiとして扱われる（後方互換の回帰ガード）。"""
+        mock_response_body = {
+            "content": [{"text": '[{"time": 30.0, "text": "さあ試合開始が近いぞ"}]'}],
+            "usage": {"input_tokens": 500, "output_tokens": 80},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(
+                read=MagicMock(return_value=json.dumps(mock_response_body).encode())
+            )
+        }
+        with patch.object(server_module.bedrock_script, "invoke_model",
+                           return_value=mock_bedrock_response) as mock_invoke:
+            resp = client.post("/api/script", json=_valid_script_payload())
+        assert resp.status_code == 200
+        sent_body = json.loads(mock_invoke.call_args.kwargs["body"])
+        prompt_text = sent_body["messages"][0]["content"][0]["text"]
+        assert "花圓くれぴ" in prompt_text
 
     def test_unparseable_bedrock_output_returns_502(self, client):
         mock_response_body = {

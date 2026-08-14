@@ -2572,44 +2572,91 @@ def _detect_battle_result(text: str) -> str | None:
     return None
 
 
-def _check_end_screen_ocr(texts: list[str]) -> tuple[bool, str | None]:
+# 「(相手名)との勝負に勝った/負けた」から相手トレーナー名を抜き出す
+# （2026-08-14・WIN/LOSE画面の左右判定用に新設。詳細は_detect_result_from_win_lose_ocr参照）
+_OPPONENT_TRAINER_NAME_RE = re.compile(r"(.{1,20}?)との勝負に(?:勝|負)")
+
+
+def _extract_opponent_trainer_name(text: str) -> str | None:
+    """OCRテキストから「〜との勝負に勝った/負けた」の相手トレーナー名を抽出する。
+
+    _detect_battle_resultと同じくスペース・スラッシュ除去後に判定する
+    （OCR断片化でトレーナー名と「との」が別トークンに割れる場合は拾えないが、
+    拾えない場合はWIN/LOSE画面の左右判定にフォールバックできないだけで、
+    従来通りタイムアウトで未検出のまま発行される＝安全側）。
+    """
+    joined = text.replace(" ", "").replace("/", "")
+    m = _OPPONENT_TRAINER_NAME_RE.search(joined)
+    return m.group(1) if m else None
+
+
+def _check_end_screen_ocr(texts: list[str]) -> tuple[bool, str | None, str | None]:
     """終了画面連続確認中に蓄積した複数フレーム分のOCRテキストから、
-    誤発火防止のキーワード一致可否と勝敗判定を行う。
+    誤発火防止のキーワード一致可否・勝敗判定・相手トレーナー名抽出を行う。
 
     「勝負に勝った/負けた」はフェードイン等で1フレーム目には出揃わないことがあるため、
     確認フレーム全部のテキストを結合してから判定する（1フレームだけに頼ると取りこぼす）。
+
+    戻り値: (キーワード一致可否, 勝敗判定結果, 抽出できた相手トレーナー名)
     """
     joined = "".join(texts)
     if not any(kw in joined for kw in _END_SCREEN_OCR_KEYWORDS):
-        return False, None
-    return True, _detect_battle_result(joined)
+        return False, None, None
+    return True, _detect_battle_result(joined), _extract_opponent_trainer_name(joined)
 
 
-def _detect_result_from_win_lose_ocr(ocr_results: list[dict], frame_width: int) -> str | None:
+def _detect_result_from_win_lose_ocr(
+    ocr_results: list[dict], opponent_trainer_name: str | None,
+) -> str | None:
     """降参終了の勝敗確定に使うWIN/LOSEロゴ画面の判定（2026-08-12実機フレーム確認で追加）。
 
-    「降参が選ばれました」画面には勝敗を示すテキストが無いが、その約10秒後に
-    自分・相手が左右に並んだ「WIN」「LOSE」ロゴ画面が表示される。自分側は常に
-    画面右半分に表示される仕様（実機2本で確認: ラベルが「トレーナー」の試合・
-    実際のユーザー名「xammer」の試合のどちらも右=自分だった）。
+    「降参が選ばれました」画面には勝敗を示すテキストが無いが、その後に自分・相手が
+    左右に並んだ「WIN」「LOSE」ロゴ画面が表示される。
 
-    OCRのbboxで中心x座標を求め、画面右半分に見つかった方の語で自分の勝敗を判定する。
-    判定不能なら None（呼び出し側でタイムアウト＝未検出のまま発行にフォールバックする）。
+    ⚠️2026-08-12時点では「自分は常に画面右半分」という前提で実装していたが、実機2本
+    （どちらも右=自分）だけを根拠にした早計な一般化だった。2026-08-14に
+    `2026-06-06_17-12-07`の実機フレームで自分が左側・相手が右側のケースを確認し、
+    この前提が誤りだったと判明（左右は試合ごとに変わりうる）。
+
+    そのため、既知の相手トレーナー名（`_extract_opponent_trainer_name`で「〜との
+    勝負に」から事前に抽出したもの）が画面内のどちらの陣営名テキストに近いかで
+    判定する方式に変更した。相手名が未取得、または画面内に見つからない場合は
+    判定不能としてNoneを返す（誤タグより無タグの方が安全という既存方針を踏襲。
+    呼び出し側はタイムアウトで未検出のまま発行にフォールバックする）。
     """
+    if not opponent_trainer_name:
+        return None
+
+    win_cx = lose_cx = None
     for r in ocr_results:
         text = (r.get("text") or "").upper()
         bbox = r.get("bbox")
         if not bbox:
             continue
-        is_win = "WIN" in text
-        is_lose = "LOSE" in text
-        if not is_win and not is_lose:
-            continue
         cx = sum(pt[0] for pt in bbox) / len(bbox)
-        is_self_side = cx >= frame_width / 2
-        if is_win:
-            return "勝ち" if is_self_side else "負け"
-        return "負け" if is_self_side else "勝ち"
+        if "WIN" in text and win_cx is None:
+            win_cx = cx
+        elif "LOSE" in text and lose_cx is None:
+            lose_cx = cx
+    if win_cx is None and lose_cx is None:
+        return None
+
+    opponent_cx = None
+    for r in ocr_results:
+        text = r.get("text") or ""
+        bbox = r.get("bbox")
+        if bbox and opponent_trainer_name in text:
+            opponent_cx = sum(pt[0] for pt in bbox) / len(bbox)
+            break
+    if opponent_cx is None:
+        return None
+
+    # 相手トレーナー名のx座標がWIN/LOSEどちらに近いかで、相手側の勝敗→自分側の
+    # 勝敗を導く（相手名がWIN側に近い＝相手の勝ち＝自分の負け、の逆も同様）
+    if win_cx is not None and (lose_cx is None or abs(opponent_cx - win_cx) < abs(opponent_cx - lose_cx)):
+        return "負け"
+    if lose_cx is not None:
+        return "勝ち"
     return None
 
 
@@ -2638,6 +2685,13 @@ _GLITCH_TEMPLATES = [
     "エラー発生〜！原因は{cause}だって♪ くれぴだってたまには混乱するもん！",
 ]
 
+# 2026-08-14: persona="neutral"用（花圓くれぴの名乗りを含まない中立版）
+_GLITCH_TEMPLATES_NEUTRAL = [
+    "あれ、{cause}で映像が少し乱れたようです。すぐに戻りますので少々お待ちください。",
+    "{cause}のため一瞬データが乱れました。試合の続きに戻ります。",
+    "只今{cause}が発生しました。すぐに実況を再開します。",
+]
+
 
 def _detect_glitch_cause(text: str) -> str | None:
     """保留・困惑応答なら差し込む原因文言を、通常の実況文なら None を返す。"""
@@ -2647,16 +2701,20 @@ def _detect_glitch_cause(text: str) -> str | None:
     return None
 
 
-def _replace_glitch_commentary(text: str) -> str:
-    """Bedrockの保留・困惑応答をくれぴ口調の「AIグリッチ」定型文に差し替える。
+def _replace_glitch_commentary(text: str, persona: str = "kurepi") -> str:
+    """Bedrockの保留・困惑応答をキャラ口調の「AIグリッチ」定型文に差し替える。
 
     通常の実況文はそのまま返す。差し替えはVOICEVOX合成前に呼ぶこと
     （合成後に字幕テキストだけ差し替えると音声と不一致になるため）。
+
+    persona: "kurepi"（デフォルト）/"neutral"（2026-08-14・3Dモデル一時差し替え
+    検証用。くれぴの名乗りを含まないテンプレートを使う）。
     """
     cause = _detect_glitch_cause(text)
     if cause is None:
         return text
-    replaced = random.choice(_GLITCH_TEMPLATES).format(cause=cause)
+    templates = _GLITCH_TEMPLATES if persona == "kurepi" else _GLITCH_TEMPLATES_NEUTRAL
+    replaced = random.choice(templates).format(cause=cause)
     log.info("[AIグリッチ] 保留・困惑応答を検出→定型文に差し替え: 「%s」→「%s」",
              text, replaced)
     return replaced
@@ -2670,11 +2728,15 @@ def _build_bedrock_context(
     battle_context: dict | None,
     classifier,
     move_log: list[str] | None,
+    persona: str = "kurepi",
 ) -> dict:
     """Bedrock に送る context 辞書を組み立てる（画像に依存しない部分）。
 
     ``_call_bedrock_vision``（ライブ・画像あり）と ``_call_bedrock_text``
     （動画モードの後付け生成・画像なし）で共通利用する。
+
+    persona: "kurepi"（デフォルト・花圓くれぴ）/"neutral"（3Dモデル一時差し替え
+    検証用・2026-08-14）。server.py側は`context.get("persona", "kurepi")`で読む。
     """
     # server.py の /api/vision は context.event_type でバリデーションする
     status_parts = (game_state.get("status", "") or "").split(" / 相手: ")
@@ -2726,6 +2788,7 @@ def _build_bedrock_context(
         "faint_focus":              game_state.get("faint_focus", ""),  # ボール数推定で確定した気絶の対象（合成faintのみ）
         "battle_result":            game_state.get("battle_result", ""),  # 勝敗（battle_endのみ・"勝ち"/"負け"）
         "move_focus":               game_state.get("move_focus", ""),  # 実況対象の1技（move_singleのみ）
+        "persona":                  persona,  # "kurepi"/"neutral"（2026-08-14・3Dモデル一時差し替え検証用）
     }
 
 
@@ -2751,6 +2814,7 @@ def _call_bedrock_vision(
     battle_context: dict | None = None,
     classifier=None,
     move_log: list[str] | None = None,
+    persona: str = "kurepi",
 ) -> str | None:
     """
     EC2 API に画像と状況を送り、Bedrock Vision 分析結果を受け取る（ライブ経路）。
@@ -2766,7 +2830,7 @@ def _call_bedrock_vision(
         _, buf = cv2.imencode(".png", small)
         image_b64 = base64.b64encode(buf.tobytes()).decode()
 
-        context = _build_bedrock_context(game_state, event_type, battle_context, classifier, move_log)
+        context = _build_bedrock_context(game_state, event_type, battle_context, classifier, move_log, persona)
         payload = {
             "image_base64": image_b64,
             "context": context,
@@ -2794,6 +2858,7 @@ def _call_bedrock_text(
     battle_context: dict | None = None,
     classifier=None,
     move_log: list[str] | None = None,
+    persona: str = "kurepi",
 ) -> str | None:
     """
     EC2 API に画像なし・構造化データのみを送り、Bedrockの実況文を受け取る
@@ -2802,7 +2867,7 @@ def _call_bedrock_text(
     単フレーム画像からの再判定はさせない。失敗してもパイプラインを止めない（None を返す）。
     """
     try:
-        context = _build_bedrock_context(game_state, event_type, battle_context, classifier, move_log)
+        context = _build_bedrock_context(game_state, event_type, battle_context, classifier, move_log, persona)
         payload = {
             "context": context,
             "history": commentary_history[-3:],
@@ -2839,8 +2904,12 @@ class Pipeline:
         video_sample_fps: float = 2.0,
         render_out: str | None = None,
         game_mode: str = "sv",
+        persona: str = "kurepi",
+        # 2026-08-14: 3Dモデル一時差し替え検証用（--persona neutral）。
+        # "kurepi"=花圓くれぴ（デフォルト・従来動作）/"neutral"=中立実況口調
     ):
         log.info("=== パイプライン初期化 ===")
+        self._persona = persona
 
         log.info("EasyOCR 初期化中...")
         self._reader = init_reader(gpu=gpu)
@@ -2852,7 +2921,7 @@ class Pipeline:
                                    enable_pretrained_fallback=False)
 
         log.info("Phi-3 クライアント初期化...")
-        self._phi3 = Phi3Client()
+        self._phi3 = Phi3Client(persona=persona)
 
         log.info("VOICEVOX クライアント初期化...")
         self._voicevox = VoicevoxClient(speaker=speaker)
@@ -2896,6 +2965,10 @@ class Pipeline:
         self._last_ball_yolo: BattleState | None = None  # ボールが見えたフレームの最新 YOLO 結果
         self._last_ability_msg: dict[str, str] = {}     # 最後に検出した特性・道具発動メッセージ
         self._battle_result: str | None = None  # 「勝負に勝った/負けた」検出結果（"勝ち"/"負け"）
+        self._opponent_trainer_name: str | None = None  # 「〜との勝負に」から抽出した相手トレーナー名
+        # （2026-08-14発見・WIN/LOSE画面の左右判定用。「自分は常に右側」という固定前提が
+        # 誤りだったため、既知の相手名との照合方式に切り替えた。詳細は
+        # _detect_result_from_win_lose_ocr のdocstring参照）
         self._pre_battle_opponent: list[str] = []  # battle_start前に検出した相手ポケモン名キャッシュ
         self._pre_battle_player: list[str] = []    # battle_start前に検出した自分ポケモン名キャッシュ（ゆけっ！検出）
         # メッセージ由来の繰り出し履歴 (時刻, side, 名前)。繰り出し演出は
@@ -2992,6 +3065,7 @@ class Pipeline:
         self._last_ball_yolo = None   # バトル開始時にボール情報をリセット
         self._last_ability_msg = {}   # バトル開始時に特性・道具メッセージをリセット
         self._battle_result = None    # 前試合の勝敗をリセット（連戦動画対策）
+        self._opponent_trainer_name = None  # 前試合の相手トレーナー名をリセット
         self._announced_faints = set()  # 前試合の気絶実況済み名をリセット
         self._end_screen_pending_turn = None       # 前試合のWIN/LOSE待ち状態をリセット
         self._end_screen_pending_deadline = None
@@ -3090,7 +3164,10 @@ class Pipeline:
                         _end_joined = "".join(r["text"] for r in _end_ocr)
                         self._end_screen_ocr_texts.append(_end_joined)
                         if self._end_screen_count >= self._END_SCREEN_CONFIRM:
-                            _kw_matched, _result = _check_end_screen_ocr(self._end_screen_ocr_texts)
+                            _kw_matched, _result, _opp_name = _check_end_screen_ocr(self._end_screen_ocr_texts)
+                            if _opp_name and self._opponent_trainer_name is None:
+                                self._opponent_trainer_name = _opp_name
+                                log.debug(f"[終了画面] 相手トレーナー名を取得: {_opp_name}")
                             if not _kw_matched:
                                 log.info(f"[YOLO] 終了画面{self._end_screen_count}回検出 → OCRキーワード不一致のため誤発火と判定 (OCR: {''.join(self._end_screen_ocr_texts)[:60]})")
                                 self._end_screen_count = 0
@@ -3099,6 +3176,11 @@ class Pipeline:
                                 # 降参終了（「降参が選ばれました」）: このテキストには勝敗情報が
                                 # 無いため即発行せず、約10秒後に出るWIN/LOSEロゴ画面を待つ
                                 # （2026-08-12実機フレーム確認で発見。パス1検証25本中12本で頻発）。
+                                # ⚠️2026-08-14発見: 「降参が選ばれました」の数秒後に通常の
+                                # 「勝負に勝った/負けた」テキストが出るケースがある
+                                # （相手が降参した場合等・実機2026-06-06_17-12-07で確認）ため、
+                                # 待機中も_process_event呼び出し直前のループでこのテキストを
+                                # 優先的に監視する（下記「降参終了のWIN/LOSE画面待ち」参照）。
                                 log.info(f"[YOLO] 終了画面を{self._end_screen_count}回連続検出（降参・勝敗未確定）→ WIN/LOSE画面を最大{self._END_SCREEN_WIN_LOSE_TIMEOUT:.0f}秒待機")
                                 self._end_screen_count = 0
                                 self._end_screen_ocr_texts = []
@@ -3135,7 +3217,25 @@ class Pipeline:
                 # ここまで遅らせることで、キューに積む時点で正しいbattle_resultを持たせる。
                 if self._end_screen_pending_deadline is not None:
                     _wl_ocr = run_ocr(self._reader, frame)
-                    _wl_result = _detect_result_from_win_lose_ocr(_wl_ocr, frame.shape[1])
+                    _wl_joined = "".join(r["text"] for r in _wl_ocr)
+                    # 2026-08-14発見: 「降参が選ばれました」の数秒後に通常の
+                    # 「勝負に勝った/負けた」テキストが出るケースがある（相手が降参した
+                    # 場合等）。従来はWIN/LOSE画面しか監視しておらずこのテキストを
+                    # 完全に見逃していた（実機2026-06-06_17-12-07で確認: 478.0s「降参が
+                    # 選ばれました」→480.0s「〜との勝負に勝った！」→485.0s WIN/LOSE画面、
+                    # という順で通常テキストの方が先に出ていた）ため、WIN/LOSE画面より
+                    # 優先してこちらを試す。
+                    _wl_result = _detect_battle_result(_wl_joined)
+                    if _wl_result is None:
+                        # 相手トレーナー名が未取得ならここでも拾っておく（WIN/LOSE画面の
+                        # 左右判定に使う。「降参が選ばれました」画面自体には名前が
+                        # 含まれないため、この待機中に初めて取得できることもある）
+                        if self._opponent_trainer_name is None:
+                            _opp_name = _extract_opponent_trainer_name(_wl_joined)
+                            if _opp_name:
+                                self._opponent_trainer_name = _opp_name
+                                log.debug(f"[終了画面] 相手トレーナー名を取得: {_opp_name}")
+                        _wl_result = _detect_result_from_win_lose_ocr(_wl_ocr, self._opponent_trainer_name)
                     _wl_timed_out = self._now() >= self._end_screen_pending_deadline
                     if _wl_result is not None or _wl_timed_out:
                         if _wl_result is not None:
@@ -3759,6 +3859,7 @@ class Pipeline:
             bedrock_commentary, bedrock_analysis = _call_bedrock_vision(
                 self._ec2_url, frame, game_state, event_type,
                 self._commentary_history, battle_context, self._classifier, move_log,
+                persona=self._persona,
             )
             if bedrock_commentary:
                 log.info(f"Bedrock 完了 ({time.perf_counter()-t0:.2f}s): 「{bedrock_commentary}」")
@@ -3789,7 +3890,7 @@ class Pipeline:
             return
 
         # 保留・困惑応答は「AIグリッチ」定型文に差し替える（VOICEVOX合成前）
-        commentary = _replace_glitch_commentary(commentary)
+        commentary = _replace_glitch_commentary(commentary, persona=self._persona)
 
         self._commentary_history.append(commentary)
         if len(self._commentary_history) > 5:
@@ -3892,6 +3993,7 @@ class Pipeline:
             bedrock_commentary, bedrock_analysis = _call_bedrock_text(
                 self._ec2_url, ev["game_state"], ev["event_type"], history,
                 ev["battle_context"], self._classifier, ev["move_log"],
+                persona=self._persona,
             )
             if bedrock_commentary:
                 commentary = _clean_commentary(bedrock_commentary)
@@ -3912,7 +4014,7 @@ class Pipeline:
 
             # 保留・困惑応答は「AIグリッチ」定型文に差し替える（VOICEVOX合成前・
             # manifest.jsonlに問題テキストを一度も書き込ませない）
-            commentary = _replace_glitch_commentary(commentary)
+            commentary = _replace_glitch_commentary(commentary, persona=self._persona)
 
             history.append(commentary)
             if len(history) > 5:
@@ -5172,6 +5274,12 @@ def main() -> None:
                         help="PokeClassifier のポケモン fuzzy マッチ対象（デフォルト: sv=全1025匹）。"
                              "'champions' 指定時は champions_pokemon テーブルの許可リストのみに絞り込む"
                              "（要 scripts/update_champions_roster.py によるデータ投入）。")
+    parser.add_argument("--persona", default="kurepi", choices=["kurepi", "neutral"],
+                        help="実況のキャラクター設定（デフォルト: kurepi=花圓くれぴ）。"
+                             "'neutral' 指定時は花圓くれぴの名前・自称・口調を含まない"
+                             "中立実況になる（3Dモデル一時差し替え検証用のオプション・"
+                             "2026-08-14）。--ec2-url使用時はEC2側server.pyにも同じ変更を"
+                             "デプロイしないとBedrock経路には反映されない点に注意。")
 
     args = parser.parse_args()
 
@@ -5190,6 +5298,7 @@ def main() -> None:
         video_sample_fps=args.video_fps,
         render_out=args.render_out,
         game_mode=args.game_mode,
+        persona=args.persona,
     )
     pipeline.run()
 

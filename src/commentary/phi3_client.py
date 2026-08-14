@@ -44,11 +44,18 @@ class Phi3Client:
         # Bedrock失敗時のフォールバックとして同期呼び出しされるため、メインループを
         # 長時間ブロックしないよう、プライマリ経路（Bedrock, timeout=15s）と近い値に
         # 抑える。旧値60sはOllamaハング時にメインループを最大60秒止めてしまっていた。
+        persona: str = "kurepi",
+        # 2026-08-14: 3Dモデル一時差し替え検証用（--persona neutral）。
+        # "kurepi"=花圓くれぴ（デフォルト・従来動作）/"neutral"=中立実況口調
     ):
         self.ollama_url = ollama_url
         self.model = model
         self.history_size = history_size
         self.timeout = timeout
+        # 属性名は`self.persona`にしない: このファイルは
+        # `from src.commentary import kurepi_persona as persona` でモジュールを
+        # `persona`という名前でimportしているため、同名だと紛らわしい
+        self._persona = persona
         self._history: list[str] = []
 
     def generate_commentary(
@@ -129,7 +136,8 @@ class Phi3Client:
 
     def _build_prompt(self, game_state: dict, bedrock_analysis: str | None,
                       battle_context: dict | None) -> str:
-        lines = [persona.CHARACTER_INTRO, ""]
+        intro = persona.CHARACTER_INTRO if self._persona == "kurepi" else persona.NEUTRAL_CHARACTER_INTRO
+        lines = [intro, ""]
         lines += persona.DOUBLES_TACTICS_LINES + [""]
         lines += persona.SLANG_GLOSSARY_LINES + [""]
         lines += persona.OUTPUT_RULES_LINES

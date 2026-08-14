@@ -174,6 +174,30 @@ class TestBuildPrompt:
         assert "場(自)=ガブリアス | 場(相)=リキキリン" in prompt
 
 
+class TestPersonaSwitch:
+    """2026-08-14新設: 3Dモデル一時差し替え検証用のpersona="neutral"切り替え
+    （--persona neutral）。デフォルトは"kurepi"のまま従来動作を維持する。"""
+
+    def test_default_persona_is_kurepi(self):
+        client = Phi3Client()
+        prompt = client._build_prompt({"event_type": "move_used", "status": "なし"}, None, None)
+        assert "花圓くれぴ" in prompt
+
+    def test_neutral_persona_excludes_kurepi_name(self):
+        client = Phi3Client(persona="neutral")
+        prompt = client._build_prompt({"event_type": "move_used", "status": "なし"}, None, None)
+        assert "くれぴ" not in prompt
+        assert "花圓" not in prompt
+
+    def test_neutral_persona_still_contains_output_rules(self):
+        """SLANG_GLOSSARY_LINES/OUTPUT_RULES_LINESはキャラ非依存のため両ペルソナで
+        共用されること（差し替え不要な部分が誤って消えていないことの確認）。"""
+        client = Phi3Client(persona="neutral")
+        prompt = client._build_prompt({"event_type": "move_used", "status": "なし"}, None, None)
+        assert "了解しました" in prompt  # OUTPUT_RULES_LINES由来
+        assert "集中攻撃" in prompt  # SLANG_GLOSSARY_LINES由来
+
+
 class TestGenerateCommentary:
     def test_success_returns_stripped_text_and_updates_history(self, client):
         mock_response = MagicMock()

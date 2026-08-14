@@ -30,12 +30,14 @@ from src.pipeline import (
     _detect_battle_result,
     _detect_glitch_cause,
     _detect_result_from_win_lose_ocr,
+    _extract_opponent_trainer_name,
     _extract_structured_info,
     _is_battle_screen,
     _ocr_results_to_text,
     _replace_glitch_commentary,
     _GLITCH_CAUSE_KEYWORDS,
     _GLITCH_TEMPLATES,
+    _GLITCH_TEMPLATES_NEUTRAL,
     BattleMessageParser,
     BattlePhaseClassifier,
     BattleStateTracker,
@@ -207,6 +209,23 @@ class TestDetectBattleResult:
         assert _build_bedrock_context(gs2, "move_used", None, None, [])["battle_result"] == ""
 
 
+class TestBuildBedrockContextPersona:
+    """2026-08-14新設: 3Dモデル一時差し替え検証用のpersona伝播（--persona neutral）。"""
+
+    def _gs(self):
+        return {"ocr_text": "", "hp_values": [], "balls_remaining": [],
+                "name_candidates_player": [], "name_candidates_opponent": [],
+                "status": "なし"}
+
+    def test_default_persona_is_kurepi(self):
+        ctx = _build_bedrock_context(self._gs(), "move_used", None, None, [])
+        assert ctx["persona"] == "kurepi"
+
+    def test_persona_neutral_passed_through(self):
+        ctx = _build_bedrock_context(self._gs(), "move_used", None, None, [], persona="neutral")
+        assert ctx["persona"] == "neutral"
+
+
 class TestCheckEndScreenOcr:
     """終了画面連続確認の複数フレーム分OCRを結合して判定する_check_end_screen_ocr。
     battle_result未検出バグ（07-03-23-34-29）は3回目確認フレーム1枚のOCRだけに
@@ -215,78 +234,133 @@ class TestCheckEndScreenOcr:
 
     def test_keyword_and_result_in_last_frame_only(self):
         """1・2枚目はまだ文字が出ておらず、3枚目でようやく出揃うケース（フェードイン想定）。"""
-        matched, result = _check_end_screen_ocr(["", "選ばれ", "勝負に勝った!"])
+        matched, result, opp_name = _check_end_screen_ocr(["", "選ばれ", "勝負に勝った!"])
         assert matched is True
         assert result == "勝ち"
+        assert opp_name is None
 
     def test_result_split_across_frames(self):
         """「勝負に」と「負けた!」が別フレームに分かれて出るケース。"""
-        matched, result = _check_end_screen_ocr(["勝負に", "負けた!"])
+        matched, result, opp_name = _check_end_screen_ocr(["勝負に", "負けた!"])
         assert matched is True
         assert result == "負け"
 
     def test_no_keyword_in_any_frame_is_not_matched(self):
-        matched, result = _check_end_screen_ocr(["", "", ""])
+        matched, result, opp_name = _check_end_screen_ocr(["", "", ""])
         assert matched is False
         assert result is None
+        assert opp_name is None
 
     def test_keyword_matched_but_result_undetermined(self):
         """「選ばれました」（降参等）はキーワード一致するが勝敗は不明のままNone。"""
-        matched, result = _check_end_screen_ocr(["降参が選ばれました"])
+        matched, result, opp_name = _check_end_screen_ocr(["降参が選ばれました"])
         assert matched is True
         assert result is None
+        assert opp_name is None
+
+    def test_opponent_trainer_name_extracted_when_present(self):
+        """2026-08-14新設: 「〜との勝負に勝った/負けた」から相手トレーナー名も
+        同時に抽出する（WIN/LOSE画面の左右判定用）。"""
+        matched, result, opp_name = _check_end_screen_ocr(["ニシキノマキとの勝負に勝った!"])
+        assert matched is True
+        assert result == "勝ち"
+        assert opp_name == "ニシキノマキ"
+
+
+class TestExtractOpponentTrainerName:
+    """_extract_opponent_trainer_name: 2026-08-14新設。「〜との勝負に勝った/負けた」
+    から相手トレーナー名を抽出する（WIN/LOSE画面の左右判定用）。"""
+
+    def test_extracts_name_before_tono(self):
+        assert _extract_opponent_trainer_name("ニシキノマキとの勝負に勝った!") == "ニシキノマキ"
+
+    def test_extracts_name_with_lose(self):
+        assert _extract_opponent_trainer_name("ニシキノマキとの勝負に負けた!") == "ニシキノマキ"
+
+    def test_ocr_fragments_joined_with_slash(self):
+        """_detect_battle_resultと同様、スラッシュ区切り結合を吸収する。"""
+        assert _extract_opponent_trainer_name("bennyとの / 勝負に / 勝った!") == "benny"
+
+    def test_no_match_returns_none(self):
+        assert _extract_opponent_trainer_name("降参が選ばれました") is None
+        assert _extract_opponent_trainer_name("") is None
 
 
 class TestDetectResultFromWinLoseOcr:
-    """降参終了時、「降参が選ばれました」の約10秒後に出るWIN/LOSEロゴ画面から
+    """降参終了時、「降参が選ばれました」の後に出るWIN/LOSEロゴ画面から
     勝敗を判定する_detect_result_from_win_lose_ocr（2026-08-12実機フレーム確認で追加）。
-    自分は常に画面右半分に表示される仕様。"""
 
-    FRAME_W = 1920
+    2026-08-14: 左右判定を「自分は常に画面右半分」の固定前提から、既知の相手
+    トレーナー名との照合方式に変更した。実機`2026-06-06_17-12-07`で自分が左側・
+    相手が右側のケースを確認し、旧前提（実機2本のみが根拠）が誤りと判明したため。
+    """
 
     def _bbox(self, cx: float):
         # 中心x座標cxの適当な矩形bboxを作る（幅100想定）
         return [[cx - 50, 500], [cx + 50, 500], [cx + 50, 560], [cx - 50, 560]]
 
-    def test_win_on_right_means_self_wins(self):
-        ocr = [{"text": "WIN", "bbox": self._bbox(1500), "confidence": 0.9}]
-        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "勝ち"
-
-    def test_win_on_left_means_self_loses(self):
-        """自分（右）がLOSE側だと、WINは相手（左）に出る。"""
-        ocr = [{"text": "WIN", "bbox": self._bbox(400), "confidence": 0.9}]
-        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "負け"
-
-    def test_lose_on_right_means_self_loses(self):
-        ocr = [{"text": "LOSE", "bbox": self._bbox(1500), "confidence": 0.9}]
-        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "負け"
-
-    def test_lose_on_left_means_self_wins(self):
-        ocr = [{"text": "LOSE", "bbox": self._bbox(400), "confidence": 0.9}]
-        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "勝ち"
-
-    def test_both_win_and_lose_present_uses_first_match(self):
-        """通常は両方同時に出る（自分側と相手側）。どちらから見ても矛盾しない結果になる。"""
+    def test_opponent_name_near_lose_means_self_wins(self):
+        """相手名がLOSE側に近い＝相手の負け＝自分の勝ち。"""
         ocr = [
-            {"text": "LOSE", "bbox": self._bbox(400), "confidence": 0.9},
-            {"text": "WIN", "bbox": self._bbox(1500), "confidence": 0.9},
+            {"text": "WIN", "bbox": self._bbox(400), "confidence": 0.9},
+            {"text": "LOSE", "bbox": self._bbox(1500), "confidence": 0.9},
+            {"text": "ニシキノマキ", "bbox": self._bbox(1520), "confidence": 0.9},
         ]
-        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "勝ち"
+        assert _detect_result_from_win_lose_ocr(ocr, "ニシキノマキ") == "勝ち"
+
+    def test_opponent_name_near_win_means_self_loses(self):
+        """相手名がWIN側に近い＝相手の勝ち＝自分の負け。"""
+        ocr = [
+            {"text": "WIN", "bbox": self._bbox(400), "confidence": 0.9},
+            {"text": "LOSE", "bbox": self._bbox(1500), "confidence": 0.9},
+            {"text": "ニシキノマキ", "bbox": self._bbox(420), "confidence": 0.9},
+        ]
+        assert _detect_result_from_win_lose_ocr(ocr, "ニシキノマキ") == "負け"
+
+    def test_self_on_left_actual_case_reproduction(self):
+        """2026-08-14実機実例の再現（自分が左・WIN側、相手ニシキノマキが右・LOSE側）。
+        従来の「右=自分」固定判定ならこのケースを誤判定していた回帰ガード。"""
+        ocr = [
+            {"text": "WIN", "bbox": self._bbox(300), "confidence": 0.9},
+            {"text": "LOSE", "bbox": self._bbox(1600), "confidence": 0.9},
+            {"text": "ニシキノマキ", "bbox": self._bbox(1650), "confidence": 0.9},
+        ]
+        assert _detect_result_from_win_lose_ocr(ocr, "ニシキノマキ") == "勝ち"
+
+    def test_no_opponent_name_returns_none(self):
+        """相手トレーナー名が未取得（None）の場合は判定不能（安全側に倒す）。"""
+        ocr = [
+            {"text": "WIN", "bbox": self._bbox(400), "confidence": 0.9},
+            {"text": "LOSE", "bbox": self._bbox(1500), "confidence": 0.9},
+        ]
+        assert _detect_result_from_win_lose_ocr(ocr, None) is None
+
+    def test_opponent_name_not_found_in_ocr_returns_none(self):
+        """相手名は分かっていても画面内OCRに見つからなければ判定不能。"""
+        ocr = [
+            {"text": "WIN", "bbox": self._bbox(400), "confidence": 0.9},
+            {"text": "LOSE", "bbox": self._bbox(1500), "confidence": 0.9},
+        ]
+        assert _detect_result_from_win_lose_ocr(ocr, "ニシキノマキ") is None
 
     def test_no_win_lose_text_returns_none(self):
-        ocr = [{"text": "ヒシン", "bbox": self._bbox(400), "confidence": 0.9}]
-        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) is None
+        ocr = [{"text": "ニシキノマキ", "bbox": self._bbox(400), "confidence": 0.9}]
+        assert _detect_result_from_win_lose_ocr(ocr, "ニシキノマキ") is None
 
     def test_empty_ocr_returns_none(self):
-        assert _detect_result_from_win_lose_ocr([], self.FRAME_W) is None
+        assert _detect_result_from_win_lose_ocr([], "ニシキノマキ") is None
 
     def test_missing_bbox_is_skipped(self):
         ocr = [{"text": "WIN", "bbox": None, "confidence": 0.9}]
-        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) is None
+        assert _detect_result_from_win_lose_ocr(ocr, "ニシキノマキ") is None
 
-    def test_case_insensitive(self):
-        ocr = [{"text": "win", "bbox": self._bbox(1500), "confidence": 0.9}]
-        assert _detect_result_from_win_lose_ocr(ocr, self.FRAME_W) == "勝ち"
+    def test_case_insensitive_win_lose(self):
+        ocr = [
+            {"text": "win", "bbox": self._bbox(400), "confidence": 0.9},
+            {"text": "lose", "bbox": self._bbox(1500), "confidence": 0.9},
+            {"text": "ニシキノマキ", "bbox": self._bbox(1520), "confidence": 0.9},
+        ]
+        assert _detect_result_from_win_lose_ocr(ocr, "ニシキノマキ") == "勝ち"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -349,6 +423,26 @@ class TestGlitchCommentary:
             assert not pat.search(template)
         for _, cause in _GLITCH_CAUSE_KEYWORDS:
             assert not pat.search(cause)
+
+    def test_neutral_templates_have_no_emoji(self):
+        import re as _re
+        pat = _re.compile("[\U0001F300-\U0001FAFF]")
+        for template in _GLITCH_TEMPLATES_NEUTRAL:
+            assert not pat.search(template)
+
+    def test_neutral_persona_replace_excludes_kurepi(self):
+        """2026-08-14新設: persona="neutral"時は「くれぴ」を含まない定型文に差し替わる
+        （3Dモデル一時差し替え検証用）。"""
+        replaced = _replace_glitch_commentary(
+            "データが矛盾していて実況できません", persona="neutral")
+        expected = [t.format(cause="データがちぐはぐさん") for t in _GLITCH_TEMPLATES_NEUTRAL]
+        assert replaced in expected
+        assert "くれぴ" not in replaced
+
+    def test_default_persona_replace_still_uses_kurepi_templates(self):
+        replaced = _replace_glitch_commentary("データが矛盾していて実況できません")
+        expected = [t.format(cause="データがちぐはぐさん") for t in _GLITCH_TEMPLATES]
+        assert replaced in expected
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

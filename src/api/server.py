@@ -127,6 +127,28 @@ _TONE_EXAMPLES: list[tuple[str, str]] = [
      "うわっ範囲技が両方に直撃！？でもまだ大丈夫、ここからしっかり受けていくよ！"),
 ]
 
+# 2026-08-14: persona="neutral"用（3Dモデル一時差し替え検証用・花圓くれぴの名前・
+# 自称・タメ口・♪を含まない中立実況）。src/commentary/kurepi_persona.pyの
+# NEUTRAL_CHARACTER_INTRO/NEUTRAL_TONE_EXAMPLESと手動同期すること
+# （このファイルはboto3/flask依存でkurepi_persona.pyをimportできないため）。
+_NEUTRAL_CHARACTER_INTRO_LINES = [
+    "あなたは、ポケモン対戦実況AIVTuberです。",
+    "テンション高めだが落ち着いた、中立的な実況口調で話してください"
+    "（キャラクターとしての自己紹介・名乗り・一人称のキャラ付けはしないこと）。",
+    "あなたは「自分」側（プレイヤー側）の視点で、自分側を応援する立場で実況します。"
+    "「自分の」「相手の」の帰属は下記の戦況リストに厳密に従い、"
+    "相手のポケモンを自分のもののように（またはその逆に）語らないこと。",
+]
+
+_NEUTRAL_TONE_EXAMPLES: list[tuple[str, str]] = [
+    ("自分の場の2匹が、相手の1匹に技を集中させた",
+     "狙うは1匹！2匹がかりの集中攻撃、これは決まってほしいところです！"),
+    ("自分のポケモンがつるぎのまいで能力を上げた",
+     "ここで積んできました。攻撃力アップで一気に展開のチャンスが広がります"),
+    ("相手の範囲技が自分の場の2匹に着弾した",
+     "範囲技が両方に直撃！しかしまだ大丈夫、ここからしっかり受けていきます"),
+]
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -168,17 +190,27 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
             "battle_end":   "試合終了を締めくくる実況をする",
         }.get(event_type, "状況を実況する")
 
+    # 2026-08-14: persona="neutral"（3Dモデル一時差し替え検証用）は花圓くれぴの
+    # 名前・自称・口調を含まない中立版のキャラ設定ブロックに差し替える
+    persona_mode = context.get("persona", "kurepi")
+    if persona_mode == "neutral":
+        intro_lines = [*_NEUTRAL_CHARACTER_INTRO_LINES, ""]
+    else:
+        intro_lines = [
+            "あなたは、ポケモン対戦実況AIVTuber「花圓くれぴ（はなまるくれぴ）」です。",
+            "性格は元気で甘えん坊、でもポケモン知識はガチ勢。",
+            "口調はアイドル・かわいい系（語尾に♪を適度に使う・タメ口・テンション高め・"
+            "かわいい褒め言葉多め）で実況しつつ、技名やHP等の情報は正確に伝えてください。",
+            "自称は「くれぴ」（ひらがな）。「花圓」という漢字表記は実況文に書かないこと"
+            "（音声合成が正しく読めないため）。",
+            "あなたは「自分」側（プレイヤー側）の視点で、自分側を応援する立場で実況します。"
+            "「自分の」「相手の」の帰属は下記の戦況リストに厳密に従い、"
+            "相手のポケモンを自分のもののように（またはその逆に）語らないこと。",
+            "",
+        ]
+
     lines = [
-        "あなたは、ポケモン対戦実況AIVTuber「花圓くれぴ（はなまるくれぴ）」です。",
-        "性格は元気で甘えん坊、でもポケモン知識はガチ勢。",
-        "口調はアイドル・かわいい系（語尾に♪を適度に使う・タメ口・テンション高め・"
-        "かわいい褒め言葉多め）で実況しつつ、技名やHP等の情報は正確に伝えてください。",
-        "自称は「くれぴ」（ひらがな）。「花圓」という漢字表記は実況文に書かないこと"
-        "（音声合成が正しく読めないため）。",
-        "あなたは「自分」側（プレイヤー側）の視点で、自分側を応援する立場で実況します。"
-        "「自分の」「相手の」の帰属は下記の戦況リストに厳密に従い、"
-        "相手のポケモンを自分のもののように（またはその逆に）語らないこと。",
-        "",
+        *intro_lines,
         "【ダブルバトルの基本知識】",
         "- 各プレイヤーが2匹ずつ場に出す（合計4匹が同時に戦う）",
         "- 技名（テラクラスター・アストラルビット・フレアドライブ等）はポケモン名ではなく技の名前",
@@ -321,7 +353,8 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
         "",
         "【口調のイメージ例（この試合とは無関係な架空例・内容は真似しなくてよい）】",
     ]
-    for situation, commentary in _TONE_EXAMPLES:
+    tone_examples = _TONE_EXAMPLES if persona_mode == "kurepi" else _NEUTRAL_TONE_EXAMPLES
+    for situation, commentary in tone_examples:
         lines += ["【状況】", f"（{situation}）", "【実況】", commentary, ""]
     lines += [
         "【状況】",
@@ -369,7 +402,8 @@ def _gap_filler_count(start: float, end: float) -> int:
     return max(1, min(3, int((end - start) // 40)))
 
 
-def _build_script_prompt(gap: dict, events: list, moments: list = None) -> str:
+def _build_script_prompt(gap: dict, events: list, moments: list = None,
+                          persona: str = "kurepi") -> str:
     """台本パス（ギャップフィラー生成）のプロンプトを組み立てる。
 
     録画解析済みの実況タイムライン・瞬間ログ（技が画面に映った動画内時刻）
@@ -380,18 +414,35 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None) -> str:
     未来の情報を「見せた上で使うな」と指示するだけでは指示に従い損ねて
     ネタバレする実例があったため（2026-07-14）、そもそも未来の events/moments
     をプロンプトに含めない構造的対策にしている。
+
+    persona: "kurepi"（デフォルト・花圓くれぴ）/"neutral"（3Dモデル一時差し替え
+    検証用・2026-08-14）。
     """
     first_event_time = min(float(e.get("time", 0)) for e in events)
     gap_start = float(gap["start"])
     gap_end = float(gap["end"])
 
+    if persona == "neutral":
+        intro_lines = [
+            "あなたは、ポケモン対戦実況AIVTuberです。",
+            "テンション高めだが落ち着いた、中立的な実況口調で話してください"
+            "（キャラクターとしての自己紹介・名乗り・一人称のキャラ付けはしないこと）。",
+            "あなたは「自分」側（プレイヤー側）の視点で、自分側を応援する立場で実況します。",
+        ]
+    else:
+        intro_lines = [
+            "あなたは、ポケモン対戦実況AIVTuber「花圓くれぴ（はなまるくれぴ）」です。",
+            "性格は元気で甘えん坊、でもポケモン知識はガチ勢。口調はアイドル・かわいい系",
+            "（語尾に♪を適度に使う・タメ口・テンション高め・かわいい褒め言葉多め）。",
+            "自称は「くれぴ」（ひらがな）。「花圓」という漢字表記は実況文に書かないこと"
+            "（音声合成が正しく読めないため）。",
+            "あなたは「自分」側（プレイヤー側）の視点で、自分側を応援する立場で実況します。",
+        ]
+
+    tone_examples = _TONE_EXAMPLES if persona == "kurepi" else _NEUTRAL_TONE_EXAMPLES
+
     lines = [
-        "あなたは、ポケモン対戦実況AIVTuber「花圓くれぴ（はなまるくれぴ）」です。",
-        "性格は元気で甘えん坊、でもポケモン知識はガチ勢。口調はアイドル・かわいい系",
-        "（語尾に♪を適度に使う・タメ口・テンション高め・かわいい褒め言葉多め）。",
-        "自称は「くれぴ」（ひらがな）。「花圓」という漢字表記は実況文に書かないこと"
-        "（音声合成が正しく読めないため）。",
-        "あなたは「自分」側（プレイヤー側）の視点で、自分側を応援する立場で実況します。",
+        *intro_lines,
         "ポケモンの「自分の」「相手の」の帰属はタイムラインの記載（【自分側】【相手側】タグ・",
         "戦況の場/控え情報）に厳密に従い、タグや記載がなく判別できない場合は",
         "「自分の/相手の」を付けずにポケモン名だけで実況すること（推測で断定しない）。",
@@ -405,7 +456,7 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None) -> str:
         *_SLANG_GLOSSARY_LINES,
         "",
         "【口調のイメージ例（この試合とは無関係な架空例・内容は真似しなくてよい）】",
-        *[f"- {commentary}" for _situation, commentary in _TONE_EXAMPLES],
+        *[f"- {commentary}" for _situation, commentary in tone_examples],
         "",
         "【最重要ルール: ネタバレ禁止】",
         "- 各フィラーは、その time 時点までに起きた出来事の情報だけを使うこと",
@@ -637,12 +688,14 @@ def script():
     events: list = data.get("events", [])
     gap = data.get("gap")
     moments: list = data.get("moments", [])
+    # 2026-08-14: 3Dモデル一時差し替え検証用（"kurepi"デフォルト/"neutral"）
+    persona: str = data.get("persona", "kurepi")
     if not events:
         return jsonify({"success": False, "error": "missing_events", "message": "events が必要です"}), 400
     if not isinstance(gap, dict) or "start" not in gap or "end" not in gap:
         return jsonify({"success": False, "error": "missing_gap", "message": "gap（start/endを持つオブジェクト）が必要です"}), 400
 
-    prompt_text = _build_script_prompt(gap, events, moments)
+    prompt_text = _build_script_prompt(gap, events, moments, persona=persona)
     request_body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 4000,

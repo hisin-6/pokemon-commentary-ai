@@ -68,6 +68,9 @@ _LABEL_MAX_LINES = 2
 _BADGE_TEXT = "AI実況"
 _BADGE_COLOR = (255, 64, 129, 235)
 _CHARACTER_NAME = "花圓くれぴ"
+# 2026-08-14: persona="neutral"用（3Dモデル一時差し替え検証用）のキャラ名表記。
+# pipeline.py/server.pyのpersona分岐と同じパターン
+_CHARACTER_NAME_NEUTRAL = "VOICEVOX：四国めたん"
 
 # ── 構築（チーム編成）アイコン ─────────────────────────────────────────────
 # pokedb.sqlite（scripts/build_pokedb.py がPokeAPIから構築した図鑑DB）で
@@ -272,12 +275,18 @@ def _wrap_to_lines(draw, text: str, font, max_width: float, max_lines: int = _LA
 
 def compose_thumbnail(frame_png: Path, out_png: Path, label: str,
                       avatar_face_png: Path | None = None,
-                      roster_icon_pngs: list[Path] | None = None) -> None:
+                      roster_icon_pngs: list[Path] | None = None,
+                      character_name: str = _CHARACTER_NAME,
+                      big_logo_text: str = "AI自動実況") -> None:
     """抜き出したフレームに下部帯＋テキスト（実測幅で折り返し）を焼き込む（PIL）。
 
     avatar_face_png / roster_icon_pngs を渡すと、右上にアバターの顔・キャプション帯の
     直上に構築アイコン列も焼き込む（AIVTuberサムネ刷新・2026-08-04）。どちらも省略時は
     従来通りゲーム画面＋テキスト帯＋AI実況バッジのみのシンプル版になる。
+    character_name: バッジ下に焼き込むキャラ名（既定=花圓くれぴ・persona="neutral"時は
+    呼び出し側から_CHARACTER_NAME_NEUTRALを渡すこと）。
+    big_logo_text: label=""（盛り上がりシーンの字幕なし）時に代わりに表示する大きな
+    ロゴテキスト。幅に収まらなければ_wrap_to_linesで自動2行折り返しする。
     """
     from PIL import Image, ImageDraw, ImageFont
 
@@ -300,12 +309,47 @@ def compose_thumbnail(frame_png: Path, out_png: Path, label: str,
     text = _truncate_label(label, max_chars=_LABEL_MAX_CHARS)
     lines = _wrap_to_lines(draw, text, font, max_width) if text else []
 
-    line_height = int(font_size * 1.25)
-    total_text_h = line_height * len(lines)
-    start_y = h - bar_h + max(0, (bar_h - total_text_h) // 2)
-    for i, line in enumerate(lines):
-        draw.text((pad_x, start_y + i * line_height), line, font=font,
-                  fill=(255, 255, 255, 255), stroke_width=3, stroke_fill=(0, 0, 0, 255))
+    if lines:
+        line_height = int(font_size * 1.25)
+        total_text_h = line_height * len(lines)
+        start_y = h - bar_h + max(0, (bar_h - total_text_h) // 2)
+        for i, line in enumerate(lines):
+            draw.text((pad_x, start_y + i * line_height), line, font=font,
+                      fill=(255, 255, 255, 255), stroke_width=3, stroke_fill=(0, 0, 0, 255))
+    else:
+        # 2026-08-14: label未指定（盛り上がりシーンの字幕なし）の場合、
+        # 実況キャプションの代わりに大きなロゴテキストを表示する
+        # （--no-roster-iconsと組み合わせてテキストのみのシンプルなサムネにする用途）
+        big_size = int(bar_h * 0.55)
+        big_font = ImageFont.truetype(font_path, size=big_size) if font_path else font
+        if "\n" in big_logo_text:
+            # 明示的な改行が指定されている場合はそれを優先する（自動折り返しだと
+            # "AI"のような英字トークンの途中で割れて不自然になることがあるため。
+            # 2026-08-14実機で発見: "ポケモンダブルバトルA"/"I自動実況"のように
+            # 割れた）
+            big_lines = big_logo_text.split("\n")
+        else:
+            big_lines = _wrap_to_lines(draw, big_logo_text, big_font, max_width, max_lines=2)
+        if len(big_lines) > 1:
+            # 2行になる場合は帯の高さに収まるようフォントだけ縮小する
+            # （行の内容=big_linesは固定。縮小後に再wrapすると1行に収まり直して
+            # 折り返し結果が消えてしまうバグを2026-08-14に踏んだため、再wrapしない）
+            big_size = int(bar_h * 0.36)
+            big_font = ImageFont.truetype(font_path, size=big_size) if font_path else font
+            max_line_w = max(draw.textbbox((0, 0), ln, font=big_font)[2] for ln in big_lines)
+            while max_line_w > max_width and big_size > 10:
+                big_size = int(big_size * 0.9)
+                big_font = ImageFont.truetype(font_path, size=big_size) if font_path else font
+                max_line_w = max(draw.textbbox((0, 0), ln, font=big_font)[2] for ln in big_lines)
+
+        big_line_height = int(big_size * 1.15)
+        total_big_h = big_line_height * len(big_lines)
+        start_big_y = h - bar_h + max(0, (bar_h - total_big_h) // 2)
+        for i, ln in enumerate(big_lines):
+            bbox = draw.textbbox((0, 0), ln, font=big_font)
+            draw.text((pad_x, start_big_y + i * big_line_height - bbox[1]), ln,
+                      font=big_font, fill=(102, 204, 255, 255),
+                      stroke_width=4, stroke_fill=(0, 0, 0, 255))
 
     # ── AI実況バッジ＋キャラ名（左上）──────────────────────────────────────
     badge_font = ImageFont.truetype(font_path, size=max(1, int(h * 0.035))) if font_path else font
@@ -322,7 +366,7 @@ def compose_thumbnail(frame_png: Path, out_png: Path, label: str,
               stroke_width=2, stroke_fill=(0, 0, 0, 200))
 
     name_font = ImageFont.truetype(font_path, size=max(1, int(h * 0.032))) if font_path else font
-    draw.text((badge_x, badge_y + badge_h + int(h * 0.012)), _CHARACTER_NAME,
+    draw.text((badge_x, badge_y + badge_h + int(h * 0.012)), character_name,
               font=name_font, fill=(255, 255, 255, 255),
               stroke_width=3, stroke_fill=(0, 0, 0, 255))
 
@@ -374,7 +418,9 @@ def generate_thumbnail(render_dir: Path, video: Path = None, out: Path = None,
                        avatar_offset: float = 0.0,
                        avatar_crop: str = _AVATAR_FACE_CROP_DEFAULT,
                        pokedb_path: Path = _POKEDB_PATH,
-                       icon_cache_dir: Path = _ICON_CACHE_DIR) -> dict:
+                       icon_cache_dir: Path = _ICON_CACHE_DIR,
+                       persona: str = "kurepi",
+                       big_logo_text: str = "AI自動実況") -> dict:
     """サムネイル生成の一連の流れ。戻り値は選ばれた瞬間の情報。"""
     manifest = load_manifest(render_dir)
     states = load_states(render_dir)
@@ -421,9 +467,12 @@ def generate_thumbnail(render_dir: Path, video: Path = None, out: Path = None,
                                  for name in roster_names) if p is not None]
             roster_icon_pngs = icons or None
 
+        character_name = _CHARACTER_NAME_NEUTRAL if persona == "neutral" else _CHARACTER_NAME
         compose_thumbnail(frame_png, out, moment["label"],
                           avatar_face_png=avatar_face_png,
-                          roster_icon_pngs=roster_icon_pngs)
+                          roster_icon_pngs=roster_icon_pngs,
+                          character_name=character_name,
+                          big_logo_text=big_logo_text)
 
     return {"out": str(out), **moment}
 
@@ -450,6 +499,12 @@ def main(argv=None) -> int:
                         help="アバター録画側の頭出しオフセット・秒（render_commentary_video.pyと同じ規約）")
     parser.add_argument("--avatar-crop", default=_AVATAR_FACE_CROP_DEFAULT,
                         help=f"アバター顔のクロップ w:h:x:y（既定{_AVATAR_FACE_CROP_DEFAULT}）")
+    parser.add_argument("--persona", choices=["kurepi", "neutral"], default="kurepi",
+                        help="キャラクター設定（既定kurepi・neutralはバッジ下の名前表記を"
+                             "「VOICEVOX：四国めたん」に切り替える。パス1と同じ値を指定すること）")
+    parser.add_argument("--big-logo-text", default="AI自動実況",
+                        help="--label \"\"（字幕なし）時に表示する大きなロゴテキスト"
+                             "（既定\"AI自動実況\"・幅に収まらなければ自動2行折り返し）")
     args = parser.parse_args(argv)
 
     video = resolve_video_path(args.video) if args.video else None
@@ -462,7 +517,9 @@ def main(argv=None) -> int:
         avatar_video=Path(args.avatar_video) if args.avatar_video else None,
         avatar_time=args.avatar_time,
         avatar_offset=args.avatar_offset,
-        avatar_crop=args.avatar_crop)
+        avatar_crop=args.avatar_crop,
+        big_logo_text=args.big_logo_text,
+        persona=args.persona)
 
     logger.info("サムネイル生成完了: %s", result["out"])
     logger.info("  選択根拠: %s（t=%.1fs, score=%.1f）", result["reason"], result["time"], result["score"])

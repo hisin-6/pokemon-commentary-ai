@@ -368,6 +368,7 @@ class TestDispatchCommentaryLiveMode:
         p._ec2_url = "http://ec2.example"
         p._classifier = None
         p._move_log = []
+        p._persona = "kurepi"
         p._phi3 = MagicMock()
         p._voicevox = MagicMock()
         p._voicevox.generate_wav.return_value = _make_wav(0.3)
@@ -437,6 +438,7 @@ class TestGeneratePosthocCommentary:
         p._video_path = str(tmp_path / "battle.mp4")
         p._ec2_url = "http://ec2.example"
         p._classifier = None
+        p._persona = "kurepi"
         p._phi3 = MagicMock()
         p._voicevox = MagicMock()
         p._voicevox.generate_wav.return_value = _make_wav(0.3)
@@ -479,7 +481,7 @@ class TestGeneratePosthocCommentary:
         ]
         seen_histories = []
 
-        def fake_call(ec2_url, game_state, event_type, history, battle_context, classifier, move_log):
+        def fake_call(ec2_url, game_state, event_type, history, battle_context, classifier, move_log, **kwargs):
             seen_histories.append(list(history))
             return (f"実況{len(seen_histories)}", "a")
 
@@ -580,6 +582,7 @@ class TestGeneratePosthocCommentary:
         p1._video_path = video_path
         p1._ec2_url = "http://ec2.example"
         p1._classifier = None
+        p1._persona = "kurepi"
         p1._phi3 = MagicMock()
         p1._voicevox = MagicMock()
         p1._voicevox.generate_wav.return_value = _make_wav(0.3)
@@ -598,6 +601,7 @@ class TestGeneratePosthocCommentary:
         p2._video_path = video_path
         p2._ec2_url = "http://ec2.example"
         p2._classifier = None
+        p2._persona = "kurepi"
         p2._phi3 = MagicMock()
         p2._voicevox = MagicMock()
         p2._voicevox.generate_wav.return_value = _make_wav(0.3)

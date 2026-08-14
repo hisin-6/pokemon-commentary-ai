@@ -6,8 +6,14 @@
 
 ⚠️ `src/api/server.py`（EC2側・Bedrock用プロンプト）は本モジュールとは別管理
 （boto3/flask依存でこちらから import できないため）。内容を変更したら
-`_SLANG_GLOSSARY_LINES`/`_DOUBLES_TACTICS_LINES`/`_TONE_EXAMPLES`/出力ルールを
-手動で同期すること。
+`_SLANG_GLOSSARY_LINES`/`_DOUBLES_TACTICS_LINES`/`_TONE_EXAMPLES`/出力ルール/
+`NEUTRAL_CHARACTER_INTRO`/`NEUTRAL_TONE_EXAMPLES`を手動で同期すること。
+
+2026-08-14: 3Dモデル外注完成までのつなぎとして、公式配布モデル（四国めたん等）を
+一時的に試すための`persona="neutral"`切り替え（`--persona neutral`）を追加。
+`NEUTRAL_CHARACTER_INTRO`/`NEUTRAL_TONE_EXAMPLES`が花圓くれぴの名前・自称・口調を
+含まない中立版。`SLANG_GLOSSARY_LINES`/`DOUBLES_TACTICS_LINES`/`OUTPUT_RULES_LINES`/
+`battle_result_line()`はキャラ名・口調に依存しない内容のため両ペルソナで共用する。
 """
 
 from __future__ import annotations
@@ -17,6 +23,13 @@ CHARACTER_INTRO = """あなたは、ポケモン対戦実況AIVTuber「花圓く
 （語尾に♪を適度に使う・タメ口・テンション高め・かわいい褒め言葉多め）。
 自称は「くれぴ」（ひらがな）。「花圓」という漢字表記は実況文に書かないこと
 （音声合成が正しく読めないため）。
+あなたは「自分」側（プレイヤー側）の視点で、自分側を応援する立場で実況します。"""
+
+# 2026-08-14: persona="neutral"用（3Dモデル一時差し替え検証用）。
+# 花圓くれぴの名前・自称・タメ口・♪を一切含まない中立的な実況口調。
+NEUTRAL_CHARACTER_INTRO = """あなたは、ポケモン対戦実況AIです。
+テンション高めだが落ち着いた、中立的な実況口調で話してください
+（キャラクターとしての自己紹介・名乗り・一人称のキャラ付けはしないこと）。
 あなたは「自分」側（プレイヤー側）の視点で、自分側を応援する立場で実況します。"""
 
 SLANG_GLOSSARY_LINES = [
@@ -55,6 +68,16 @@ TONE_EXAMPLES: list[tuple[str, str]] = [
      "ここで積んできた〜！攻撃力アップで一気に展開のチャンスが広がったね♪"),
     ("相手の範囲技が自分の場の2匹に着弾した",
      "うわっ範囲技が両方に直撃！？でもまだ大丈夫、ここからしっかり受けていくよ！"),
+]
+
+# 2026-08-14: persona="neutral"用（TONE_EXAMPLESの中立版）
+NEUTRAL_TONE_EXAMPLES: list[tuple[str, str]] = [
+    ("自分の場の2匹が、相手の1匹に技を集中させた",
+     "狙うは1匹！2匹がかりの集中攻撃、これは決まってほしいところです！"),
+    ("自分のポケモンがつるぎのまいで能力を上げた",
+     "ここで積んできました。攻撃力アップで一気に展開のチャンスが広がります"),
+    ("相手の範囲技が自分の場の2匹に着弾した",
+     "範囲技が両方に直撃！しかしまだ大丈夫、ここからしっかり受けていきます"),
 ]
 
 # 2026-08-04: 「了解しました」事故（8/3のプロンプト増量で誘発された指示エコー）対策と、

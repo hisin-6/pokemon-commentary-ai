@@ -160,6 +160,30 @@ class TestRequestFillers:
         with pytest.raises(RuntimeError):
             ggc.request_fillers("http://ec2", self._events, self._gaps)
 
+    def test_default_persona_is_kurepi(self, monkeypatch):
+        calls = []
+
+        def fake_post(url, json=None, timeout=None):
+            calls.append(json)
+            return MockResponse({"success": True, "fillers": [], "usage": {}})
+
+        monkeypatch.setattr(ggc.requests, "post", fake_post)
+        ggc.request_fillers("http://ec2", self._events, self._gaps)
+
+        assert all(c["persona"] == "kurepi" for c in calls)
+
+    def test_persona_neutral_is_forwarded_to_payload(self, monkeypatch):
+        calls = []
+
+        def fake_post(url, json=None, timeout=None):
+            calls.append(json)
+            return MockResponse({"success": True, "fillers": [], "usage": {}})
+
+        monkeypatch.setattr(ggc.requests, "post", fake_post)
+        ggc.request_fillers("http://ec2", self._events, self._gaps, persona="neutral")
+
+        assert all(c["persona"] == "neutral" for c in calls)
+
 
 class MockResponse:
     def __init__(self, payload):

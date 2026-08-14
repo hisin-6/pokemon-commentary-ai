@@ -136,7 +136,8 @@ def load_timeline(render_dir: Path) -> list:
 
 
 def request_fillers(ec2_url: str, events: list, gaps: list,
-                    moments: list = None, timeout: float = 120.0) -> list:
+                    moments: list = None, timeout: float = 120.0,
+                    persona: str = "kurepi") -> list:
     """EC2 /api/script に無言区間ごとに1回ずつ送りフィラー案を集約して受け取る。
 
     ネタバレ防止のため、gapごとに個別のBedrock呼び出しにして、その区間より
@@ -160,6 +161,7 @@ def request_fillers(ec2_url: str, events: list, gaps: list,
             "events": events_payload,
             "gap": gap,
             "moments": moments_payload,
+            "persona": persona,
         }
         resp = requests.post(f"{ec2_url.rstrip('/')}/api/script", json=payload,
                              timeout=timeout)
@@ -216,6 +218,9 @@ def main(argv=None) -> int:
                         help=f"フィラー対象とする最小無言秒数（既定{_DEFAULT_MIN_GAP_SEC}）")
     parser.add_argument("--dry-run", action="store_true",
                         help="Bedrock生成結果の表示まで（VOICEVOX不要・fillers.jsonl未更新）")
+    parser.add_argument("--persona", choices=["kurepi", "neutral"], default="kurepi",
+                        help="キャラクター設定（既定kurepi・neutralは花圓くれぴの名前/口調を"
+                             "外した中立実況。パス1と同じ値を指定すること）")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -254,7 +259,7 @@ def main(argv=None) -> int:
         logger.info("timeline.jsonl なし（パス1の再実行で技の瞬間ログが付きます）")
 
     # Bedrockでフィラー生成（テキストのみ1回）→ ギャップ範囲へクランプ
-    raw_fillers = request_fillers(args.ec2_url, kept, gaps, moments)
+    raw_fillers = request_fillers(args.ec2_url, kept, gaps, moments, persona=args.persona)
     fillers, dropped = clamp_fillers_to_gaps(raw_fillers, gaps)
     for f in dropped:
         logger.warning("ギャップ範囲外のため破棄: t=%.1fs %s", f["time"], f["text"][:30])

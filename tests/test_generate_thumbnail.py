@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # scripts/ はパッケージではないためファイルパスから直接ロードする
 _SCRIPT = Path(__file__).parent.parent / "scripts" / "generate_thumbnail.py"
@@ -263,6 +263,113 @@ class TestComposeThumbnail:
         with Image.open(out) as img:
             r, g, b = img.convert("RGB").getpixel((w // 2, strip_y + strip_h // 2))
             assert (r, g, b) != (30, 30, 30)
+
+    def test_empty_label_shows_big_ai_logo_text(self, tmp_path, monkeypatch):
+        """label=""（盛り上がりシーンの字幕なし）指定時、実況キャプションの代わりに
+        大きな「AI自動実況」ロゴテキストが描画されること（2026-08-14新設）。"""
+        calls = []
+        real_text = ImageDraw.ImageDraw.text
+
+        def spy_text(self, xy, text, *args, **kwargs):
+            calls.append(text)
+            return real_text(self, xy, text, *args, **kwargs)
+
+        monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy_text)
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (1920, 1080), color=(30, 30, 30)).save(frame)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "")
+        assert "AI自動実況" in calls
+
+    def test_big_logo_text_custom_and_wraps_to_two_lines(self, tmp_path, monkeypatch):
+        """big_logo_textを指定した場合そのテキストが使われ、画面幅に収まらない
+        長さなら自動的に2行へ折り返されること（2026-08-14）。"""
+        calls = []
+        real_text = ImageDraw.ImageDraw.text
+
+        def spy_text(self, xy, text, *args, **kwargs):
+            calls.append(text)
+            return real_text(self, xy, text, *args, **kwargs)
+
+        monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy_text)
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (1920, 1080), color=(30, 30, 30)).save(frame)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "", big_logo_text="ポケモンダブルバトルAI自動実況")
+        joined = "".join(calls)
+        assert "ポケモンダブルバトル" in joined
+        assert "AI自動実況" in joined
+        # 1文字列の描画呼び出しには収まらず複数行に分割されているはず
+        assert "ポケモンダブルバトルAI自動実況" not in calls
+
+    def test_big_logo_text_explicit_newline_splits_on_word_boundary(self, tmp_path, monkeypatch):
+        """big_logo_textに"\\n"を含めた場合、自動折り返しではなく指定位置で
+        割れること（"AI"のような英字トークンの途中で割れる不自然さの回避・2026-08-14）。"""
+        calls = []
+        real_text = ImageDraw.ImageDraw.text
+
+        def spy_text(self, xy, text, *args, **kwargs):
+            calls.append(text)
+            return real_text(self, xy, text, *args, **kwargs)
+
+        monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy_text)
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (1920, 1080), color=(30, 30, 30)).save(frame)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "",
+                             big_logo_text="ポケモンダブルバトル\nAI自動実況")
+        assert "ポケモンダブルバトル" in calls
+        assert "AI自動実況" in calls
+
+    def test_non_empty_label_does_not_show_big_ai_logo_text(self, tmp_path, monkeypatch):
+        """通常通りlabelがある場合は大きなロゴテキストを出さない（既存動作の回帰防止）。"""
+        calls = []
+        real_text = ImageDraw.ImageDraw.text
+
+        def spy_text(self, xy, text, *args, **kwargs):
+            calls.append(text)
+            return real_text(self, xy, text, *args, **kwargs)
+
+        monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy_text)
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (1920, 1080), color=(30, 30, 30)).save(frame)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "テスト実況テキスト")
+        assert "AI自動実況" not in calls
+
+    def test_character_name_defaults_to_kurepi(self, tmp_path, monkeypatch):
+        """character_name省略時は従来通り花圓くれぴ表記のまま（回帰防止）。"""
+        calls = []
+        real_text = ImageDraw.ImageDraw.text
+
+        def spy_text(self, xy, text, *args, **kwargs):
+            calls.append(text)
+            return real_text(self, xy, text, *args, **kwargs)
+
+        monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy_text)
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (400, 300), color=(30, 30, 30)).save(frame)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "")
+        assert gt._CHARACTER_NAME in calls
+
+    def test_character_name_neutral_override(self, tmp_path, monkeypatch):
+        """character_name="VOICEVOX：四国めたん"指定時、花圓くれぴ表記が出ないこと
+        （2026-08-14・persona="neutral"でキャラ名誤表示になる不具合の再発防止）。"""
+        calls = []
+        real_text = ImageDraw.ImageDraw.text
+
+        def spy_text(self, xy, text, *args, **kwargs):
+            calls.append(text)
+            return real_text(self, xy, text, *args, **kwargs)
+
+        monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy_text)
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (400, 300), color=(30, 30, 30)).save(frame)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "", character_name=gt._CHARACTER_NAME_NEUTRAL)
+        assert gt._CHARACTER_NAME_NEUTRAL in calls
+        assert gt._CHARACTER_NAME not in calls
 
 
 class TestCollectRoster:
