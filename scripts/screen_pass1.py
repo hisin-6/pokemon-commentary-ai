@@ -12,6 +12,10 @@ manifest.jsonl/timeline.jsonl/states.jsonlの構造だけから機械的に検�
   4. 生の保留・困惑キーワード残存 … AIグリッチ差し替え漏れ（B2）
   5. 選出画面限定登場ポケモン  … NG#5（ランクルス→オオニューラ）型
   6. ひんし判定なのにHP0%系を一度も観測していない … NG#4型
+  7. 変化技のダメージ誤認疑い  … NG恒久対策フェーズ1・施策B（技効果ヒントRAG）の
+                                  再発検出（2026-08-14追加）
+  8. 陣営矛盾疑い              … NG恒久対策フェーズ1・施策C（is_opponentクロス
+                                  チェック）の再発検出（2026-08-14追加・簡易検出）
 
 ⚠️これは「疑い」の一次検出であり確定判定ではない。フラグが立った箇所を
 優先して目視確認すること。フラグゼロ＝無罪ではなく「既知パターンには
@@ -230,11 +234,91 @@ def check_missing_hp_zero(states: list[dict], manifest: list[dict]) -> list[dict
     return flags
 
 
-def run_all_checks(render_dir: Path) -> dict:
+_STATUS_MOVE_DAMAGE_WORDS = (
+    "ダメージ", "効果ばつぐん", "こうかばつぐん", "食らった", "くらった",
+    "削れ", "痛手", "命中して", "半減", "4分の1",
+)
+
+
+def _load_status_moves(pokedb_path: Path) -> set[str]:
+    """data/pokedb.sqliteから変化技（category='変化'）の技名一覧を読む。
+    DBが無い環境（CI等）ではフラグを立てずに空集合を返す。"""
+    if not pokedb_path.exists():
+        return set()
+    import sqlite3
+    conn = sqlite3.connect(pokedb_path)
+    try:
+        return {row[0] for row in conn.execute(
+            "SELECT name_ja FROM moves WHERE category = '変化'")}
+    finally:
+        conn.close()
+
+
+def check_status_move_damage_claim(manifest: list[dict], status_moves: set[str]) -> list[dict]:
+    """変化技（ダメージを与えない技）なのにダメージ表現を伴う実況 → 技効果誤認疑い
+    （2026-08-14・NG恒久対策フェーズ1「施策B: 技効果ヒントRAG新設」の再発検出用。
+    RAGが機能していればこのパターンは新規発生しないはず）。"""
+    flags = []
+    for m in manifest:
+        if m.get("event_type") not in ("move_used", "move_single", "faint"):
+            continue
+        text = m.get("commentary", "") or ""
+        for mv in status_moves:
+            if mv and mv in text and any(w in text for w in _STATUS_MOVE_DAMAGE_WORDS):
+                flags.append({
+                    "kind": "変化技のダメージ誤認疑い",
+                    "time": m.get("event_time"),
+                    "seq": m.get("seq"),
+                    "detail": f"技={mv}（変化技） commentary=「{text}」",
+                })
+                break
+    return flags
+
+
+def check_side_roster_mismatch(states: list[dict], manifest: list[dict]) -> list[dict]:
+    """技ログに登場する使い手の陣営と、states.jsonl上の実ロスター所属が矛盾していないか
+    （2026-08-14・NG恒久対策フェーズ1「施策C: is_opponent陣営判定クロスチェック」の
+    再発検出用）。states全体を通じてplayer/opponent各ロスターに一度でも出現した名前
+    集合を作り、自分ロスター専属（相手ロスターには一度も出ていない）のはずの名前が
+    manifest.context.opponent（相手の場/控え表示文字列）にも出現しているという
+    明確な矛盾のみを拾う簡易版。⚠️完全な検出は難しいため「疑いの一次検出」の
+    位置づけ（同名ミラー戦は判定不能として除外する）。"""
+    ever_player: set[str] = set()
+    ever_opponent: set[str] = set()
+    for s in states:
+        ever_player |= {p.get("name") for p in s.get("player", []) if p.get("name")}
+        ever_opponent |= {p.get("name") for p in s.get("opponent", []) if p.get("name")}
+    both_sides = ever_player & ever_opponent  # ミラー個体は判定不能なので除外
+    player_only = ever_player - both_sides
+
+    flags = []
+    for m in manifest:
+        ctx = m.get("context") or {}
+        opponent_str = ctx.get("opponent") or ""
+        if not opponent_str:
+            continue
+        for entry in ctx.get("move_log") or []:
+            for name in player_only:
+                if name in entry and name in opponent_str:
+                    flags.append({
+                        "kind": "陣営矛盾疑い（自分専用ポケモンが相手ロスターにも出現）",
+                        "time": m.get("event_time"),
+                        "seq": m.get("seq"),
+                        "detail": f"「{name}」はstates.jsonl上は自分ロスター専属のはずだが、"
+                                  f"技ログ「{entry}」の時点でcontext.opponent"
+                                  f"「{opponent_str}」にも出現",
+                    })
+    return flags
+
+
+def run_all_checks(render_dir: Path, pokedb_path: Path | None = None) -> dict:
     manifest = load_jsonl(render_dir / "manifest.jsonl")
     states = load_jsonl(render_dir / "states.jsonl")
 
     glitch_flags, replaced_count = check_leaked_glitch_keywords(manifest)
+    if pokedb_path is None:
+        pokedb_path = Path(__file__).resolve().parent.parent / "data" / "pokedb.sqlite"
+    status_moves = _load_status_moves(pokedb_path)
 
     return {
         "move_log_empty": check_empty_move_log(manifest),
@@ -244,6 +328,8 @@ def run_all_checks(render_dir: Path) -> dict:
         "glitch_replaced_count": replaced_count,
         "selection_screen_only": check_selection_screen_only_names(states, manifest),
         "hp_zero_missing": check_missing_hp_zero(states, manifest),
+        "status_move_damage_claim": check_status_move_damage_claim(manifest, status_moves),
+        "side_roster_mismatch": check_side_roster_mismatch(states, manifest),
     }
 
 
@@ -261,6 +347,8 @@ def build_report_markdown(render_dir: Path, results: dict) -> str:
         "glitch_leaked": "④ 生の保留・困惑応答の残存",
         "selection_screen_only": "⑤ 選出画面限定登場ポケモン",
         "hp_zero_missing": "⑥ HP0%検出漏れ疑い",
+        "status_move_damage_claim": "⑦ 変化技のダメージ誤認疑い",
+        "side_roster_mismatch": "⑧ 陣営矛盾疑い",
     }
     for key, label in category_labels.items():
         flags = results[key]

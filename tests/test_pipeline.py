@@ -1661,10 +1661,11 @@ class TestTryRegisterRosterFallback:
     def _set_classifier(self, moves, pokemon):
         """moves/pokemon に完全一致する文字列だけを該当カテゴリと判定する簡易分類器モック。"""
         class _Result:
-            def __init__(self, category, score, canonical_ja):
+            def __init__(self, category, score, canonical_ja, confident=True):
                 self.category = category
                 self.score = score
                 self.canonical_ja = canonical_ja
+                self.confident = confident
 
         def classify(text):
             if text in moves:
@@ -1747,6 +1748,54 @@ class TestTryRegisterRosterFallback:
         assert self.runner._move_log == ["T0:ガブリアスのじだんだ"]
         assert any(s.name == "ガブリアス" for s in self.runner._battle_tracker._opponent)
 
+    def test_false_positive_opponent_flag_corrected_for_known_player_pokemon(self):
+        """2026-08-14: 陣営判定クロスチェック。「相手」のOCR手がかり（is_opponent=True）
+        があっても、解決済みポケモン名が自分ロスターにのみ登録済み（相手ロスターには
+        居ない）と確定している場合はOCR誤検出と判断して自分側に補正する。
+
+        実機由来のNG（2026-07-03_23-48-45）: is_opponent判定が直前OCRトークンの
+        「相手/あいて」文字列一致だけの弱いロジックのため、自分のポケモンの技が
+        「相手の技」として実況される陣営逆転と、相手ロスターへの誤登録が同時に
+        発生していた（is_opponent=Trueで即座にregister_opponent_on_fieldするため）。
+        """
+        self.runner._battle_tracker._player.append(
+            FieldPokemon(name="ガブリアス", on_field=True)
+        )
+        self._set_classifier(moves={"じだんだ"}, pokemon={"ガブリアス": "ガブリアス"})
+        events = [
+            _ocr("あいて", y_center=800.0),
+            _ocr("相手の", y_center=800.0),
+            _ocr("ガブリアスの", y_center=800.0),
+            _ocr("じだんだ!", y_center=800.0),
+        ]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+        assert self.runner._move_log == ["T0:ガブリアスのじだんだ"]
+        # 相手ロスターへ誤登録されない（回帰ガード: 陣営逆転バグの副作用）
+        assert self.runner._battle_tracker._opponent == []
+        # 陣営判定は自分のまま（補正が効いている）
+        assert self.runner._battle_tracker.move_user_side("ガブリアス") == "自分"
+
+    def test_mirror_name_in_both_rosters_not_corrected(self):
+        """同名ミラー戦（両陣営に存在）の場合は既存のis_opponentヒューリスティックを
+        尊重し、クロスチェック補正は発動しない（move_user_side側のNone判定に委ねる
+        設計を変えない）。"""
+        self.runner._battle_tracker._player.append(
+            FieldPokemon(name="ガブリアス", on_field=True))
+        self.runner._battle_tracker._opponent.append(
+            FieldPokemon(name="ガブリアス", on_field=True))
+        self._set_classifier(moves={"じだんだ"}, pokemon={"ガブリアス": "ガブリアス"})
+        events = [
+            _ocr("あいて", y_center=800.0),
+            _ocr("相手の", y_center=800.0),
+            _ocr("ガブリアスの", y_center=800.0),
+            _ocr("じだんだ!", y_center=800.0),
+        ]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+        assert self.runner._move_log == ["T0:ガブリアスのじだんだ"]
+        # 両陣営とも1匹のまま（誤って重複登録されない）
+        assert len(self.runner._battle_tracker._opponent) == 1
+        assert len(self.runner._battle_tracker._player) == 1
+
 
 class TestOpponentAttackFallbackAmbiguity:
     """_get_active_opponent_name の「場の1匹目」フォールバックの曖昧さ対策。
@@ -1769,10 +1818,11 @@ class TestOpponentAttackFallbackAmbiguity:
 
     def _set_classifier(self, moves, pokemon):
         class _Result:
-            def __init__(self, category, score, canonical_ja):
+            def __init__(self, category, score, canonical_ja, confident=True):
                 self.category = category
                 self.score = score
                 self.canonical_ja = canonical_ja
+                self.confident = confident
 
         def classify(text):
             if text in moves:
@@ -1848,10 +1898,11 @@ class TestMoveSingleDispatch:
 
     def _set_classifier(self, moves, pokemon, learnable=True):
         class _Result:
-            def __init__(self, category, score, canonical_ja):
+            def __init__(self, category, score, canonical_ja, confident=True):
                 self.category = category
                 self.score = score
                 self.canonical_ja = canonical_ja
+                self.confident = confident
 
         def classify(text):
             if text in moves:
@@ -1863,6 +1914,7 @@ class TestMoveSingleDispatch:
         clf = MagicMock()
         clf.classify.side_effect = classify
         clf.is_move_learnable.return_value = learnable
+        clf.get_move_effect.return_value = None
         self.runner._classifier = clf
 
     def test_confirmed_move_dispatches_move_single(self):
@@ -1879,6 +1931,20 @@ class TestMoveSingleDispatch:
         assert game_state["move_focus"] == "自分のガブリアスのじしん"
         assert attempt_bedrock is True
         assert kwargs["event_time"] == 123.0
+
+    def test_move_effect_hint_propagated_to_battle_context(self):
+        """2026-08-14: move_single専用のdispatch経路（_process_eventを経由しない）でも
+        技効果ヒントRAGがbattle_contextに配線されること（type_hintと同じ2箇所目の
+        注入経路の回帰ガード）。"""
+        self.runner._battle_tracker._player.append(FieldPokemon(name="フシギバナ", on_field=True))
+        self._set_classifier(moves={"おいかぜ"}, pokemon={"フシギバナ": "フシギバナ"})
+        self.runner._classifier.get_move_effect.side_effect = (
+            lambda name: "味方全員の素早さをあげる。" if name == "おいかぜ" else None)
+        events = [_ocr("フシギバナの", y_center=800.0), _ocr("おいかぜ!", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+
+        _, _, _, battle_context, _, _ = self.runner._dispatch_commentary.call_args.args
+        assert battle_context.get("move_effect_hint") == "おいかぜ: 味方全員の素早さをあげる。"
 
     def test_tentative_move_still_dispatches(self):
         """断片一致救済等でtentative扱いになった技も実況の対象にする（ユーザー決定）。"""
@@ -2354,6 +2420,48 @@ class TestComputeTypeHint:
         hint = self.runner._compute_type_hint()
         assert "実際に使った" not in hint
         assert "メタグロスの技はイワークにバツグン" in hint
+
+
+class TestLatestMoveEffectHint:
+    """_latest_move_effect_hint: 技効果ヒントRAG新設（2026-08-14）。パス1検証で
+    累計最頻のNGパターンだった「技の効果に関する事実誤認」（おいかぜ等の変化技を
+    ダメージ技として説明する等）対策。_latest_move_type_hintと同じ「直近の技ログ
+    1件だけを見る」設計だが、変化技も対象に含む点が異なる。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._move_log = []
+        self._move_effects = {}
+        self.clf = MagicMock()
+        self.clf.get_move_effect.side_effect = lambda name: self._move_effects.get(name)
+
+    def test_no_move_log_returns_none(self):
+        assert self.runner._latest_move_effect_hint(self.clf) is None
+
+    def test_known_move_returns_effect_text(self):
+        self.runner._move_log = ["T1:フシギバナのおいかぜ"]
+        self._move_effects["おいかぜ"] = "味方全員の素早さをあげる。"
+        hint = self.runner._latest_move_effect_hint(self.clf)
+        assert hint == "おいかぜ: 味方全員の素早さをあげる。"
+
+    def test_unknown_effect_returns_none(self):
+        """effectがDBに無い（backfill未取得）技はNone（type_hint同様、単に
+        ヒントが出ないだけで実害なし）。"""
+        self.runner._move_log = ["T1:フシギバナのつるのムチ"]
+        hint = self.runner._latest_move_effect_hint(self.clf)
+        assert hint is None
+
+    def test_uses_latest_entry_only(self):
+        """直近1件だけを見る（古いターンの技には反応しない）。"""
+        self.runner._move_log = ["T1:フシギバナのおいかぜ", "T2:メタグロスのじだんだ"]
+        self._move_effects["おいかぜ"] = "味方全員の素早さをあげる。"
+        self._move_effects["じだんだ"] = "地面を思いきり踏みつける。"
+        hint = self.runner._latest_move_effect_hint(self.clf)
+        assert hint == "じだんだ: 地面を思いきり踏みつける。"
+
+    def test_malformed_entry_returns_none(self):
+        self.runner._move_log = ["これは形式に合わない文字列"]
+        assert self.runner._latest_move_effect_hint(self.clf) is None
 
 
 class TestUpdateMegaEvolution:

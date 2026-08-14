@@ -20,9 +20,18 @@
 
 ## 現在の状況
 
+**⏸️2026-08-14: 無課金検証ワークフローを一旦中断（ユーザー判断）**。目視チェックリスト
+消化の負荷が高すぎると判断し、「NG恒久対策フェーズ1」（累計180件の分析→施策A〜D実装、
+詳細は`pass1-verification-ng-findings.md`の2026-08-14エントリ参照）で頻出パターンの
+根本対策まで完了させた時点でクローズ。**今後は実況動画制作（ADR-009）の中で気づいた
+不具合を都度直す運用に切り替える**。残り13本の目視消化・追加サンプリングは行わない
+（再開する場合はこのファイルの続きから）。
+
 - 全録画: **132本**
 - 実況動画として完成済み（対象外）: **6本**
-- 無課金パス1検証 判定済み: **14本**（サンプリング25本中14本完了・残り11本）
+- 無課金パス1検証 判定済み: **17本**（サンプリング25本中17本完了・残り**13本**。パス1の生成自体は
+  25本全て完了済みで、残り13本は生成済みだが目視判定が未着手という状態。2026-08-13訂正
+  ——旧「残り11本」表記は判定待ちの生成有無を確認せずに書かれた古い数字だった）
 - 無課金パス1検証 対象（サンプリング後）: **25本**
 - サンプリング対象外（15分超）: **9本**
 - サンプリング対象外（15分以内・非選出）: **87本**
@@ -59,6 +68,9 @@
 | 12 | 10:25 | `2026-04-13 06-34-11.mp4` | `renders/2026-04-13_06-34-11/review_checklist.md`（NG15件・ユーザー目視） |
 | 13 | 11:32 | `2026-07-03 21-06-34.mp4` | `renders/2026-07-03_21-06-34/review_checklist.md`（NG29件・ユーザー目視） |
 | 14 | 14:42 | `2026-07-03 21-54-06.mp4` | `renders/2026-07-03_21-54-06/review_checklist.md`（NG22件・ユーザー目視） |
+| 15 | 7:03 | `2026-06-06 19-34-04.mp4` | `renders/2026-06-06_19-34-04/review_checklist.md`（NG21件・ユーザー目視） |
+| 16 | 7:52 | `2026-07-03 23-48-45.mp4` | `renders/2026-07-03_23-48-45/review_checklist.md`（NG16件・ユーザー目視） |
+| 17 | 8:13 | `2026-06-06 17-12-07.mp4` | `renders/2026-06-06_17-12-07/review_checklist.md`（NG24件・ユーザー目視） |
 
 ## サンプリング方針（2026-08-11決定）
 
@@ -142,7 +154,7 @@
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-04-14_20-32-31
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-04-14_20-32-31
   ```
-- [ ] 11. 7:03 — `2026-06-06 19-34-04.mp4`
+- [ x] 11. 7:03 — `2026-06-06 19-34-04.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-06-06 19-34-04.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-06-06_19-34-04
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-06-06_19-34-04
@@ -166,7 +178,7 @@
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-04-13_21-46-08
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-04-13_21-46-08
   ```
-- [ ] 15. 7:52 — `2026-07-03 23-48-45.mp4`
+- [x ] 15. 7:52 — `2026-07-03 23-48-45.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-07-03 23-48-45.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-07-03_23-48-45
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-07-03_23-48-45
@@ -178,7 +190,7 @@
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-06-03_20-55-44
   venv\Scripts\python.exe scripts\screen_pass1.py renders\2026-06-03_20-55-44
   ```
-- [ ] 17. 8:13 — `2026-06-06 17-12-07.mp4`
+- [x ] 17. 8:13 — `2026-06-06 17-12-07.mp4`
   ```
   venv\Scripts\python.exe src\pipeline.py --input "D:\ゲーム録画\2026-06-06 17-12-07.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --game-mode champions --conf 0.3 --render-out renders\2026-06-06_17-12-07
   venv\Scripts\python.exe scripts\generate_review_checklist.py renders\2026-06-06_17-12-07

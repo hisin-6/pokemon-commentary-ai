@@ -141,6 +141,76 @@ class TestCheckMissingHpZero:
         assert sp.check_missing_hp_zero(states, manifest) == []
 
 
+class TestCheckStatusMoveDamageClaim:
+    """check_status_move_damage_claim: 2026-08-14新設（NG恒久対策フェーズ1・
+    施策B「技効果ヒントRAG新設」の再発検出用）。"""
+
+    def test_flags_status_move_with_damage_wording(self):
+        manifest = [_manifest(121.6, "move_single",
+                              "めいそうでダメージを与えていくよ！",
+                              {"move_log": ["T1:フシギバナのめいそう"]})]
+        flags = sp.check_status_move_damage_claim(manifest, status_moves={"めいそう"})
+        assert len(flags) == 1
+        assert "めいそう" in flags[0]["detail"]
+
+    def test_does_not_flag_status_move_without_damage_wording(self):
+        manifest = [_manifest(121.6, "move_single", "めいそうで自分を強化するのね♪",
+                              {"move_log": ["T1:フシギバナのめいそう"]})]
+        assert sp.check_status_move_damage_claim(manifest, status_moves={"めいそう"}) == []
+
+    def test_does_not_flag_damage_move_with_damage_wording(self):
+        """物理/特殊技（変化技リストに無い）はダメージ表現があっても正常なのでフラグしない。"""
+        manifest = [_manifest(121.6, "move_single", "じしんで大ダメージ！",
+                              {"move_log": ["T1:ガブリアスのじしん"]})]
+        assert sp.check_status_move_damage_claim(manifest, status_moves={"めいそう"}) == []
+
+    def test_ignores_non_move_events(self):
+        manifest = [_manifest(80.0, "battle_start", "めいそうでダメージが入った気がする",
+                              {"move_log": []})]
+        assert sp.check_status_move_damage_claim(manifest, status_moves={"めいそう"}) == []
+
+    def test_empty_status_moves_flags_nothing(self):
+        """DB未検出等でstatus_movesが空集合の場合はフラグを立てない（安全側）。"""
+        manifest = [_manifest(121.6, "move_single", "めいそうでダメージを与えていくよ！",
+                              {"move_log": ["T1:フシギバナのめいそう"]})]
+        assert sp.check_status_move_damage_claim(manifest, status_moves=set()) == []
+
+
+class TestCheckSideRosterMismatch:
+    """check_side_roster_mismatch: 2026-08-14新設（NG恒久対策フェーズ1・
+    施策C「is_opponent陣営判定クロスチェック」の再発検出用）。"""
+
+    def test_flags_player_only_name_appearing_in_opponent_context(self):
+        states = [_state(80.0, 1, player=[_mon("ガブリアス")], opponent=[_mon("リザードン")])]
+        manifest = [_manifest(90.0, "move_single", "相手のガブリアスのじしん！",
+                              {"move_log": ["T1:ガブリアスのじしん"],
+                               "opponent": "場: ガブリアス / 控え: なし"})]
+        flags = sp.check_side_roster_mismatch(states, manifest)
+        assert len(flags) == 1
+        assert "ガブリアス" in flags[0]["detail"]
+
+    def test_does_not_flag_consistent_roster(self):
+        states = [_state(80.0, 1, player=[_mon("ガブリアス")], opponent=[_mon("リザードン")])]
+        manifest = [_manifest(90.0, "move_single", "ガブリアスのじしん！",
+                              {"move_log": ["T1:ガブリアスのじしん"],
+                               "opponent": "場: リザードン / 控え: なし"})]
+        assert sp.check_side_roster_mismatch(states, manifest) == []
+
+    def test_mirror_name_in_both_rosters_not_flagged(self):
+        """同名ミラー戦（両陣営に登場）は判定不能として除外し、フラグしない。"""
+        states = [_state(80.0, 1, player=[_mon("ガブリアス")], opponent=[_mon("ガブリアス")])]
+        manifest = [_manifest(90.0, "move_single", "ガブリアスのじしん！",
+                              {"move_log": ["T1:ガブリアスのじしん"],
+                               "opponent": "場: ガブリアス / 控え: なし"})]
+        assert sp.check_side_roster_mismatch(states, manifest) == []
+
+    def test_no_opponent_context_not_flagged(self):
+        states = [_state(80.0, 1, player=[_mon("ガブリアス")])]
+        manifest = [_manifest(90.0, "move_single", "ガブリアスのじしん！",
+                              {"move_log": ["T1:ガブリアスのじしん"]})]
+        assert sp.check_side_roster_mismatch(states, manifest) == []
+
+
 class TestExtractNames:
     def test_parses_field_and_bench(self):
         roster = "場: オオニューラ HP:98/155 技=[ねこだまし] / イダイトウ HP:7/201★ピンチ 技=[だくりゅう] / 控え: なし"

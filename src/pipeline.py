@@ -3588,6 +3588,10 @@ class Pipeline:
         type_hint = self._compute_type_hint()
         if type_hint:
             battle_context["type_hint"] = type_hint
+        if getattr(self, "_classifier", None) is not None:
+            move_effect_hint = self._latest_move_effect_hint(self._classifier)
+            if move_effect_hint:
+                battle_context["move_effect_hint"] = move_effect_hint
         condition_hint = self._compute_condition_hint(battle_context)
         if condition_hint:
             battle_context["condition_hint"] = condition_hint
@@ -4084,6 +4088,27 @@ class Pipeline:
                 return f"{weather_type_note} / {matchup}" if weather_type_note else matchup
         return weather_type_note
 
+    def _latest_move_effect_hint(self, classifier) -> str | None:
+        """直近の技ログエントリの効果テキストをRAGで取得する（2026-08-14新設）。
+
+        パス1検証（`docs/manual/pass1-verification-ng-findings.md`）で「技の効果に
+        関する事実誤認」（おいかぜ/めいそう等の変化技をダメージ技として説明する等）が
+        累計最頻のNGパターンと判明したための対策。`_latest_move_type_hint`と同じ
+        「直近の技ログ1件だけを見る」設計だが、こちらは変化技（型ヒントでは除外する
+        対象）にこそ意味がある情報のため独立して評価する。
+        """
+        move_log = getattr(self, "_move_log", None)
+        if not move_log:
+            return None
+        m = self._MOVE_LOG_ENTRY_RE.match(move_log[-1])
+        if not m:
+            return None
+        move_name = m.group(2)
+        effect = classifier.get_move_effect(move_name)
+        if not effect:
+            return None
+        return f"{move_name}: {effect}"
+
     def _compute_type_hint(self) -> str | None:
         """場に出ている自分/相手ポケモンのタイプ相性ヒントを計算する
         （Cicero型アーキテクチャ・改善ロードマップ「戦況推論強化」2026-08-04）。
@@ -4149,6 +4174,9 @@ class Pipeline:
             if "type_hint" in battle_context:
                 # 戦況推論強化（2026-08-04）用: manifest.jsonlで実機確認できるようにする
                 ctx["type_hint"] = battle_context["type_hint"]
+            if "move_effect_hint" in battle_context:
+                # 技効果ヒントRAG（2026-08-14）用: manifest.jsonlで実機確認できるようにする
+                ctx["move_effect_hint"] = battle_context["move_effect_hint"]
             if "condition_hint" in battle_context:
                 ctx["condition_hint"] = battle_context["condition_hint"]
         return ctx
@@ -4619,6 +4647,10 @@ class Pipeline:
         type_hint = self._compute_type_hint()
         if type_hint:
             battle_context["type_hint"] = type_hint
+        if getattr(self, "_classifier", None) is not None:
+            move_effect_hint = self._latest_move_effect_hint(self._classifier)
+            if move_effect_hint:
+                battle_context["move_effect_hint"] = move_effect_hint
         condition_hint = self._compute_condition_hint(battle_context)
         if condition_hint:
             battle_context["condition_hint"] = condition_hint
@@ -4749,6 +4781,23 @@ class Pipeline:
                         log.debug("[技ログ] 使用者名候補 %s を分類・ロスター一致とも失敗のため棄却（技候補: %s）",
                                   pokemon_name, move_candidate)
                         return False
+                # 陣営判定クロスチェック（2026-08-14・OCR文字列ヒューリスティックの
+                # 誤検出対策）: is_opponent は直前OCRトークンに「相手/あいて」の文字列が
+                # 含まれるかだけの弱い判定（このすぐ下のスキャンロジック参照）。解決済みの
+                # pokemon_name が自分ロスターにのみ存在する（相手ロスターには居ない）ことが
+                # 確定しているのに is_opponent=True だった場合、OCR誤検出と判断して
+                # 自分側に補正する（実況の陣営逆転・相手ロスターへの誤登録を同時に防ぐ）。
+                # 同名ミラー戦（両陣営に存在）や未登録の場合は補正せず既存の
+                # ヒューリスティックを尊重する（move_user_side側のNone判定に委ねる）。
+                if is_opponent:
+                    in_player = any(s.name == pokemon_name for s in self._battle_tracker._player)
+                    in_opponent = any(s.name == pokemon_name for s in self._battle_tracker._opponent)
+                    if in_player and not in_opponent:
+                        log.warning(
+                            "[技ログ] 陣営判定の矛盾を検出: %s は自分ロスターのみに登録済みだが"
+                            "「相手」のOCR手がかりを検出 → 自分側と判定して上書き（誤登録防止）",
+                            pokemon_name)
+                        is_opponent = False
                 # is_opponent=True で技ログにだけ記録されロスター未登録のケースを
                 # 即座に校正登録する（実機: 07-00-19でガブリアスの繰り出しメッセージが
                 # OCR取りこぼしで検知されないまま技ログにだけ記録され、ロスター未登録
@@ -4775,7 +4824,12 @@ class Pipeline:
                 if len(result.canonical_ja) > len(move_candidate) * 1.5:
                     return False
                 move_name = result.canonical_ja or move_candidate
-                if via_roster_fallback or not self._classifier.is_move_learnable(pokemon_name, move_name):
+                # not result.confident: 僅差の複数候補あり（2026-08-14・紛らわしい技ペア
+                # 対策。例: OCR断片「パワー」が「パワージェム」「パワーシェア」に同点で
+                # マッチするケース）。classify()側で降格済みのconfidentをそのまま尊重する
+                if (via_roster_fallback
+                        or not self._classifier.is_move_learnable(pokemon_name, move_name)
+                        or not result.confident):
                     tentative = True
             else:
                 move_name = move_candidate

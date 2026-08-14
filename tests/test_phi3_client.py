@@ -41,6 +41,14 @@ class TestBuildPrompt:
         assert "花圓くれぴ" in prompt
         assert "了解しました" in prompt  # 指示エコー対策ルール
 
+    def test_contains_target_defense_side_uncertainty_rules(self, client):
+        """2026-08-14: kurepi_persona.OUTPUT_RULES_LINESに追加した対象/防御結果/陣営の
+        断定回避ルールがPhi3Client側にもそのまま反映されること（単一ソース経由）。"""
+        prompt = client._build_prompt({"event_type": "move_used", "status": "なし"}, None, None)
+        assert "対象ポケモン名を" in prompt and "決め打ちしない" in prompt
+        assert "まもる等の防御が成功したかどうか" in prompt
+        assert "陣営（自分/相手）が状況情報から特定できない場合" in prompt
+
     def test_battle_context_fields_included(self, client):
         battle_context = {
             "turn": 2, "player_pokemon": "場: メタグロス / 控え: なし",
@@ -113,6 +121,18 @@ class TestBuildPrompt:
     def test_type_hint_omitted_when_absent(self, client):
         prompt = client._build_prompt({"event_type": "move_used"}, None, {"turn": 1})
         assert "タイプ相性ヒント" not in prompt
+
+    def test_move_effect_hint_included_when_present(self, client):
+        """2026-08-14: 技効果ヒントRAG（server.py側と同じ文言でPhi3Client側にも配線。
+        最頻NGパターン「技の効果に関する事実誤認」対策）。"""
+        battle_context = {"move_effect_hint": "おいかぜ: 味方全員の素早さをあげる。"}
+        prompt = client._build_prompt({"event_type": "move_used"}, None, battle_context)
+        assert "おいかぜ: 味方全員の素早さをあげる。" in prompt
+        assert "ダメージを与えない変化技" in prompt
+
+    def test_move_effect_hint_omitted_when_absent(self, client):
+        prompt = client._build_prompt({"event_type": "move_used"}, None, {"turn": 1})
+        assert "ダメージを与えない変化技" not in prompt
 
     def test_condition_hint_included_when_present(self, client):
         """2026-08-08: 天候「にほんばれ」下でウェザーボールが炎技になることを

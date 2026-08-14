@@ -315,6 +315,60 @@ class TestClassify:
         assert isinstance(result.score, float)
 
 
+class TestAmbiguousMoveDisambiguation:
+    """紛らわしい技ペア対策（2026-08-14新設）。パス1検証で「技ログ自体の誤検出
+    （パワージェム→パワーシェア、同一動画内3回再発）」が見つかったための対策。
+    OCR断片が複数の実在技名に僅差でマッチする場合（実測: 「パワー」は
+    「パワージェム」「パワーシェア」どちらにもWRatio=90.0で同点マッチ）、
+    confidentをFalseに降格して断定登録を防ぐ。"""
+
+    @pytest.fixture(scope="class")
+    def clf_ambiguous(self, tmp_path_factory):
+        db_dir = tmp_path_factory.mktemp("pokedb_ambiguous_moves")
+        db_path = db_dir / "test_ambiguous.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE pokemon (
+                id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL,
+                type1 TEXT, type2 TEXT, ability1 TEXT, ability2 TEXT, ability_hidden TEXT
+            );
+            CREATE TABLE moves (
+                id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL,
+                category TEXT, power INTEGER
+            );
+            CREATE TABLE abilities (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+            CREATE TABLE items (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+            CREATE TABLE pokemon_moves (pokemon_id INTEGER, move_id INTEGER);
+
+            INSERT INTO moves VALUES
+              (1, 'れいとうパンチ', 'Ice Punch', '物理', 75),
+              (2, 'れいとうビーム', 'Ice Beam',  '特殊', 90);
+        """)
+        conn.commit()
+        conn.close()
+        return PokeClassifier(db_path=str(db_path))
+
+    def test_ambiguous_fragment_is_not_confident(self, clf_ambiguous):
+        """OCR断片「れいとう」（4文字・短断片ゲートの対象外）が「れいとうパンチ」
+        「れいとうビーム」両方にWRatio=90.0で同点マッチする実測ケース（パワージェム
+        ⇔パワーシェアと同種の紛らわしさを、短断片ゲートに引っかからない長さで再現）。"""
+        result = clf_ambiguous.classify("れいとう")
+        assert result.category == CATEGORY_MOVE
+        assert result.confident is False
+
+    def test_exact_match_remains_confident_despite_similar_entries(self, clf_ambiguous):
+        """完全一致（フルネーム入力）は僅差候補があっても正読として扱い、
+        confidentに格上げされたままにする（回帰ガード: マージン導入で
+        既存の正常系まで過剰にtentative化しないこと）。"""
+        result = clf_ambiguous.classify("れいとうパンチ")
+        assert result.confident is True
+        assert result.canonical_ja == "れいとうパンチ"
+
+        result2 = clf_ambiguous.classify("れいとうビーム")
+        assert result2.confident is True
+        assert result2.canonical_ja == "れいとうビーム"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # classify_batch
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -472,6 +526,50 @@ class TestGetMoveType:
 
     def test_get_move_category_unknown_move_returns_none(self, clf_with_move_types):
         assert clf_with_move_types.get_move_category("存在しない技12345") is None
+
+
+class TestGetMoveEffect:
+    """get_move_effect: 2026-08-14新設。技効果ヒントRAG（パス1検証の最頻NGパターン
+    「技の効果に関する事実誤認」対策）用に技の効果テキストを取得する。"""
+
+    @pytest.fixture(scope="class")
+    def clf_with_move_effects(self, tmp_path_factory):
+        db_dir = tmp_path_factory.mktemp("pokedb_moveeffects")
+        db_path = db_dir / "test_move_effects.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE pokemon (
+                id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL,
+                type1 TEXT, type2 TEXT, ability1 TEXT, ability2 TEXT, ability_hidden TEXT
+            );
+            CREATE TABLE moves (
+                id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL,
+                type TEXT, category TEXT, power INTEGER, effect TEXT
+            );
+            CREATE TABLE abilities (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+            CREATE TABLE items (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+            CREATE TABLE pokemon_moves (pokemon_id INTEGER, move_id INTEGER);
+
+            INSERT INTO moves VALUES
+              (1, 'おいかぜ', 'Tailwind', 'ひこう', '変化', NULL,
+               '激しく吹きあれる風の渦をつくり４ターンの間味方全員の素早さをあげる。'),
+              (2, 'かみなり', 'Thunder', 'でんき', '特殊', 110, NULL);
+        """)
+        conn.commit()
+        conn.close()
+        return PokeClassifier(db_path=str(db_path))
+
+    def test_known_move_with_effect_returns_text(self, clf_with_move_effects):
+        assert clf_with_move_effects.get_move_effect("おいかぜ") == \
+            "激しく吹きあれる風の渦をつくり４ターンの間味方全員の素早さをあげる。"
+
+    def test_move_without_effect_returns_none(self, clf_with_move_effects):
+        """effect列がNULL（backfill未取得）の技はNoneを返す（type_hint等と同じ
+        フォールバック動作。プロンプトにヒントが単に出ないだけで実害なし）。"""
+        assert clf_with_move_effects.get_move_effect("かみなり") is None
+
+    def test_unknown_move_returns_none(self, clf_with_move_effects):
+        assert clf_with_move_effects.get_move_effect("存在しない技12345") is None
 
 
 class TestIsMoveLearnable:

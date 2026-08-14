@@ -183,6 +183,18 @@ class Phi3Client:
                     f"タイプ相性ヒント（Python側で計算済みの確定結果。"
                     f"信頼して有利不利の実況に使ってよい）: {type_hint}"
                 )
+            # 技効果ヒントRAG（2026-08-14・server.py側と同じ文言で配線）:
+            # パス1検証の最頻NGパターン「技の効果に関する事実誤認」対策
+            move_effect_hint = battle_context.get("move_effect_hint")
+            if move_effect_hint:
+                lines.append(
+                    f"直近で使われた技の効果（PokeAPI由来のデータ。信頼して事実として"
+                    f"扱ってよい）: {move_effect_hint}"
+                )
+                lines.append(
+                    "※ ダメージを与えない変化技（能力変化・状態異常付与等）の場合、"
+                    "「ダメージ」「効果ばつぐん」「〜に効いた」等の攻撃結果を表す言葉を使わないこと"
+                )
             condition_hint = battle_context.get("condition_hint")
             if condition_hint:
                 lines.append(

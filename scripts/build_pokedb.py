@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS moves (
     type     TEXT,
     category TEXT,
     power    INTEGER,
-    accuracy INTEGER
+    accuracy INTEGER,
+    effect   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS abilities (
@@ -192,11 +193,48 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pokemon_name_ko ON pokemon(name_ko)")
     conn.commit()
 
+    # 既存 DB へのマイグレーション（effect カラムがない古い DB に対応・2026-08-14
+    # 技効果ヒントRAG新設。技効果誤認パターン対策）
+    try:
+        conn.execute("ALTER TABLE moves ADD COLUMN effect TEXT")
+        conn.commit()
+        log.info("マイグレーション: moves.effect カラムを追加しました")
+    except sqlite3.OperationalError:
+        pass  # カラムが既に存在する場合は無視
+
     log.info("DB スキーマ初期化完了")
 
 # ─── 技データ取得 ─────────────────────────────────────────────────────────────
 
 DAMAGE_CLASS_JA = {"physical": "物理", "special": "特殊", "status": "変化"}
+
+# 技効果テキスト（flavor_text）のバージョングループ優先度。新しい世代ほど
+# 説明文が整理されている傾向があるため先頭を優先し、無ければ後方にフォールバックする
+_EFFECT_VERSION_GROUP_PRIORITY = [
+    "sword-shield", "ultra-sun-ultra-moon", "sun-moon",
+    "omega-ruby-alpha-sapphire", "x-y", "lets-go-pikachu-lets-go-eevee",
+]
+# SWSHのflavor_textの一部（bide/barrier等、SWSHで技マシン等から削除された技）に
+# 「この技は使えません」という説明文自体のダミーテキストが混入する
+# （実測: sword-shield 826件中147件が該当）ため除外する
+_EFFECT_PLACEHOLDER_MARKERS = ("この技は", "使えません")
+
+
+def _pick_move_effect_text(flavor_text_entries: list[dict]) -> str | None:
+    """flavor_text_entries からバージョングループ優先度順に日本語の効果説明文を選ぶ。"""
+    by_vg: dict[str, str] = {}
+    for e in flavor_text_entries:
+        if e.get("language", {}).get("name") != "ja":
+            continue
+        txt = e.get("flavor_text", "").replace("　", "").replace("\n", "")
+        if not txt or any(marker in txt for marker in _EFFECT_PLACEHOLDER_MARKERS):
+            continue
+        by_vg[e.get("version_group", {}).get("name", "")] = txt
+
+    for vg in _EFFECT_VERSION_GROUP_PRIORITY:
+        if vg in by_vg:
+            return by_vg[vg]
+    return next(iter(by_vg.values()), None)
 
 
 def fetch_moves(conn: sqlite3.Connection) -> None:
@@ -236,6 +274,32 @@ def fetch_moves(conn: sqlite3.Connection) -> None:
 
     conn.commit()
     log.info("技データ完了: %d 件", conn.execute("SELECT COUNT(*) FROM moves").fetchone()[0])
+
+
+def fetch_move_effects(conn: sqlite3.Connection) -> None:
+    """既存 moves 全行に、PokeAPI キャッシュ済みの flavor_text から効果テキストを
+    後付け補完する（2026-08-14・技効果ヒントRAG新設）。
+
+    fetch_moves() は `SELECT 1 FROM moves WHERE id=?` で既存行を丸ごとスキップする
+    ため、旧DBの919件には新設した effect 列が入らない。このバックフィル専用関数で
+    全件を対象に埋める。data/pokeapi_cache/move_*.json が既に取得済みのため、
+    通常は新規ネットワークアクセスは発生しない（_fetch() のキャッシュ層に乗る）。
+    """
+    log.info("=== 技効果データ backfill 開始 ===")
+    rows = conn.execute("SELECT id FROM moves").fetchall()
+    updated = 0
+    for i, (move_id,) in enumerate(rows):
+        m = _fetch(f"{POKEAPI_BASE}/move/{move_id}/")
+        effect = _pick_move_effect_text(m.get("flavor_text_entries", [])) if m else None
+        if effect:
+            conn.execute("UPDATE moves SET effect = ? WHERE id = ?", (effect, move_id))
+            updated += 1
+        if i % 100 == 0:
+            conn.commit()
+            log.info("  技効果: %d / %d 処理済み", i, len(rows))
+
+    conn.commit()
+    log.info("技効果データ backfill 完了: %d / %d 件", updated, len(rows))
 
 
 # ─── 特性データ取得 ───────────────────────────────────────────────────────────
@@ -391,6 +455,7 @@ def main() -> None:
 
         # 技・特性・アイテムを先に取得（ポケモン取得時に参照するため）
         fetch_moves(conn)
+        fetch_move_effects(conn)
         fetch_abilities(conn)
         fetch_items(conn)
         fetch_pokemon(conn)

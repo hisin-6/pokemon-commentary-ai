@@ -173,6 +173,36 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context("battle_end"), [], self._battle_state())
         assert "勝敗に触れること" not in prompt
 
+    def test_target_uncertainty_rule_present(self):
+        """2026-08-14: 技の対象不明時に対象ポケモン名を決め打ちしないよう指示する
+        安全策（ダブルバトル対象取り違え対策）。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "対象ポケモン名を" in prompt and "決め打ちしない" in prompt
+
+    def test_defense_result_uncertainty_rule_present(self):
+        """2026-08-14: 直前ターンの防御成功有無が不明な場合にダメージ命中を
+        断定しないよう指示する安全策（まもる無視/捏造対策）。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "まもる等の防御が成功したかどうか" in prompt
+
+    def test_side_uncertainty_rule_present(self):
+        """2026-08-14: 技を使った陣営（自分/相手）が不明な場合に断定しないよう
+        指示する安全策（陣営取り違え対策）。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "陣営（自分/相手）が状況情報から特定できない場合" in prompt
+
+    def test_move_effect_hint_included_when_present(self):
+        """2026-08-14: 技効果ヒントRAG（最頻NGパターン「技の効果に関する事実誤認」対策）。"""
+        prompt = _build_vision_prompt(
+            self._context(), [], self._battle_state(
+                move_effect_hint="おいかぜ: 味方全員の素早さをあげる。"))
+        assert "おいかぜ: 味方全員の素早さをあげる。" in prompt
+        assert "ダメージを与えない変化技" in prompt
+
+    def test_move_effect_hint_omitted_when_absent(self):
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "ダメージを与えない変化技" not in prompt
+
     def test_effectiveness_tag_usage_rule(self):
         """2026-08-04: パイプライン側でバツグンタグを検出できるようになったため、
         『絶対に使うな』の全面禁止から『タグがあれば信頼して使ってよい』に変更した。"""
@@ -626,6 +656,14 @@ class TestBuildScriptPrompt:
         prompt = _build_script_prompt(payload["gap"], payload["events"])
         assert "ネタバレ禁止" in prompt
         assert "先取り" in prompt
+
+    def test_target_and_defense_uncertainty_rules_present(self):
+        """2026-08-14: 台本パス（フィラー生成）にも対象不明時の決め打ち禁止・
+        防御結果不明時の命中断定禁止の安全策を追加（ビジョンパスと同種の対策）。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "対象ポケモン名を" in prompt and "決め打ちしない" in prompt
+        assert "まもる等の防御が成功したかどうか" in prompt
 
     def test_context_rendered_when_present(self):
         payload = _valid_script_payload()

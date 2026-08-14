@@ -43,6 +43,12 @@ CONFIDENT_THRESHOLD = 90   # これ以上: 確定採用
 CANDIDATE_THRESHOLD = 75   # これ以上: 低信頼度候補として採用
 # 75 未満: 不明扱い（除外）
 
+# 僅差候補判定用マージン（2026-08-14・紛らわしい技ペア対策）。上位候補との
+# スコア差がこの値未満なら「僅差の複数候補あり」としてconfidentに格上げしない。
+# OCR断片「パワー」が「パワージェム」「パワーシェア」どちらにもWRatio=90.0で
+# 同点マッチする実測ケースを確認済み。
+_AMBIGUITY_MARGIN = 3.0
+
 # カテゴリ定数
 CATEGORY_POKEMON = "pokemon"
 CATEGORY_MOVE    = "move"
@@ -183,7 +189,9 @@ class PokeClassifier:
                     category=category,
                     canonical_ja=result.canonical_ja,
                     score=result.score,
-                    confident=result.score >= CONFIDENT_THRESHOLD,
+                    # confident は _best_match が僅差候補判定込みで計算した値を
+                    # そのまま使う（2026-08-14・紛らわしい技ペア対策）
+                    confident=result.confident,
                 )
 
         if best.score < CANDIDATE_THRESHOLD:
@@ -214,20 +222,39 @@ class PokeClassifier:
         if dakuten_removed != text:
             variants.add(dakuten_removed)
 
-        # WRatio: partial_ratio と token_sort_ratio を組み合わせた汎用スコアラー
-        match = max(
-            (process.extractOne(v, entries, scorer=fuzz.WRatio) for v in variants),
-            key=lambda m: m[1] if m else 0,
-        )
-        if not match:
+        # WRatio: partial_ratio と token_sort_ratio を組み合わせた汎用スコアラー。
+        # 各バリアントにつき上位2件を取得し、僅差の複数候補を検知できるようにする
+        # （2026-08-14・紛らわしい技ペア対策）
+        candidates: list[tuple[str, float, int]] = []
+        for v in variants:
+            candidates.extend(process.extract(v, entries, scorer=fuzz.WRatio, limit=2))
+        if not candidates:
             return None
+        candidates.sort(key=lambda m: -m[1])
+        matched_ja, score, _ = candidates[0]
 
-        matched_ja, score, _ = match
+        # 僅差候補判定: 完全一致（100点付近）はOCR正読の可能性が高いため対象外にし、
+        # それ以外で2位候補（matched_jaと異なる名前）とのスコア差がマージン未満なら
+        # 「どちらとも言い切れない」としてconfidentに格上げしない
+        # （パワージェム⇔パワーシェア混同の実例対策）。
+        is_exact = score >= 99.5
+        runner_up = next((c for c in candidates[1:] if c[0] != matched_ja), None)
+        ambiguous = (
+            not is_exact
+            and runner_up is not None
+            and (score - runner_up[1]) < _AMBIGUITY_MARGIN
+        )
+        if ambiguous:
+            log.info(
+                "[分類] 僅差候補あり（%s: %.1f / %s: %.1f）→ confident降格",
+                matched_ja, score, runner_up[0], runner_up[1],
+            )
+
         return ClassifyResult(
             category=CATEGORY_UNKNOWN,   # 呼び出し元で上書き
             canonical_ja=matched_ja,
             score=float(score),
-            confident=score >= CONFIDENT_THRESHOLD,
+            confident=score >= CONFIDENT_THRESHOLD and not ambiguous,
         )
 
     # ── バッチ分類 ───────────────────────────────────────────────────────────
@@ -329,6 +356,18 @@ class PokeClassifier:
             "SELECT category FROM moves WHERE name_ja = ?", (move_name_ja,)
         ).fetchone()
         return row["category"] if row else None
+
+    def get_move_effect(self, move_name_ja: str) -> str | None:
+        """技名（日本語）から効果テキストを取得する（RAG用・2026-08-14新設）。
+
+        技の効果に関する事実誤認（おいかぜ等の変化技をダメージ技として説明する等）が
+        パス1検証で最頻パターンと判明したための対策。データは PokeAPI の flavor_text
+        由来（`scripts/build_pokedb.py`の`fetch_move_effects`でバックフィル）。
+        見つからない/effect未設定の場合はNone。"""
+        row = self._conn.execute(
+            "SELECT effect FROM moves WHERE name_ja = ?", (move_name_ja,)
+        ).fetchone()
+        return row["effect"] if row and row["effect"] else None
 
     def _get_moves_for_pokemon(self, pokemon_id: int) -> list[str]:
         """pokemon_moves テーブルから代表技リストを取得する。"""
