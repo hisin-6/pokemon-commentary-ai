@@ -2719,7 +2719,7 @@ class TestComputeTypeHint:
         self._add("player", "メタグロス", ["はがね", "エスパー"])
         self._add("opponent", "イワーク", ["いわ"])
         hint = self.runner._compute_type_hint()
-        assert "メタグロスの技はイワークにバツグン" in hint
+        assert "メタグロスのはがね技はイワークにバツグン" in hint
 
     def test_neutral_matchup_omitted(self):
         self._add("player", "ピカチュウ", ["でんき"])
@@ -2731,7 +2731,7 @@ class TestComputeTypeHint:
         self._add("player", "コータス", ["ほのお"])
         self._add("opponent", "ペリッパー", ["みず", "ひこう"])
         hint = self.runner._compute_type_hint()
-        assert "ペリッパーの技はコータスにバツグン" in hint
+        assert "ペリッパーのみず技はコータスにバツグン" in hint
 
     def test_fainted_pokemon_excluded(self):
         self.runner._battle_tracker._player.append(
@@ -2795,7 +2795,7 @@ class TestComputeTypeHint:
         self._add("opponent", "イワーク", ["いわ"])
         hint = self.runner._compute_type_hint()
         assert "実際に使った" not in hint
-        assert "メタグロスの技はイワークにバツグン" in hint
+        assert "メタグロスのはがね技はイワークにバツグン" in hint
 
     def test_weather_ball_type_overridden_by_weather(self):
         """2026-08-08発見: ウェザーボールは天候で技タイプが変わるが、天候情報
@@ -2840,7 +2840,7 @@ class TestComputeTypeHint:
         self._move_types["10まんボルト"] = "でんき"  # イワークに等倍（でんきはいわに特に効果なし）
         hint = self.runner._compute_type_hint()
         assert "実際に使った" not in hint
-        assert "メタグロスの技はイワークにバツグン" in hint
+        assert "メタグロスのはがね技はイワークにバツグン" in hint
 
 
 class TestLatestMoveEffectHint:
@@ -2968,7 +2968,7 @@ class TestTypeHintUsesMegaEvolution:
             FieldPokemon(name="リザードン", on_field=True, mega_evolved=True))
         self.runner._battle_tracker._opponent.append(FieldPokemon(name="オンバーン", on_field=True))
         hint = self.runner._compute_type_hint()
-        assert "オンバーンの技はリザードンにバツグン" in hint
+        assert "オンバーンのドラゴン技はリザードンにバツグン" in hint
 
 
 class TestRecordSituationSnapshot:

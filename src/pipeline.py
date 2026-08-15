@@ -4439,6 +4439,10 @@ class Pipeline:
             return None
 
         def _matchup_lines(attackers: list, defenders: list) -> list[str]:
+            # 2026-08-15検証: 「メタグロス(はがね/エスパー)のはがね技はいまひとつ」を
+            # setでラベルだけまとめて技タイプ名を省略した結果、LLMが「エスパー技も
+            # いまひとつ」と両方のタイプに誤って敷衍した実例あり（実質等倍なのに）。
+            # タイプ名を明示してどの技タイプの話か曖昧さを無くす
             lines: list[str] = []
             for attacker in attackers:
                 a_types = self._effective_pokemon_types(attacker, classifier)
@@ -4448,9 +4452,11 @@ class Pipeline:
                     d_types = self._effective_pokemon_types(defender, classifier)
                     if not d_types:
                         continue
-                    labels = {describe_matchup(t, d_types) for t in a_types} - {"等倍"}
-                    for label in labels:
-                        lines.append(f"{attacker.name}の技は{defender.name}に{label}")
+                    for t in a_types:
+                        label = describe_matchup(t, d_types)
+                        if label == "等倍":
+                            continue
+                        lines.append(f"{attacker.name}の{t}技は{defender.name}に{label}")
             return lines
 
         on_field_p = [p for p in self._battle_tracker._player if p.on_field and not p.fainted]

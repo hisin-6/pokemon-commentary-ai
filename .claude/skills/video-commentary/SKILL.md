@@ -120,20 +120,26 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
      （呼吸っぽい揺れ・`--no-sway`で無効化可）に拡張。加えてHeadへ数秒〜十数秒おきに
      ランダムな軽い仕草（首かしげ等）を挟み、長い無反応区間の単調さを崩す
      （`--no-idle-gestures`で無効化可）。
-     **2026-08-03ポーズ統合**: 表情が変わった瞬間のリアクションは、`explore_avatar_poses.py`
-     （＋`pose_tuner_gui.py`）で実機検証済みのポーズへSLERP遷移→保持→idle_downへ戻す
-     動作に統合（Joy=`victory_arms_up`・Sorrow=`bow_apologetic`・Fun=`head_tilt_curious`。
-     マッピング外の表情はNeckの標準うなずきにフォールバック）。ポーズ再生中は該当ボーンを
-     常時スウェイ/ランダム仕草から一時除外（`_suspend_bones`/`_resume_bones`）して競合を
-     防ぐ。`fist_pump_right`/`thinking_chin`/`lean_back_confident`は実機検証済みだが
-     まだイベント未マッピング（`explore_avatar_poses.POSES`には残っているので今後拡張可）。
+     **2026-08-03ポーズ統合 → 場面別ポーズ分岐 2026-08-15**: 表情が変わった瞬間の
+     リアクションは、`explore_avatar_poses.py`（＋`pose_tuner_gui.py`）で実機検証済みの
+     ポーズへSLERP遷移→保持→idle_downへ戻す動作に統合。同じ表情でも発生場面
+     （`_pose_variant_key`）でポーズを変える設計に拡張済み: Joy=`victory_arms_up`
+     （battle_end＝試合の勝敗が決まった瞬間のみ）/`fist_pump_right`（faint＝1匹倒す度の
+     軽いガッツポーズ）・Sorrow=`bow_apologetic`（自分が倒された時）/`thinking_chin`
+     （sentiment＝ピンチ等の実況キーワード反応）・Fun=`head_tilt_curious`（sentiment）/
+     `lean_back_confident`（battle_start＝対戦開始の意気込み）。これで元々未使用だった
+     `fist_pump_right`/`thinking_chin`/`lean_back_confident`の3ポーズも全て稼働＋
+     腕を大きく振り上げる`victory_arms_up`の発火頻度も下がる（`--avatar-crop`から
+     はみ出しやすい問題の緩和にもなる。上記地雷リスト参照）。マッピング外の表情は
+     Neckの標準うなずきにフォールバック。ポーズ再生中は該当ボーンを常時スウェイ/
+     ランダム仕草から一時除外（`_suspend_bones`/`_resume_bones`）して競合を防ぐ。
      **事前にVMCの設定画面でReceiver（39540 or 39541）の「有効化」チェックボックスを
      ONにしておくこと**（デフォルトOFF・OFFのままだと表情が一切変わらない＝実機で
      確認済みの地雷）。schedule.jsonが必要なので先に`render_commentary_video.py <動画名>
      --dry-run`を実行しておく。表情マッピングは`scripts/play_and_animate_avatar.py`の
      `_EVENT_EXPRESSION`/`_FAINT_EXPRESSION`/`_BATTLE_RESULT_EXPRESSION`/
-     `_POSITIVE_KEYWORDS`/`_NEGATIVE_KEYWORDS`/`_EXPRESSION_POSE`を、モーションは
-     `_IDLE_BONES`/`_NOD_*`/`_GESTURE_*`/`play_pose_reaction`を参照。
+     `_POSITIVE_KEYWORDS`/`_NEGATIVE_KEYWORDS`/`_POSE_VARIANTS`/`_pose_variant_key`を、
+     モーションは`_IDLE_BONES`/`_NOD_*`/`_GESTURE_*`/`play_pose_reaction`を参照。
      - **手順は「スクリプト起動→OBS録画→Enter」の順**（2026-07-30変更・T-pose対策後）:
        ①スクリプトを起動すると即座に腕を下ろした初期姿勢をOSC送信→
        ②「録画が始まったらEnterを押してください」の表示を待ってここでOBS録画を開始→
@@ -206,6 +212,7 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | states.jsonlが無い旧素材 | 戦況パネルが出ない | パス1の再実行が必要（timeline/statesは新パス1からのみ生成） |
 | モックアップ/日報の実フレーム | 対戦相手のトレーナー名が映る | publicリポジトリに載せてよいかはユーザー判断（2026-07-14に確認済み・現方針は許容） |
 | アバター全身録画をそのまま縮小 | 344px枠内で人物が極小・Tポーズの腕が窮屈 | `--avatar-crop`で上半身だけ切り出してから拡大する。**クロップ範囲の決め方**: 収録した生の録画（グリーンバック）から1フレーム抽出し、Pythonで緑以外のピクセルのbounding boxを検出すると人物の実座標が分かる（`PIL`+`numpy`で`is_green = (g>150)&(r<100)&(b<100)`の否定領域を`np.where`）。2026-07-30収録（`HairSample_Female.vrm`・1920x1080・全身がx760-1161/y273-1079に収まっていた）では`--avatar-crop "300:480:810:230"`（過去動画の実績値）でバストアップになり、これがそのまま流用できることを確認済み。モデルが変わったら同じ手順で再計測すること |
+| バストアップ用クロップだと`victory_arms_up`（バンザイ）で腕が枠外に見切れる | 静止時のbounding boxだけでクロップを決めると、腕を斜め上55°まで振り上げるポーズ（Joy表情の一部・`play_and_animate_avatar.py`の`_POSE_VARIANTS`参照）で肩から上・左右にはみ出す（2026-08-15発見） | **クロップ計測はidle姿勢の1フレームだけでなく、`explore_avatar_poses.py --pose victory_arms_up`を実機で再生させた状態のフレームでも行い、両方のbounding boxを包含する範囲に広げること**（UIや情報表示に被ってもよい前提で許容）。2026-08-15対応: `victory_arms_up`の発火頻度自体もJoy表情の"default"（battle_end＝試合の勝敗が決まった瞬間のみ）に絞り、1匹倒す度の"faint"variantは腕をあまり広げない`fist_pump_right`に変更済み（クロップを広げる対応との合わせ技） |
 | `--device`に数値インデックスを渡してもsounddeviceが認識しない | `play_and_animate_avatar.py --device 7`のように番号を渡すとエラー、または無関係のデバイスが選ばれる | sounddeviceは`device`引数が文字列だと**名前の部分一致検索**になり、数字文字列を渡しても数値インデックスとしては解釈されない。2026-07-30に対策済み: 数字文字列なら自動でintにキャストするよう`play_and_animate_avatar.py`を修正。デバイス一覧は`python -c "import sounddevice as sd; print(sd.query_devices())"`で確認し、CABLE Input側のMME/WASAPI版インデックスを指定する |
 | `play_and_animate_avatar.py`実行中にCtrl+Cで中断できない | 再生を途中で止めたくても効かない | `sd.wait()`のブロッキング待ちがWindowsだとシグナルを拾えないことがある。2026-07-30に対策済み: `sd.get_stream().active`をポーリングするループ＋`KeyboardInterrupt`ハンドリングに変更（`sd.stop()`で即座に再生停止） |
 | VMCがリップシンク中にフリーズする | 表情もリップシンクも反応しなくなる | 2026-07-30に実機で1回発生・VMC再起動で解消。再現条件は不明のため、フリーズしたらまず再起動を試す |

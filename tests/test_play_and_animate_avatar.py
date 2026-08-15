@@ -95,7 +95,7 @@ class TestBuildExpressionTimeline:
             {"start": 30.0, "event_type": "faint", "context": {"faint_side": "opponent"}},
         ]
         timeline = paa.build_expression_timeline(scheduled)
-        assert timeline == [(10.0, "Fun"), (30.0, "Joy")]
+        assert timeline == [(10.0, "Fun", "battle_start"), (30.0, "Joy", "faint")]
 
     def test_sorted_by_start_time(self):
         scheduled = [
@@ -103,11 +103,11 @@ class TestBuildExpressionTimeline:
             {"start": 10.0, "event_type": "battle_start", "context": {}},
         ]
         timeline = paa.build_expression_timeline(scheduled)
-        assert [t for t, _ in timeline] == [10.0, 30.0]
+        assert [t for t, _, _ in timeline] == [10.0, 30.0]
 
     def test_missing_context_treated_as_empty(self):
         scheduled = [{"start": 5.0, "event_type": "battle_start"}]
-        assert paa.build_expression_timeline(scheduled) == [(5.0, "Fun")]
+        assert paa.build_expression_timeline(scheduled) == [(5.0, "Fun", "battle_start")]
 
     def test_empty_schedule_returns_empty_timeline(self):
         assert paa.build_expression_timeline([]) == []
@@ -246,6 +246,51 @@ class TestSendReaction:
         paa.send_reaction(client, "Joy")
         bones_sent = {call.args[1][0] for call in client.send_message.call_args_list}
         assert set(paa.eap.POSES["victory_arms_up"]) <= bones_sent
+
+    def test_joy_faint_variant_uses_fist_pump_right(self):
+        """2026-08-15: 1匹倒す度に毎回victory_arms_up（腕を大きく振り上げ、
+        --avatar-cropからはみ出しやすい）を送っていたのを、faint variantでは
+        軽めのfist_pump_rightに切り替えて頻度を落とした。"""
+        client = MagicMock()
+        paa.send_reaction(client, "Joy", "faint")
+        bones_sent = {call.args[1][0] for call in client.send_message.call_args_list}
+        assert set(paa.eap.POSES["fist_pump_right"]) <= bones_sent
+
+    def test_sorrow_sentiment_variant_uses_thinking_chin(self):
+        client = MagicMock()
+        paa.send_reaction(client, "Sorrow", "sentiment")
+        bones_sent = {call.args[1][0] for call in client.send_message.call_args_list}
+        assert set(paa.eap.POSES["thinking_chin"]) <= bones_sent
+
+    def test_fun_battle_start_variant_uses_lean_back_confident(self):
+        client = MagicMock()
+        paa.send_reaction(client, "Fun", "battle_start")
+        bones_sent = {call.args[1][0] for call in client.send_message.call_args_list}
+        assert set(paa.eap.POSES["lean_back_confident"]) <= bones_sent
+
+    def test_unknown_variant_falls_back_to_default_pose(self):
+        client = MagicMock()
+        paa.send_reaction(client, "Joy", "some_unmapped_variant")
+        bones_sent = {call.args[1][0] for call in client.send_message.call_args_list}
+        assert set(paa.eap.POSES["victory_arms_up"]) <= bones_sent
+
+
+class TestPoseVariantKey:
+    def test_faint_side_in_context_wins_regardless_of_event_type(self):
+        """faint_sideはfaint単独dispatchだけでなくmove_used統合経路にも乗る
+        （expression_forと同じ優先順）。"""
+        assert paa._pose_variant_key("move_used", {"faint_side": "opponent"}) == "faint"
+        assert paa._pose_variant_key("faint", {"faint_side": "player"}) == "faint"
+
+    def test_battle_start(self):
+        assert paa._pose_variant_key("battle_start", {}) == "battle_start"
+
+    def test_sentiment_event_types(self):
+        for et in ("move_used", "move_single", "switch"):
+            assert paa._pose_variant_key(et, {}) == "sentiment"
+
+    def test_battle_end_is_default(self):
+        assert paa._pose_variant_key("battle_end", {"battle_result": "勝ち"}) == "default"
 
 
 class TestSendSmoothKeyframes:

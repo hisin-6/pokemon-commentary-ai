@@ -166,14 +166,17 @@ def load_schedule(render_dir: Path) -> list[dict]:
     return data["scheduled"]
 
 
-def build_expression_timeline(scheduled: list[dict]) -> list[tuple[float, str]]:
-    """(発火時刻, ブレンドシェイプ名) のリストを開始時刻順で返す（表情変更なしイベントは除く）。"""
+def build_expression_timeline(scheduled: list[dict]) -> list[tuple[float, str, str]]:
+    """(発火時刻, ブレンドシェイプ名, ポーズバリエーションキー) のリストを
+    開始時刻順で返す（表情変更なしイベントは除く）。"""
     timeline = []
     for entry in scheduled:
-        expr = expression_for(entry.get("event_type", ""), entry.get("context") or {},
-                              entry.get("commentary", ""))
+        event_type = entry.get("event_type", "")
+        context = entry.get("context") or {}
+        expr = expression_for(event_type, context, entry.get("commentary", ""))
         if expr:
-            timeline.append((float(entry["start"]), expr))
+            variant = _pose_variant_key(event_type, context)
+            timeline.append((float(entry["start"]), expr, variant))
     timeline.sort(key=lambda t: t[0])
     return timeline
 
@@ -218,9 +221,10 @@ _IDLE_BONES: tuple[_IdleBoneConfig, ...] = (
 )
 _SWAY_UPDATE_INTERVAL_SEC = 0.15
 
-# ── 表情変化時のリアクション動作（モーション② 2026-08-01 → ポーズ統合 2026-08-03）
+# ── 表情変化時のリアクション動作（モーション② 2026-08-01 → ポーズ統合 2026-08-03
+# → 場面別ポーズ分岐 2026-08-15）
 # Joy/Sorrow/Funは`explore_avatar_poses.py`で実機検証済みのポーズへ滑らかに
-# 遷移する（_EXPRESSION_POSE・play_pose_reaction）。それ以外（Angryなど現状未使用の
+# 遷移する（_POSE_VARIANTS・play_pose_reaction）。それ以外（Angryなど現状未使用の
 # 表情）はNeckの標準うなずきにフォールバックする。
 _NOD_BONE = "Neck"
 _NOD_AXIS = "x"
@@ -228,16 +232,46 @@ _NOD_SEQUENCE_DEG = (10.0, 14.0, 6.0, 0.0)
 _NOD_STEP_SEC = 0.12
 
 # 表情 → 遷移させるポーズ名（`explore_avatar_poses.POSES`のキー）。
-# Joy    = victory_arms_up（バンザイ・勝利の瞬間用）
-# Sorrow = bow_apologetic（会釈・謝罪系リアクション）
-# Fun    = head_tilt_curious（首かしげ・興味津々）
-# fist_pump_right/thinking_chin/lean_back_confidentは実機検証済みだが、まだ
-# 対応するイベント種別が無いため未マッピング（将来の拡張用にPOSESには残っている）。
-_EXPRESSION_POSE = {
-    "Joy": "victory_arms_up",
-    "Sorrow": "bow_apologetic",
-    "Fun": "head_tilt_curious",
+# 2026-08-15: 同じ表情でも発生場面（variant）によってポーズを変え、単調さを崩す
+# ＋victory_arms_up（腕を大きく振り上げるV字バンザイ・--avatar-cropからはみ出し
+# やすい）の発火頻度を「試合の勝敗が決まった瞬間」だけに絞る（従来は1匹倒す度に
+# 毎回発火していた）。fist_pump_right/thinking_chin/lean_back_confidentは
+# 実機検証済みだが未使用だった3ポーズ（`explore_avatar_poses.py`参照）。
+# "default"キーは_pose_variant_keyが未知のvariantを返した場合のフォールバック。
+_POSE_VARIANTS = {
+    "Joy": {
+        "default": "victory_arms_up",   # battle_end（試合の勝利）用・派手なバンザイ
+        "faint": "fist_pump_right",     # 1匹倒す度の軽いガッツポーズ
+    },
+    "Sorrow": {
+        "default": "bow_apologetic",    # 自分が倒された時の会釈
+        "sentiment": "thinking_chin",   # ピンチ等の実況キーワード反応・考え込む仕草
+    },
+    "Fun": {
+        "default": "head_tilt_curious",  # 技が決まった時の首かしげ
+        "battle_start": "lean_back_confident",  # 対戦開始の意気込み
+    },
 }
+
+
+def _pose_variant_key(event_type: str, context: dict) -> str:
+    """ポーズのバリエーション選択に使う分類キーを返す。faint_sideがcontextに
+    乗っていればevent_type（faint/move_used統合どちらも）を問わず'faint'扱いにする
+    （pipeline.py側のfaint統合仕様に合わせる。expression_forと同じ優先順）。"""
+    if "faint_side" in context:
+        return "faint"
+    if event_type == "battle_start":
+        return "battle_start"
+    if event_type in _SENTIMENT_EVENT_TYPES:
+        return "sentiment"
+    return "default"
+
+
+def _pose_for(expression: str, variant: str = "default") -> str | None:
+    variants = _POSE_VARIANTS.get(expression)
+    if not variants:
+        return None
+    return variants.get(variant, variants["default"])
 
 # ポーズ遷移1回あたりの秒数（遷移in→保持→遷移outの3段）
 _POSE_TRANSITION_SEC = 0.45
@@ -392,11 +426,12 @@ def _send_smooth_keyframes(client: SimpleUDPClient, bone: str, axis: str,
             time.sleep(interval)
 
 
-def send_reaction(client: SimpleUDPClient, expression: str) -> None:
+def send_reaction(client: SimpleUDPClient, expression: str, variant: str = "default") -> None:
     """表情が変わった瞬間に一度だけ呼ぶリアクション動作（短時間ブロッキング）。
-    _EXPRESSION_POSEにマッピングされた表情はポーズ遷移（play_pose_reaction）、
-    それ以外はNeckの標準うなずき（滑らか化済み）のみ。"""
-    pose_name = _EXPRESSION_POSE.get(expression)
+    _POSE_VARIANTSにマッピングされた表情はポーズ遷移（play_pose_reaction）、
+    それ以外はNeckの標準うなずき（滑らか化済み）のみ。variant省略時は"default"
+    （=従来のvictory_arms_up/bow_apologetic/head_tilt_curiousと同じ挙動）。"""
+    pose_name = _pose_for(expression, variant)
     if pose_name:
         play_pose_reaction(client, pose_name)
         return
@@ -413,17 +448,17 @@ def send_expression(client: SimpleUDPClient, name: str) -> None:
     log.info("[表情] %s", name)
 
 
-def run_expression_scheduler(client: SimpleUDPClient, timeline: list[tuple[float, str]],
+def run_expression_scheduler(client: SimpleUDPClient, timeline: list[tuple[float, str, str]],
                              start_clock: float, total_duration: float) -> None:
     """再生開始時刻(start_clock)を基準に、timelineの時刻が来るたびOSCを送る。
     表情は_EXPRESSION_HOLD_SEC秒後（次のイベントより先に来れば）Neutralへ戻す。
     """
-    for i, (t, expr) in enumerate(timeline):
+    for i, (t, expr, variant) in enumerate(timeline):
         wait = start_clock + t - time.monotonic()
         if wait > 0:
             time.sleep(wait)
         send_expression(client, expr)
-        send_reaction(client, expr)  # 表情が変わった瞬間だけ感情別のリアクションを1回入れる
+        send_reaction(client, expr, variant)  # 表情が変わった瞬間だけ感情別のリアクションを1回入れる
 
         next_t = timeline[i + 1][0] if i + 1 < len(timeline) else total_duration
         hold_until = min(t + _EXPRESSION_HOLD_SEC, next_t)
