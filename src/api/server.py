@@ -439,15 +439,19 @@ def _parse_commentary(text: str) -> tuple[str, str]:
 
 
 def _gap_filler_count(start: float, end: float) -> int:
-    """無言区間の長さから生成するフィラーの目安件数を決める（約40秒に1件・1〜3件）。
+    """無言区間の長さから生成するフィラーの目安件数を決める（約20秒に1件・1〜5件）。
 
     2026-07-14に「とてもしゃべらせたい」で25秒→18秒へ増量したが、
     2026-07-30の視聴フィードバック「フィラーが多い」で30秒/件・上限3へ減量。
     その後「もう少し増やしたい」で25秒/件・上限4へ再調整。
     さらに視聴フィードバック「あ、あ、が耳につく・フィラーを減らして実況を
     活かしたい」で40秒/件・上限3に再々調整（2026-07-30続き）。
+    **2026-08-15訂正**: 上記「あ、あ、」fbは実際には言葉遣い（相槌の書き出し）への
+    指摘であり、無言埋め自体の生成頻度を絞る話ではなかったとユーザーから訂正あり。
+    相槌対策は別途「書き出しのバリエーション」指示で対応済みのため、無言埋めは
+    20秒/件・上限5へ積極的に戻す（無言を減らし、隙間を実況・雑談で積極的に埋める方針）。
     """
-    return max(1, min(3, int((end - start) // 40)))
+    return max(1, min(5, int((end - start) // 20)))
 
 
 def _build_script_prompt(gap: dict, events: list, moments: list = None,
@@ -469,6 +473,9 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None,
     first_event_time = min(float(e.get("time", 0)) for e in events)
     gap_start = float(gap["start"])
     gap_end = float(gap["end"])
+    # 動画冒頭の無言区間か（generate_gap_commentary.pyのcompute_gapsが付与）。
+    # 開始時挨拶を確実に入れるための2026-08-15新設フラグ
+    is_intro = bool(gap.get("is_intro"))
 
     if persona == "neutral":
         intro_lines = [
@@ -497,7 +504,9 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None,
         "録画された試合に後から実況を吹き込みますが、視聴者には生放送の",
         "ライブ実況に聞こえるようにしてください（後から見返している・録画といった言い方は禁止）。",
         "主要イベントの実況音声はすでに収録済みです。",
-        "イベント間の「無言区間」を埋めるつなぎ実況（フィラー）を生成してください。",
+        "イベントとイベントの間の時間も、視聴者を楽しませる実況・雑談として積極的に",
+        "語ってください。「無言を埋めるための最低限の一言」ではなく、内容のあるトーク",
+        "（考察・戦況の掘り下げ・キャラとしての感想等）を心がけること。",
         "",
         *_DOUBLES_TACTICS_LINES,
         "",
@@ -506,6 +515,17 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None,
         "【口調のイメージ例（この試合とは無関係な架空例・内容は真似しなくてよい）】",
         *[f"- {commentary}" for _situation, commentary in tone_examples],
         "",
+    ]
+    if is_intro:
+        lines += [
+            "【最優先・動画冒頭の挨拶】",
+            "- この区間は動画が始まって最初の無言区間です。time が一番早いフィラーは",
+            "  必ず視聴者への挨拶（「みんな、こんにちは/こんばんは」「今日も一緒に",
+            "  見ていくよ」等の呼びかけ）から始めること。今日の対戦への意気込みや",
+            "  見どころ紹介を続けてよい（自己紹介的な名乗りも1回まではOK）",
+            "",
+        ]
+    lines += [
         "【最重要ルール: ネタバレ禁止】",
         "- 各フィラーは、その time 時点までに起きた出来事の情報だけを使うこと",
         "- time より後の出来事や試合の勝敗を絶対に先取りして言及しないこと",

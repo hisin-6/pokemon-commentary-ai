@@ -39,30 +39,48 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 logger = logging.getLogger(__name__)
 
 # この秒数を超える無言区間をフィラーの対象にする
-_DEFAULT_MIN_GAP_SEC = 40.0  # 2026-07-30視聴fb「フィラーが多い」で20→30秒に引き上げ→
+_DEFAULT_MIN_GAP_SEC = 20.0  # 2026-07-30視聴fb「フィラーが多い」で20→30秒に引き上げ→
                              # 「もう少し増やしたい」で25秒に再調整→さらに視聴fb
                              # 「あ、あ、が耳につく・フィラーを減らして実況を活かしたい」で
-                             # 40秒に再々調整（実況を薄めるフィラーを減らす方向）
+                             # 40秒に再々調整。**2026-08-15訂正**: 上記「あ、あ、」fbは
+                             # 実際には言葉遣い（相槌の書き出し）への指摘であり、無言埋め
+                             # 自体の生成頻度を絞る話ではなかったとユーザーから訂正あり。
+                             # 相槌対策は別途「書き出しのバリエーション」指示
+                             # （下記_build_script_prompt）で対応済みのため、無言埋めは
+                             # 20秒へ積極的に戻す
+# 冒頭（動画開始〜最初のイベント実況）は開始時挨拶を確実に入れたいため、
+# 通常のmin_gapより短い閾値で対象化する（2026-08-15新設）
+_INTRO_MIN_GAP_SEC = 8.0
 # ギャップ端の余白（イベント実況の直前直後にフィラーを密着させない）
 _GAP_MARGIN_SEC = 2.0
 
 
 def compute_gaps(scheduled: list, video_duration: float = 0.0,
                  min_gap: float = _DEFAULT_MIN_GAP_SEC,
-                 margin: float = _GAP_MARGIN_SEC) -> list:
+                 margin: float = _GAP_MARGIN_SEC,
+                 intro_min_gap: float = _INTRO_MIN_GAP_SEC) -> list:
     """スケジュール済みイベント実況の間の無言区間を検出する。
 
     区間は前後 ``margin`` 秒を除いた「フィラーを置いてよい範囲」で返す。
-    冒頭（0秒〜最初の実況）も対象。末尾は ``video_duration`` が分かる場合のみ。
+    冒頭（0秒〜最初の実況）も対象。開始時挨拶を確実に入れるため、冒頭区間だけは
+    通常の ``min_gap`` より短い ``intro_min_gap`` を閾値に使い、``is_intro: True``
+    を付ける（2026-08-15新設・server.py側で挨拶必須の指示に使う）。
+    末尾は ``video_duration`` が分かる場合のみ。
     """
     gaps = []
     prev_end = 0.0
+    is_first = True
     for e in sorted(scheduled, key=lambda e: e["start"]):
         gap_start = prev_end + (margin if prev_end > 0 else 0.0)
         gap_end = e["start"] - margin
-        if gap_end - gap_start >= min_gap:
-            gaps.append({"start": round(gap_start, 1), "end": round(gap_end, 1)})
+        threshold = intro_min_gap if is_first else min_gap
+        if gap_end - gap_start >= threshold:
+            gap = {"start": round(gap_start, 1), "end": round(gap_end, 1)}
+            if is_first:
+                gap["is_intro"] = True
+            gaps.append(gap)
         prev_end = max(prev_end, e["start"] + e["duration"])
+        is_first = False
     if video_duration > 0:
         gap_start = prev_end + margin
         gap_end = video_duration - margin

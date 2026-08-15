@@ -771,10 +771,10 @@ class TestBuildScriptPrompt:
         assert prompt.index("63.0秒") < prompt.index("📺70.0秒")
 
     def test_gap_line_contains_filler_count(self):
-        """★区間の行に区間長に応じた件数指定が入る（53秒区間→1件）。"""
+        """★区間の行に区間長に応じた件数指定が入る（53秒区間→2件）。"""
         payload = _valid_script_payload()
         prompt = _build_script_prompt(payload["gap"], payload["events"])
-        assert "★78.0秒 〜 131.0秒 = 無言区間（ここにフィラーを1件）" in prompt  # 53秒÷40秒/件
+        assert "★78.0秒 〜 131.0秒 = 無言区間（ここにフィラーを2件）" in prompt  # 53秒÷20秒/件
 
     def test_live_commentary_persona(self):
         """録画感を出さないライブ実況指示が入る。"""
@@ -826,6 +826,27 @@ class TestBuildScriptPrompt:
         assert "倒れた" not in prompt
         assert "★0.0秒 〜 61.0秒" in prompt
 
+    def test_intro_gap_includes_mandatory_greeting_instruction(self):
+        """2026-08-15新設: is_intro付きのgapは開始時挨拶を必須にする指示が入る
+        （generate_gap_commentary.pyのcompute_gapsが冒頭区間に付与するフラグ）。"""
+        payload = _valid_script_payload(gap={"start": 0.0, "end": 61.0, "is_intro": True})
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "動画冒頭の挨拶" in prompt
+        assert "視聴者への挨拶" in prompt
+
+    def test_non_intro_gap_excludes_greeting_instruction(self):
+        payload = _valid_script_payload()  # is_introキー無し（通常のgap）
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "動画冒頭の挨拶" not in prompt
+
+    def test_prompt_frames_gaps_as_active_commentary_not_filler(self):
+        """2026-08-15訂正: 「無言を埋めるための最低限の一言」ではなく、実況・雑談として
+        積極的に語るトーンに修正（ユーザーfb: フィラーという言葉自体が「あー」「えっと」
+        のような相槌を連想させていた）。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "視聴者を楽しませる実況・雑談として積極的に" in prompt
+
     def test_includes_slang_glossary(self):
         """改善ロードマップ④（口調・知識改善）: 対戦スラング用語集が注入されている。"""
         payload = _valid_script_payload()
@@ -851,12 +872,12 @@ class TestBuildScriptPrompt:
 class TestGapFillerCount:
 
     def test_scales_with_gap_length(self):
-        # 2026-07-30続き「あ、あ、が耳につく・フィラーを減らして実況を活かしたい」で
-        # 40秒/件・上限3に再々調整
+        # 2026-08-15: 「あ、あ、」fbは言葉遣いへの指摘であり無言埋め自体を絞る話では
+        # なかったとユーザー訂正→20秒/件・上限5へ積極的に戻した
         assert _gap_filler_count(0.0, 15.0) == 1     # 短い区間は最低1件
-        assert _gap_filler_count(0.0, 65.0) == 1
-        assert _gap_filler_count(0.0, 100.0) == 2
-        assert _gap_filler_count(0.0, 300.0) == 3    # 上限3件
+        assert _gap_filler_count(0.0, 65.0) == 3
+        assert _gap_filler_count(0.0, 100.0) == 5
+        assert _gap_filler_count(0.0, 300.0) == 5    # 上限5件
 
 
 class TestParseScriptFillers:

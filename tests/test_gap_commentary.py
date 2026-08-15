@@ -26,28 +26,46 @@ def _sched(start, duration=10.0):
 
 class TestComputeGaps:
     def test_leading_gap_detected_without_margin_at_zero(self):
-        """冒頭ギャップは0秒から（margin適用なし）。"""
+        """冒頭ギャップは0秒から（margin適用なし）・is_introが付く（2026-08-15）。"""
         gaps = ggc.compute_gaps([_sched(63.0)], min_gap=20.0, margin=2.0)
-        assert gaps[0] == {"start": 0.0, "end": 61.0}
+        assert gaps[0] == {"start": 0.0, "end": 61.0, "is_intro": True}
 
     def test_between_events_gap_has_margin_on_both_sides(self):
+        # 冒頭区間の混入を避けるためintro_min_gapを無効化（0）してイベント間だけ見る
         gaps = ggc.compute_gaps([_sched(10.0, 10.0), _sched(100.0, 10.0)],
-                                min_gap=20.0, margin=2.0)
+                                min_gap=20.0, margin=2.0, intro_min_gap=20.0)
         # 前イベント終了20.0 + 2.0 〜 次イベント開始100.0 - 2.0
         assert {"start": 22.0, "end": 98.0} in gaps
 
     def test_short_gap_ignored(self):
         gaps = ggc.compute_gaps([_sched(10.0, 10.0), _sched(30.0, 10.0)],
-                                min_gap=20.0, margin=2.0)
-        # 20〜30秒の間は実質6秒 → 対象外
+                                min_gap=20.0, margin=2.0, intro_min_gap=20.0)
+        # 20〜30秒の間は実質6秒 → 対象外（intro_min_gap=min_gapで冒頭8秒も同基準）
         assert gaps == []
 
     def test_trailing_gap_only_when_video_duration_known(self):
         scheduled = [_sched(10.0, 10.0)]
-        assert ggc.compute_gaps(scheduled, video_duration=0.0, min_gap=20.0) == []
+        assert ggc.compute_gaps(scheduled, video_duration=0.0, min_gap=20.0,
+                                intro_min_gap=20.0) == []
         gaps = ggc.compute_gaps(scheduled, video_duration=100.0,
-                                min_gap=20.0, margin=2.0)
+                                min_gap=20.0, margin=2.0, intro_min_gap=20.0)
         assert gaps == [{"start": 22.0, "end": 98.0}]
+
+    def test_intro_gap_uses_shorter_threshold_than_normal_gaps(self):
+        """開始時挨拶を確実に入れるため、冒頭だけはintro_min_gap（通常のmin_gapより
+        短い）で対象化される（2026-08-15新設）。"""
+        # 冒頭6秒だけならmin_gap=20では対象外だが、intro_min_gap=5なら対象
+        gaps = ggc.compute_gaps([_sched(8.0, 10.0)], min_gap=20.0, margin=2.0,
+                                intro_min_gap=5.0)
+        assert gaps == [{"start": 0.0, "end": 6.0, "is_intro": True}]
+
+    def test_only_leading_gap_gets_is_intro_flag(self):
+        """2件目以降のギャップ（イベント間・末尾）にはis_introが付かない。"""
+        gaps = ggc.compute_gaps(
+            [_sched(5.0, 10.0), _sched(50.0, 10.0)],
+            video_duration=100.0, min_gap=20.0, margin=2.0, intro_min_gap=1.0)
+        assert gaps[0]["is_intro"] is True
+        assert all("is_intro" not in g for g in gaps[1:])
 
 
 class TestSplitGapsByMoments:
