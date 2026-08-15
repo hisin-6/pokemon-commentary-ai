@@ -39,15 +39,27 @@
 抑制だけでは防ぎきれない（2026-07-14に検査スキップした生成分から1件が動画まで
 到達した実例あり）。**フィラーを再生成したら必ず③からやり直す**こと。
 
+## persona（キャラクター設定）
+
+- `--persona kurepi`（デフォルト）＝花圓くれぴの名前・口調（語尾♪・タメ口・テンション高め）。
+  `--persona neutral`＝名乗り・一人称のキャラ付けを外した中立実況（3Dモデル一時差し替え
+  検証用・2026-08-14新設）
+- **⚠️2026-08-15〜当面は`--persona neutral`で運用**（3Dモデル外注完成までのつなぎで
+  四国めたん公式VRMを試用中のため。VRM自体はVMC側で手動差し替え・コード変更不要）
+- **パス1・パス1.5の両方に必ず同じ値を指定すること**（パス1で決まった口調にパス1.5の
+  フィラーが合わせる設計のため。片方だけ付け忘れてkurepi口調のまま混在した実例あり
+  ＝`manifest.jsonl`の実況文に「♪」等が残っていないか要確認）
+
 ## 実行手順
 
 ### パス1（Windows PowerShell）
 
 ```
 # ⚠️ 事前に必ず VOICEVOX を起動する（忘れると素材ゼロ・Bedrock代だけ消える）
+# ⚠️ 当面 --persona neutral を付ける（上記「persona」参照）
 venv\Scripts\python.exe src/pipeline.py --input "D:\ゲーム録画\<動画>.mp4" ^
   --end-model runs/detect/train_end_screen2/weights/best.pt ^
-  --ec2-url http://<EC2のIP>:5000 --conf 0.3 --render-out renders/<動画名>
+  --ec2-url http://<EC2のIP>:5000 --conf 0.3 --render-out renders/<動画名> --persona neutral
 ```
 
 （`--model`＝状態異常YOLO・`--ball-model`＝ボール数YOLOは2026-07-15より未指定がデフォルト。
@@ -64,10 +76,11 @@ venv\Scripts\python.exe src/pipeline.py --input "D:\ゲーム録画\<動画>.mp4
 ### パス1.5（Windows・VOICEVOX起動必須）
 
 ```
+# ⚠️ --persona はパス1と必ず同じ値にする（当面 neutral）
 # まず --dry-run でフィラー文面を確認（VOICEVOX不要・fillers.jsonlは書かれない）
-venv\Scripts\python.exe scripts\generate_gap_commentary.py renders\<動画名> --ec2-url http://<EC2のIP>:5000 --dry-run
+venv\Scripts\python.exe scripts\generate_gap_commentary.py renders\<動画名> --ec2-url http://<EC2のIP>:5000 --persona neutral --dry-run
 # 文面OKなら --dry-run を外して本実行（これでfillers.jsonlが書かれる）
-venv\Scripts\python.exe scripts\generate_gap_commentary.py renders\<動画名> --ec2-url http://<EC2のIP>:5000
+venv\Scripts\python.exe scripts\generate_gap_commentary.py renders\<動画名> --ec2-url http://<EC2のIP>:5000 --persona neutral
 ```
 
 ⚠️ dry-runは**ファイルに書き込まない**。「実行した」と思ってもfillers.jsonlの
@@ -210,7 +223,8 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | 日本語フォント | 字幕が豆腐/英字 | WSLにフォント不要。`fontsdir=/mnt/c/Windows/Fonts`のmeiryoを参照している |
 | renders/のcommit | 数GBのmp4がリポジトリに入る | .gitignore済み。**外さないこと** |
 | states.jsonlが無い旧素材 | 戦況パネルが出ない | パス1の再実行が必要（timeline/statesは新パス1からのみ生成） |
-| モックアップ/日報の実フレーム | 対戦相手のトレーナー名が映る | publicリポジトリに載せてよいかはユーザー判断（2026-07-14に確認済み・現方針は許容） |
+| モックアップ/日報の実フレーム | 対戦相手のトレーナー名が映る | publicリポジトリに載せてよいかはユーザー判断（2026-07-14に確認済み・現方針は許容）。**YouTube公開動画も同じ方針で画面表示は許容**（2026-08-15確認） |
+| 実況テキストが相手トレーナー名をそのまま読み上げる懸念 | 動画は公開されるため、音声で個人特定できる名前を読み上げると画面表示より踏み込んだ形になる | **2026-08-15対策済み**: vision/script両プロンプト（`server.py`）に「トレーナー名（画面のIDやハンドルネーム）をそのまま呼ばない・「相手」「お相手」等でぼかす」指示を追加。画面表示自体は上記行の方針どおり許容、実況の読み上げだけを避ける |
 | アバター全身録画をそのまま縮小 | 344px枠内で人物が極小・Tポーズの腕が窮屈 | `--avatar-crop`で上半身だけ切り出してから拡大する。**クロップ範囲の決め方**: 収録した生の録画（グリーンバック）から1フレーム抽出し、Pythonで緑以外のピクセルのbounding boxを検出すると人物の実座標が分かる（`PIL`+`numpy`で`is_green = (g>150)&(r<100)&(b<100)`の否定領域を`np.where`）。2026-07-30収録（`HairSample_Female.vrm`・1920x1080・全身がx760-1161/y273-1079に収まっていた）では`--avatar-crop "300:480:810:230"`（過去動画の実績値）でバストアップになり、これがそのまま流用できることを確認済み。モデルが変わったら同じ手順で再計測すること |
 | バストアップ用クロップだと`victory_arms_up`（バンザイ）で腕が枠外に見切れる | 静止時のbounding boxだけでクロップを決めると、腕を斜め上55°まで振り上げるポーズ（Joy表情の一部・`play_and_animate_avatar.py`の`_POSE_VARIANTS`参照）で肩から上・左右にはみ出す（2026-08-15発見） | **クロップ計測はidle姿勢の1フレームだけでなく、`explore_avatar_poses.py --pose victory_arms_up`を実機で再生させた状態のフレームでも行い、両方のbounding boxを包含する範囲に広げること**（UIや情報表示に被ってもよい前提で許容）。2026-08-15対応: `victory_arms_up`の発火頻度自体もJoy表情の"default"（battle_end＝試合の勝敗が決まった瞬間のみ）に絞り、1匹倒す度の"faint"variantは腕をあまり広げない`fist_pump_right`に変更済み（クロップを広げる対応との合わせ技） |
 | `--device`に数値インデックスを渡してもsounddeviceが認識しない | `play_and_animate_avatar.py --device 7`のように番号を渡すとエラー、または無関係のデバイスが選ばれる | sounddeviceは`device`引数が文字列だと**名前の部分一致検索**になり、数字文字列を渡しても数値インデックスとしては解釈されない。2026-07-30に対策済み: 数字文字列なら自動でintにキャストするよう`play_and_animate_avatar.py`を修正。デバイス一覧は`python -c "import sounddevice as sd; print(sd.query_devices())"`で確認し、CABLE Input側のMME/WASAPI版インデックスを指定する |

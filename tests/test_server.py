@@ -133,6 +133,13 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context("faint"), [], self._battle_state())
         assert "倒れた" in prompt or "HP=0" in prompt
 
+    def test_prompt_forbids_reading_trainer_name(self):
+        """2026-08-15: 動画公開にあたり相手トレーナー名を実況で言及しない安全策
+        （「相手」「お相手」等でぼかす指示）が入る。"""
+        prompt = _build_vision_prompt(self._context("move_used"), [], self._battle_state())
+        assert "トレーナー名" in prompt and "そのまま呼ばない" in prompt
+        assert "お相手" in prompt
+
     def test_faint_focus_switches_to_inferred_hint(self):
         """合成faint（ボール数減少推定）: 画面に0%表示が無いため「HP=0のポケモンを
         特定」ではなく確定済みの対象を直接指示するevent_hintに差し替える。"""
@@ -838,6 +845,22 @@ class TestBuildScriptPrompt:
         payload = _valid_script_payload()  # is_introキー無し（通常のgap）
         prompt = _build_script_prompt(payload["gap"], payload["events"])
         assert "動画冒頭の挨拶" not in prompt
+
+    def test_intro_gap_neutral_persona_greeting_not_blocked_by_no_name_rule(self):
+        """2026-08-15実機発見の修正: neutralペルソナの「名乗り禁止」ルールと素朴に
+        併記すると、LLMが挨拶自体まで自重して弱い書き出し（「それでは対戦を始めて
+        いきます」等）になっていた。挨拶は名乗り・キャラ付けとは別だと明示する。"""
+        payload = _valid_script_payload(gap={"start": 0.0, "end": 61.0, "is_intro": True})
+        prompt = _build_script_prompt(payload["gap"], payload["events"], persona="neutral")
+        assert "動画冒頭の挨拶" in prompt
+        assert "名乗り禁止ルールとは別に必ず行う" in prompt
+
+    def test_prompt_forbids_reading_trainer_name(self):
+        """2026-08-15: 動画公開にあたり相手トレーナー名を実況で言及しない安全策。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "トレーナー名" in prompt and "そのまま呼ばない" in prompt
+        assert "お相手" in prompt
 
     def test_prompt_frames_gaps_as_active_commentary_not_filler(self):
         """2026-08-15訂正: 「無言を埋めるための最低限の一言」ではなく、実況・雑談として
