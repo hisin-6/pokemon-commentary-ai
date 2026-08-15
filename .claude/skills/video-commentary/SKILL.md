@@ -161,11 +161,18 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
        （旧手順「録画→スクリプト実行」だと録画開始直後の一瞬Tポーズが映っていた）。
        この順序なら録画開始がWAV再生開始より確実に先になるので、下記
        `--avatar-offset`は0固定でよい（目視で秒数を計る必要がなくなった）
-4. 合成: `python3 scripts/render_commentary_video.py renders/<動画名> --layout biim --avatar-video <録画mp4> --avatar-offset <秒> --avatar-crop <w:h:x:y>`
+4. 合成: `python3 scripts/render_commentary_video.py renders/<動画名> --layout biim --avatar-video <録画mp4> --avatar-offset <秒> --avatar-crop <w:h:x:y> --avatar-width <px> --avatar-x-shift <px> --avatar-y-shift <px>`
    - 右下344px幅にクロマキー合成（`--avatar-width`/`--avatar-chroma`で調整可）
    - `--avatar-crop`（任意）: 全身録画から上半身だけを切り出してから拡大する
      （例 `"300:480:810:230"`＝顔・肩まわり）。全身のまま縮小すると人物が極小になるため、
      バストアップで見せたい場合は指定推奨
+   - `--avatar-x-shift`/`--avatar-y-shift`（2026-08-15新設・既定0）: 右下固定位置からの
+     追加オフセット（x正=右へ・y正=下へ、画面外にはみ出た分は見えなくなる）。
+     `--avatar-width`を大きくすると右下固定のままでは戦況パネルの大部分が隠れるため、
+     人物の下半身側を画面外に追い出してパネルを見せる範囲を調整する用途
+   - **2026-08-15実績値（四国めたん公式VRM・1920x1080）**: `--avatar-crop "663:765:631:314"
+     --avatar-width 700 --avatar-x-shift 80 --avatar-y-shift 250`。相手の場は完全に見え、
+     自分の場の2匹目（下側）のHP/技だけ隠れる状態で確定（ユーザー承認・支障が出たら再調整）
    - クロマキーは類似度0.25＋`despill`（緑かぶり除去）がデフォルト。それでも縁が残る場合は
      `--avatar-chroma`と合わせて類似度をさらに上げる
    - アバター録画が動画より短い場合は最終フレームで静止（正常動作）
@@ -174,12 +181,21 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
 ### サムネイル自動生成（改善ロードマップ⑥・任意・WSL）
 
 パス1の素材（manifest.jsonl・states.jsonl）から「盛り上がった瞬間」
-（battle_end > faint(KO) > HP急変の優先度）を機械的に選び、元動画の該当フレームに
-その瞬間の実況テキストを焼き込んだサムネイルPNGを出力する。パス2とは独立（動画本体
-の合成をやり直さなくてもサムネイルだけ再生成できる）。
+（battle_end > faint(KO) > HP急変の優先度・battle_endは既定で結果ネタバレ防止のため
+除外）を機械的に選び、元動画の該当フレームにテキストを焼き込んだサムネイルPNGを
+出力する。パス2とは独立（動画本体の合成をやり直さなくてもサムネイルだけ再生成できる）。
+
+**2026-08-15確定運用**: オプション無指定（`--avatar-video`だけ指定）で
+構築アイコン無し・固定タイトルロゴ「ポケモンダブルバトル／AI自動実況」・
+アバターは上半身まで大きく（scale 0.62）・persona=neutralがデフォルトになる
+（`main()`のargparse既定値として組み込み済み。ユーザー承認済みの標準仕様）。
 
 ```
-python3 scripts/generate_thumbnail.py renders/<動画名>                    # 自動選択
+# 標準運用（2026-08-15〜）: --avatar-videoだけ指定すればOK
+python3 scripts/generate_thumbnail.py renders/<動画名> --avatar-video "<録画mp4>"
+
+# 自動選択された実況テキストを使いたい場合（旧来の挙動）は--labelを未指定にせず
+# 明示的にNone相当を指定できないため、選ばれたテキストを目視で確認して--labelに渡す
 python3 scripts/generate_thumbnail.py renders/<動画名> --time 230.5 --label "きめ台詞！"  # 手動指定
 ```
 
@@ -187,6 +203,13 @@ python3 scripts/generate_thumbnail.py renders/<動画名> --time 230.5 --label "
 - 元動画パスは`render_info.json`から自動解決（D:\...→/mnt/d/...変換込み）。`--video`で上書き可
 - HP急変の検出閾値（既定30pt）は`--hp-swing-threshold`で調整可
 - 自動選択が微妙な場合は`--time`/`--label`で手動指定するのが手っ取り早い
+- `--big-logo-text`に改行(`\n`)を含めると、その位置で必ず折り返される
+  （英数字混じりの短いテキストだと自動折り返しが"AI"のような単語の途中で
+  割れることがあるため。既定値`$'ポケモンダブルバトル\nAI自動実況'`もこの対策込み）
+- `--avatar-crop`/`--avatar-face-scale`（既定`"663:765:631:314"`/`0.62`）はアバター顔用の
+  クロップ・拡大率。動画合成（`render_commentary_video.py --avatar-crop`）と同じ実績値を
+  流用しているが、こちらは体まで大きく見せる用途なのでscaleは合成側より大きめ。
+  モデルが変わったら合成側と同様に再計測すること
 
 ## 合成後の検証チェックリスト（必ずやる）
 
@@ -225,7 +248,8 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | states.jsonlが無い旧素材 | 戦況パネルが出ない | パス1の再実行が必要（timeline/statesは新パス1からのみ生成） |
 | モックアップ/日報の実フレーム | 対戦相手のトレーナー名が映る | publicリポジトリに載せてよいかはユーザー判断（2026-07-14に確認済み・現方針は許容）。**YouTube公開動画も同じ方針で画面表示は許容**（2026-08-15確認） |
 | 実況テキストが相手トレーナー名をそのまま読み上げる懸念 | 動画は公開されるため、音声で個人特定できる名前を読み上げると画面表示より踏み込んだ形になる | **2026-08-15対策済み**: vision/script両プロンプト（`server.py`）に「トレーナー名（画面のIDやハンドルネーム）をそのまま呼ばない・「相手」「お相手」等でぼかす」指示を追加。画面表示自体は上記行の方針どおり許容、実況の読み上げだけを避ける |
-| アバター全身録画をそのまま縮小 | 344px枠内で人物が極小・Tポーズの腕が窮屈 | `--avatar-crop`で上半身だけ切り出してから拡大する。**クロップ範囲の決め方**: 収録した生の録画（グリーンバック）から1フレーム抽出し、Pythonで緑以外のピクセルのbounding boxを検出すると人物の実座標が分かる（`PIL`+`numpy`で`is_green = (g>150)&(r<100)&(b<100)`の否定領域を`np.where`）。2026-07-30収録（`HairSample_Female.vrm`・1920x1080・全身がx760-1161/y273-1079に収まっていた）では`--avatar-crop "300:480:810:230"`（過去動画の実績値）でバストアップになり、これがそのまま流用できることを確認済み。モデルが変わったら同じ手順で再計測すること |
+| アバター全身録画をそのまま縮小 | 344px枠内で人物が極小・Tポーズの腕が窮屈 | `--avatar-crop`で上半身だけ切り出してから拡大する。**クロップ範囲の決め方**: 収録した生の録画（グリーンバック）から1フレーム抽出し、Pythonで緑以外のピクセルのbounding boxを検出すると人物の実座標が分かる（`PIL`+`numpy`で`is_green = (g>150)&(r<100)&(b<100)`の否定領域を`np.where`）。2026-07-30収録（`HairSample_Female.vrm`・1920x1080・全身がx760-1161/y273-1079に収まっていた）では`--avatar-crop "300:480:810:230"`（過去動画の実績値）でバストアップになり、これがそのまま流用できることを確認済み。**モデルが変わったら同じ手順で再計測すること**（2026-08-15に四国めたん公式VRMへ切り替え済み・新しい実績値は`--avatar-crop "663:765:631:314"`。[[domain_shikoku_metan_appearance]]参照＝ピンク髪メイド服で合っている） |
+| `--avatar-width`を大きくすると戦況パネルが隠れる | 700px等に拡大すると右下固定位置のままでは戦況パネル（HP/技ログ）の大部分がアバターの下に隠れる（2026-08-15実機発見） | `--avatar-x-shift`/`--avatar-y-shift`（2026-08-15新設）で右下固定位置から追加オフセットし、人物の下半身側を画面外に追い出してパネルの見える範囲を確保する。実績値は上記「アバター合成」節を参照 |
 | バストアップ用クロップだと`victory_arms_up`（バンザイ）で腕が枠外に見切れる | 静止時のbounding boxだけでクロップを決めると、腕を斜め上55°まで振り上げるポーズ（Joy表情の一部・`play_and_animate_avatar.py`の`_POSE_VARIANTS`参照）で肩から上・左右にはみ出す（2026-08-15発見） | **クロップ計測はidle姿勢の1フレームだけでなく、`explore_avatar_poses.py --pose victory_arms_up`を実機で再生させた状態のフレームでも行い、両方のbounding boxを包含する範囲に広げること**（UIや情報表示に被ってもよい前提で許容）。2026-08-15対応: `victory_arms_up`の発火頻度自体もJoy表情の"default"（battle_end＝試合の勝敗が決まった瞬間のみ）に絞り、1匹倒す度の"faint"variantは腕をあまり広げない`fist_pump_right`に変更済み（クロップを広げる対応との合わせ技） |
 | `--device`に数値インデックスを渡してもsounddeviceが認識しない | `play_and_animate_avatar.py --device 7`のように番号を渡すとエラー、または無関係のデバイスが選ばれる | sounddeviceは`device`引数が文字列だと**名前の部分一致検索**になり、数字文字列を渡しても数値インデックスとしては解釈されない。2026-07-30に対策済み: 数字文字列なら自動でintにキャストするよう`play_and_animate_avatar.py`を修正。デバイス一覧は`python -c "import sounddevice as sd; print(sd.query_devices())"`で確認し、CABLE Input側のMME/WASAPI版インデックスを指定する |
 | `play_and_animate_avatar.py`実行中にCtrl+Cで中断できない | 再生を途中で止めたくても効かない | `sd.wait()`のブロッキング待ちがWindowsだとシグナルを拾えないことがある。2026-07-30に対策済み: `sd.get_stream().active`をポーリングするループ＋`KeyboardInterrupt`ハンドリングに変更（`sd.stop()`で即座に再生停止） |

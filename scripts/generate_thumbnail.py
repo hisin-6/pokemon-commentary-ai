@@ -85,6 +85,15 @@ _MAX_ROSTER_ICONS = 6
 # 確認済みのクロップ値（2026-08-04・HairSample_Female.vrm実測）。モデルが変わったら
 # 要再計測（`--avatar-crop`で上書き可）。
 _AVATAR_FACE_CROP_DEFAULT = "400:400:800:250"
+_AVATAR_FACE_SCALE_DEFAULT = 0.34  # アバター顔の表示幅（画面高さに対する比率）
+
+# ── CLIの既定運用（2026-08-15確定・当面のデフォルト）─────────────────────
+# ユーザー承認済みの標準サムネ仕様: 構築アイコン無し・実況テキストの代わりに
+# 固定タイトルロゴ・アバターは顔だけでなく上半身まで大きく見せる・persona=neutral
+# （四国めたん公式VRM試用中）。動画ごとに変わる--avatar-videoだけは指定必須のまま。
+_CLI_DEFAULT_BIG_LOGO_TEXT = "ポケモンダブルバトル\nAI自動実況"
+_CLI_DEFAULT_AVATAR_CROP = "663:765:631:314"  # 四国めたん公式VRM実績値（体まで含む）
+_CLI_DEFAULT_AVATAR_FACE_SCALE = 0.62
 
 
 def _collect_event_candidates(manifest: list, allow_result_spoiler: bool = False) -> list:
@@ -262,10 +271,20 @@ def _wrap_to_lines(draw, text: str, font, max_width: float, max_lines: int = _LA
 
     ``_wrap_jp``（render_commentary_video.py・ASS字幕の折り返しと同じロジック）を
     再利用し、max_lines を超える分は末尾行を「…」付きで切り詰める。
+
+    text に明示的な改行（``\\n``）が含まれる場合は行分割の指定として優先する
+    （2026-08-15対応: `_wrap_jp`は句読点ベースの折り返しで、ロゴ用の短い英数字
+    混じりテキスト＝例「ポケモンダブルバトルAI自動実況」だと"AI"の途中
+    （バトルA / I自動実況）で機械的に割れてしまう実例があった。呼び出し側が
+    `--big-logo-text $'ポケモンダブルバトル\\nAI自動実況'`のように改行を渡せば
+    その位置で必ず改行される）。
     """
     sample_width = draw.textlength("あ", font=font) or 1.0
     chars_per_line = max(4, int(max_width / sample_width))
-    wrapped_lines = _wrap_jp(text, width=chars_per_line).split("\\N")
+    segments = text.split("\n") if "\n" in text else [text]
+    wrapped_lines = []
+    for seg in segments:
+        wrapped_lines.extend(_wrap_jp(seg, width=chars_per_line).split("\\N"))
     if len(wrapped_lines) <= max_lines:
         return wrapped_lines
     lines = wrapped_lines[:max_lines]
@@ -277,7 +296,8 @@ def compose_thumbnail(frame_png: Path, out_png: Path, label: str,
                       avatar_face_png: Path | None = None,
                       roster_icon_pngs: list[Path] | None = None,
                       character_name: str = _CHARACTER_NAME,
-                      big_logo_text: str = "AI自動実況") -> None:
+                      big_logo_text: str = "AI自動実況",
+                      avatar_face_scale: float = _AVATAR_FACE_SCALE_DEFAULT) -> None:
     """抜き出したフレームに下部帯＋テキスト（実測幅で折り返し）を焼き込む（PIL）。
 
     avatar_face_png / roster_icon_pngs を渡すと、右上にアバターの顔・キャプション帯の
@@ -287,6 +307,9 @@ def compose_thumbnail(frame_png: Path, out_png: Path, label: str,
     呼び出し側から_CHARACTER_NAME_NEUTRALを渡すこと）。
     big_logo_text: label=""（盛り上がりシーンの字幕なし）時に代わりに表示する大きな
     ロゴテキスト。幅に収まらなければ_wrap_to_linesで自動2行折り返しする。
+    avatar_face_scale: アバター顔の表示幅（画面高さに対する比率・既定
+    _AVATAR_FACE_SCALE_DEFAULT）。2026-08-15新設: 既定だと存在感が薄いとの
+    fbで調整可能にした。
     """
     from PIL import Image, ImageDraw, ImageFont
 
@@ -375,7 +398,7 @@ def compose_thumbnail(frame_png: Path, out_png: Path, label: str,
     # ── アバターの顔（右上・クロマキー抜き済みRGBAをそのまま貼る）──────────────
     if avatar_face_png is not None and Path(avatar_face_png).exists():
         face = Image.open(avatar_face_png).convert("RGBA")
-        face_w = int(h * 0.34)
+        face_w = int(h * avatar_face_scale)
         face_h = int(face_w * face.height / face.width)
         face = face.resize((face_w, face_h))
         fx = w - face_w - int(w * 0.025)
@@ -420,7 +443,8 @@ def generate_thumbnail(render_dir: Path, video: Path = None, out: Path = None,
                        pokedb_path: Path = _POKEDB_PATH,
                        icon_cache_dir: Path = _ICON_CACHE_DIR,
                        persona: str = "kurepi",
-                       big_logo_text: str = "AI自動実況") -> dict:
+                       big_logo_text: str = "AI自動実況",
+                       avatar_face_scale: float = _AVATAR_FACE_SCALE_DEFAULT) -> dict:
     """サムネイル生成の一連の流れ。戻り値は選ばれた瞬間の情報。"""
     manifest = load_manifest(render_dir)
     states = load_states(render_dir)
@@ -472,7 +496,8 @@ def generate_thumbnail(render_dir: Path, video: Path = None, out: Path = None,
                           avatar_face_png=avatar_face_png,
                           roster_icon_pngs=roster_icon_pngs,
                           character_name=character_name,
-                          big_logo_text=big_logo_text)
+                          big_logo_text=big_logo_text,
+                          avatar_face_scale=avatar_face_scale)
 
     return {"out": str(out), **moment}
 
@@ -484,27 +509,37 @@ def main(argv=None) -> int:
     parser.add_argument("--video", help="元動画パス（省略時はrender_info.jsonから）")
     parser.add_argument("--out", type=Path, help="出力先PNG（既定: <render_dir>/thumbnail.png）")
     parser.add_argument("--time", type=float, help="自動選択せずこの秒数のフレームを使う")
-    parser.add_argument("--label", help="焼き込みテキストを上書きする")
+    parser.add_argument("--label", default="",
+                        help="焼き込みテキストを上書きする（既定は空＝big-logo-textを表示。"
+                             "2026-08-15確定運用: 実況テキストの自動焼き込みは廃止したため、"
+                             "旧来の挙動が欲しい場合は明示的に--label無指定ではなく"
+                             "自動選択テキストを別途調べて渡すこと）")
     parser.add_argument("--hp-swing-threshold", type=float, default=_DEFAULT_HP_SWING_THRESHOLD,
                         help=f"HP急変とみなす最低減少幅・pt（既定{_DEFAULT_HP_SWING_THRESHOLD}）")
     parser.add_argument("--allow-result-spoiler", action="store_true",
                         help="battle_end（試合結果）も候補に含める（既定は結果ネタバレ防止のため除外）")
-    parser.add_argument("--team", choices=["player", "opponent"], default="player",
-                        help="構築アイコンに使う陣営（既定: player=自分）")
-    parser.add_argument("--no-roster-icons", action="store_true", help="構築アイコンを焼き込まない")
+    parser.add_argument("--team", choices=["player", "opponent"], default=None,
+                        help="構築アイコンに使う陣営（既定: 焼き込まない。2026-08-15確定運用で"
+                             "アイコン無しがデフォルトに変更。表示したい時だけ指定する）")
+    parser.add_argument("--no-roster-icons", action="store_true",
+                        help="（後方互換のため残置・--team未指定なら元々アイコンは出ない）")
     parser.add_argument("--avatar-video", help="v2cアバター録画のパス（指定時は右上に顔を焼き込む）")
     parser.add_argument("--avatar-time", type=float,
                         help="アバター顔の抜き出し時刻・秒（省略時はサムネ選択時刻+avatar-offset）")
     parser.add_argument("--avatar-offset", type=float, default=0.0,
                         help="アバター録画側の頭出しオフセット・秒（render_commentary_video.pyと同じ規約）")
-    parser.add_argument("--avatar-crop", default=_AVATAR_FACE_CROP_DEFAULT,
-                        help=f"アバター顔のクロップ w:h:x:y（既定{_AVATAR_FACE_CROP_DEFAULT}）")
-    parser.add_argument("--persona", choices=["kurepi", "neutral"], default="kurepi",
-                        help="キャラクター設定（既定kurepi・neutralはバッジ下の名前表記を"
-                             "「VOICEVOX：四国めたん」に切り替える。パス1と同じ値を指定すること）")
-    parser.add_argument("--big-logo-text", default="AI自動実況",
-                        help="--label \"\"（字幕なし）時に表示する大きなロゴテキスト"
-                             "（既定\"AI自動実況\"・幅に収まらなければ自動2行折り返し）")
+    parser.add_argument("--avatar-crop", default=_CLI_DEFAULT_AVATAR_CROP,
+                        help=f"アバター顔のクロップ w:h:x:y（既定{_CLI_DEFAULT_AVATAR_CROP}"
+                             "＝四国めたん公式VRM実績値・体まで含む）")
+    parser.add_argument("--avatar-face-scale", type=float, default=_CLI_DEFAULT_AVATAR_FACE_SCALE,
+                        help=f"アバター顔の表示幅・画面高さに対する比率（既定{_CLI_DEFAULT_AVATAR_FACE_SCALE}）")
+    parser.add_argument("--persona", choices=["kurepi", "neutral"], default="neutral",
+                        help="キャラクター設定（既定neutral・2026-08-15〜3Dモデル外注完成まで"
+                             "四国めたん公式VRM試用中のため。kurepiはバッジ下の名前表記を"
+                             "「花圓くれぴ」に戻す。パス1と同じ値を指定すること）")
+    parser.add_argument("--big-logo-text", default=_CLI_DEFAULT_BIG_LOGO_TEXT,
+                        help="--label \"\"（字幕なし・既定）時に表示する大きなロゴテキスト"
+                             f"（既定{_CLI_DEFAULT_BIG_LOGO_TEXT!r}・幅に収まらなければ自動2行折り返し）")
     args = parser.parse_args(argv)
 
     video = resolve_video_path(args.video) if args.video else None
@@ -519,6 +554,7 @@ def main(argv=None) -> int:
         avatar_offset=args.avatar_offset,
         avatar_crop=args.avatar_crop,
         big_logo_text=args.big_logo_text,
+        avatar_face_scale=args.avatar_face_scale,
         persona=args.persona)
 
     logger.info("サムネイル生成完了: %s", result["out"])

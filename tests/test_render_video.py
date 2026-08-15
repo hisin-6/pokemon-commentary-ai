@@ -466,6 +466,27 @@ class TestAvatarCommand:
             avatar_video=Path("avatar.mp4"))
         assert "-t" not in cmd
 
+    def test_default_shift_is_zero_in_overlay_position(self, tmp_path):
+        """既定（シフト無し）では従来どおりの右下固定式のまま。"""
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
+            avatar_video=Path("avatar.mp4"))
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        assert "main_w-overlay_w-16+0:" in fc
+        assert "main_h-overlay_h-16+0:" in fc
+
+    def test_x_y_shift_applied_to_overlay_position(self, tmp_path):
+        """2026-08-15新設: avatar-widthを大きくした時に戦況パネルが隠れすぎる問題への
+        調整弁。x_shiftは右・y_shiftは下方向の追加オフセット。"""
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
+            avatar_video=Path("avatar.mp4"), avatar_x_shift=80, avatar_y_shift=250)
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        assert "main_w-overlay_w-16+80:" in fc
+        assert "main_h-overlay_h-16+250:" in fc
+
 
 class TestLoadStates:
     def test_missing_file_returns_empty(self, tmp_path):

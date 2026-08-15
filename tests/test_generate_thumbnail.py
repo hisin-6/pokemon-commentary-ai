@@ -226,6 +226,20 @@ class TestComposeThumbnail:
         for line in lines:
             assert draw.textlength(line, font=font) <= max_width
 
+    def test_wrap_to_lines_respects_explicit_newline(self, tmp_path):
+        """2026-08-15対応: ロゴテキストに明示的な改行(\\n)があれば、_wrap_jpの
+        句読点ベース折り返しに関わらずその位置で行分割する。改行が無いと
+        「ポケモンダブルバトルAI自動実況」が「ポケモンダブルバトルA」/「I自動実況」
+        のように英単語の途中で機械的に割れてしまう実例があった。"""
+        from PIL import ImageDraw, ImageFont
+        img = Image.new("RGB", (1920, 1080), color=(0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        font_path = gt._FONT_PATH if Path(gt._FONT_PATH).exists() else None
+        font = (ImageFont.truetype(font_path, size=60) if font_path
+               else ImageFont.load_default())
+        lines = gt._wrap_to_lines(draw, "ポケモンダブルバトル\nAI自動実況", font, max_width=1800)
+        assert lines == ["ポケモンダブルバトル", "AI自動実況"]
+
     def test_avatar_face_composited_top_right(self, tmp_path):
         """avatar_face_png指定時、右上付近が元フレームと変わっていること。"""
         frame = tmp_path / "frame.png"
@@ -239,6 +253,22 @@ class TestComposeThumbnail:
             # face_w = int(h*0.34) = 204, fx = w-204-20 = 576, fy = int(h*0.03) = 18
             # → (700, 60) は貼り付けたRGBA画像の内側に確実に収まる
             r, g, b = img.convert("RGB").getpixel((700, 60))
+            assert (r, g, b) != (30, 30, 30)
+
+    def test_avatar_face_scale_enlarges_composited_region(self, tmp_path):
+        """2026-08-15新設: avatar_face_scaleを大きくすると顔の表示幅が広がる
+        （既定0.34だと存在感が薄いとのfbで調整可能にした）。"""
+        frame = tmp_path / "frame.png"
+        w, h = 800, 600
+        Image.new("RGB", (w, h), color=(30, 30, 30)).save(frame)
+        face = tmp_path / "face.png"
+        Image.new("RGBA", (400, 400), color=(255, 0, 0, 255)).save(face)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "", avatar_face_png=face, avatar_face_scale=0.6)
+        with Image.open(out) as img:
+            # face_w = int(h*0.6) = 360, fx = w-360-20 = 420 → x=450は貼り付け範囲内
+            # （既定0.34だとfx=576なのでx=450は元フレームの背景色のまま残るはず）
+            r, g, b = img.convert("RGB").getpixel((450, 60))
             assert (r, g, b) != (30, 30, 30)
 
     def test_missing_avatar_face_png_skipped_gracefully(self, tmp_path):
@@ -485,3 +515,24 @@ class TestBuildAvatarFaceCommand:
         cmd = gt.build_avatar_face_command(
             "ffmpeg", tmp_path / "a.mp4", -3.0, "400:400:800:250", tmp_path / "f.png")
         assert "0.0" in cmd
+
+
+class TestCliDefaults:
+    """2026-08-15確定運用: ユーザー承認済みの標準サムネ仕様（構築アイコン無し・
+    実況テキストの代わりに固定タイトルロゴ・アバターは上半身まで大きく・
+    persona=neutral）がオプション無指定でも再現できることの回帰テスト。"""
+
+    def test_main_defaults_match_confirmed_thumbnail_spec(self, tmp_path):
+        render_dir = tmp_path / "renders" / "sample"
+        render_dir.mkdir(parents=True)
+        with patch.object(gt, "generate_thumbnail") as mock_gen:
+            mock_gen.return_value = {"out": "x", "reason": "faint", "time": 1.0,
+                                     "score": 80.0, "label": ""}
+            gt.main([str(render_dir)])
+        _, kwargs = mock_gen.call_args
+        assert kwargs["label_override"] == ""
+        assert kwargs["team"] is None
+        assert kwargs["persona"] == "neutral"
+        assert kwargs["big_logo_text"] == "ポケモンダブルバトル\nAI自動実況"
+        assert kwargs["avatar_crop"] == "663:765:631:314"
+        assert kwargs["avatar_face_scale"] == 0.62

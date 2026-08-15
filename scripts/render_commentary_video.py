@@ -504,6 +504,13 @@ _AVATAR_WIDTH = 344          # アバターの表示幅（右下・縦横比は�
 _AVATAR_MARGIN = 16          # 画面右端・下端からの余白
 _AVATAR_CHROMA = "0x00FF00"  # クロマキー色（グリーンバック）
 _AVATAR_SIMILARITY = 0.25    # クロマキーの類似度しきい値（despillとセットで緑フリンジ対策）
+# アバター位置の追加オフセット（2026-08-15新設）: サイズを大きくする（例700px）と
+# 右下固定のままでは戦況パネルの大部分が隠れてしまうため、表示位置を画面外側へ
+# 追加でずらして「見せたい範囲だけ」を画面内に残す調整弁。x_shiftは正で右へ
+# （右端がはみ出て見えなくなる）・y_shiftは正で下へ（下半身がはみ出て上半身だけ
+# 残る）ずらす。マイナス指定で逆方向にも動かせる
+_AVATAR_X_SHIFT = 0
+_AVATAR_Y_SHIFT = 0
 
 
 def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
@@ -514,6 +521,8 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
                               avatar_chroma: str = _AVATAR_CHROMA,
                               avatar_similarity: float = _AVATAR_SIMILARITY,
                               avatar_crop: str = None,
+                              avatar_x_shift: int = _AVATAR_X_SHIFT,
+                              avatar_y_shift: int = _AVATAR_Y_SHIFT,
                               tail_pad: float = 0.0,
                               max_duration: float = 0.0) -> list:
     """biim風レイアウト（案A）合成のffmpegコマンドを組み立てる。
@@ -526,7 +535,10 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
     右下に重ねる。avatar_offset は「録画開始→WAV再生開始」の秒数（頭合わせ・
     録画側の先頭をスキップする）。アバターが動画より短い場合は最終フレームで
     静止する（eof_action=repeat）。avatar_crop（"w:h:x:y"）指定時はスケール前に
-    クロップし、全身録画から上半身だけを抜き出して拡大表示する。
+    クロップし、全身録画から上半身だけを抜き出して拡大表示する。avatar_x_shift/
+    avatar_y_shift（既定0）は右下固定位置からの追加オフセット（画面外へずらした分は
+    見えなくなる）。avatar_widthを大きくした際に戦況パネルの隠れる範囲を調整する用途
+    （2026-08-15新設）。
 
     tail_pad > 0 のとき、元動画の末尾を最終フレームの静止で tail_pad 秒延長する
     （tpad=stop_mode=clone）。末尾の実況が動画終端をまたぐ場合に映像なしで音声
@@ -581,7 +593,8 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
             f"chromakey={avatar_chroma}:{avatar_similarity}:0.08,"
             f"despill=type=green:mix=0.5:expand=0[av];"
             f"[vsub][av]overlay="
-            f"main_w-overlay_w-{_AVATAR_MARGIN}:main_h-overlay_h-{_AVATAR_MARGIN}:"
+            f"main_w-overlay_w-{_AVATAR_MARGIN}+{avatar_x_shift}:"
+            f"main_h-overlay_h-{_AVATAR_MARGIN}+{avatar_y_shift}:"
             f"eof_action=repeat[vout]"
         )
     else:
@@ -701,6 +714,12 @@ def main(argv=None) -> int:
     parser.add_argument("--avatar-crop", default=None,
                         help="スケール前に録画をクロップ（ffmpeg crop式 'w:h:x:y'）。"
                              "全身録画から上半身だけを抜き出して拡大表示したい場合に指定")
+    parser.add_argument("--avatar-x-shift", type=int, default=_AVATAR_X_SHIFT,
+                        help=f"右下固定位置からの追加オフセットpx・右が正（既定{_AVATAR_X_SHIFT}）")
+    parser.add_argument("--avatar-y-shift", type=int, default=_AVATAR_Y_SHIFT,
+                        help=f"右下固定位置からの追加オフセットpx・下が正（既定{_AVATAR_Y_SHIFT}）。"
+                             "avatar-widthを大きくした時、下半身側を画面外へ追い出して"
+                             "戦況パネルの隠れる範囲を減らす調整に使う")
     parser.add_argument("--dry-run", action="store_true",
                         help="スケジュールの表示のみ（ffmpeg不要）")
     args = parser.parse_args(argv)
@@ -808,6 +827,8 @@ def main(argv=None) -> int:
                                         avatar_width=args.avatar_width,
                                         avatar_chroma=args.avatar_chroma,
                                         avatar_crop=args.avatar_crop,
+                                        avatar_x_shift=args.avatar_x_shift,
+                                        avatar_y_shift=args.avatar_y_shift,
                                         tail_pad=tail_pad,
                                         max_duration=max_duration)
     else:
