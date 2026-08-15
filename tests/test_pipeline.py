@@ -33,6 +33,7 @@ from src.pipeline import (
     _extract_opponent_trainer_name,
     _extract_structured_info,
     _is_battle_screen,
+    _is_surrender_text,
     _ocr_results_to_text,
     _replace_glitch_commentary,
     _GLITCH_CAUSE_KEYWORDS,
@@ -207,6 +208,281 @@ class TestDetectBattleResult:
         gs2 = dict(gs)
         del gs2["battle_result"]
         assert _build_bedrock_context(gs2, "move_used", None, None, [])["battle_result"] == ""
+
+    def test_surrendered_context_passthrough(self):
+        """game_stateのbattle_surrenderedが_build_bedrock_contextに乗る
+        （battle_endのみ注入されるため通常イベントではFalse）。"""
+        gs = {"ocr_text": "", "hp_values": [], "balls_remaining": [],
+              "name_candidates_player": [], "name_candidates_opponent": [],
+              "status": "なし", "battle_surrendered": True}
+        ctx = _build_bedrock_context(gs, "battle_end", None, None, [])
+        assert ctx["battle_surrendered"] is True
+        gs2 = dict(gs)
+        del gs2["battle_surrendered"]
+        assert _build_bedrock_context(gs2, "move_used", None, None, [])["battle_surrendered"] is False
+
+
+class TestIsSurrenderText:
+    """降参テキスト判定（2026-08-15・フェーズ遷移経路の降参保留用）。"""
+
+    def test_plain(self):
+        assert _is_surrender_text("降参が選ばれました") is True
+
+    def test_ocr_fragments_joined_with_slash(self):
+        """実機2026-08-14_20-46-44のocr_text「こうさん / えら / 降参が / 選ばれました」
+        のようなスラッシュ区切り断片化を吸収する。"""
+        assert _is_surrender_text("こうさん / えら / 降参が / 選ばれました") is True
+
+    def test_split_keyword_fragments(self):
+        assert _is_surrender_text("降参が / 選ばれました") is True
+
+    def test_normal_result_is_not_surrender(self):
+        assert _is_surrender_text("bennyとの / 勝負に / 勝った!") is False
+        assert _is_surrender_text("") is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 技の対象ヒント（2026-08-15・move_single対象誤認対策）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMoveTargetHint:
+    """技の直後の観測（HP減少・状態異常付与・まもる成功）からの対象逆引き。
+    実機2026-08-14_20-46-44のNG7件（技の対象誤認）への対策。"""
+
+    def _pipe(self):
+        pipe = Pipeline.__new__(Pipeline)
+        pipe._panel_state_history = []
+        pipe._protect_history = []
+        return pipe
+
+    @staticmethod
+    def _state(player=(), opponent=()):
+        def side(entries):
+            return [{"name": n, "hp_pct": hp, "hp_text": "", "status": st}
+                    for (n, hp, st) in entries]
+        return {"turn": 1, "player": side(player), "opponent": side(opponent),
+                "alive_player": 0, "alive_opponent": 0}
+
+    def test_hp_drop_detected(self):
+        """実機の実例: でんじほう(123.3s)→メタグロス100%→39%(127.3s)の対応から
+        対象を逆引きできる（実況は「コノヨザルが痺れた」と誤認していた）。"""
+        pipe = self._pipe()
+        pipe._panel_state_history = [
+            (120.0, self._state(player=[("メタグロス", 100.0, None)])),
+            (127.3, self._state(player=[("メタグロス", 39.0, None)])),
+        ]
+        hint = pipe._compute_move_target_hint(123.3, 132.4)
+        assert "メタグロス（自分側）のHPが100%→39%に減少" in hint
+
+    def test_status_gain_detected(self):
+        pipe = self._pipe()
+        pipe._panel_state_history = [
+            (120.0, self._state(player=[("メタグロス", 39.0, None)])),
+            (130.1, self._state(player=[("メタグロス", 39.0, "まひ")])),
+        ]
+        hint = pipe._compute_move_target_hint(123.3, 132.4)
+        assert "メタグロス（自分側）がまひ状態になった" in hint
+
+    def test_opponent_side_label(self):
+        pipe = self._pipe()
+        pipe._panel_state_history = [
+            (110.0, self._state(opponent=[("ライチュウ", 100.0, None)])),
+            (119.7, self._state(opponent=[("ライチュウ", 12.0, None)])),
+        ]
+        hint = pipe._compute_move_target_hint(114.8, 123.3)
+        assert "ライチュウ（相手側）のHPが100%→12%に減少" in hint
+
+    def test_protect_evidence(self):
+        """実機の実例: アイアンヘッド(172.8s)→「ライチュウは攻撃から身を守った」。
+        実況は「ライチュウに着弾」と防がれた事実を無視していた。"""
+        pipe = self._pipe()
+        pipe._protect_history = [(176.0, "相手側", "ライチュウ")]
+        hint = pipe._compute_move_target_hint(172.8, 183.9)
+        assert "ライチュウ（相手側）は攻撃から身を守った＝この技は防がれた" in hint
+
+    def test_observation_outside_window_ignored(self):
+        """窓の外（次の技以降）の観測は前の技に帰属させない。"""
+        pipe = self._pipe()
+        pipe._panel_state_history = [
+            (120.0, self._state(opponent=[("ライチュウ", 100.0, None)])),
+            (140.0, self._state(opponent=[("ライチュウ", 12.0, None)])),
+        ]
+        assert pipe._compute_move_target_hint(123.3, 132.4) == ""
+
+    def test_small_drop_ignored_as_noise(self):
+        """数値HPの軽微ノイズ（既知の許容事項）を誤ってダメージ扱いしない。"""
+        pipe = self._pipe()
+        pipe._panel_state_history = [
+            (120.0, self._state(player=[("メタグロス", 100.0, None)])),
+            (125.0, self._state(player=[("メタグロス", 98.0, None)])),
+        ]
+        assert pipe._compute_move_target_hint(123.3, 132.4) == ""
+
+    def test_no_data_returns_empty(self):
+        assert self._pipe()._compute_move_target_hint(10.0, 20.0) == ""
+
+    def test_window_end_capped_by_next_move_not_faint(self):
+        """観測窓は次の技/交代/試合終了で区切る。faintはこの技の結果なので区切らない。"""
+        events = [
+            {"event_time": 123.3, "event_type": "move_single"},
+            {"event_time": 128.0, "event_type": "faint"},
+            {"event_time": 132.4, "event_type": "move_single"},
+        ]
+        assert Pipeline._move_target_window_end(events, 0) == 132.4
+
+    def test_window_end_defaults_to_max(self):
+        events = [{"event_time": 123.3, "event_type": "move_single"}]
+        expected = 123.3 + Pipeline._TARGET_HINT_MAX_WINDOW_SEC
+        assert Pipeline._move_target_window_end(events, 0) == expected
+
+
+class TestUpdateProtectHistory:
+    """「Xは攻撃から身を守った」メッセージの捕捉（技の対象ヒント用）。"""
+
+    def _pipe(self, name="ライチュウ", score=95):
+        pipe = Pipeline.__new__(Pipeline)
+        pipe._protect_history = []
+        pipe._video_now = 176.0
+        result = MagicMock()
+        result.category = "pokemon"
+        result.score = score
+        result.canonical_ja = name
+        clf = MagicMock()
+        clf.classify.return_value = result
+        pipe._classifier = clf
+        return pipe
+
+    @staticmethod
+    def _ocr(texts):
+        return [{"text": t} for t in texts]
+
+    def test_detects_with_ocr_fragments(self):
+        """実機OCR「あいて相手のライチュウはこうげきみまも攻撃から身を守った!」
+        （名前と本文の間に誤読断片が挟まる）を検出できる。"""
+        pipe = self._pipe()
+        pipe._update_protect_history(self._ocr(
+            ["あいて", "相手の", "ライチュウは", "こうげきみまも", "攻撃から身を守った!"]))
+        assert pipe._protect_history == [(176.0, "相手側", "ライチュウ")]
+
+    def test_player_side_without_opponent_prefix(self):
+        pipe = self._pipe(name="ブリジュラス")
+        pipe._update_protect_history(self._ocr(["ブリジュラスは", "攻撃から身を守った!"]))
+        assert pipe._protect_history == [(176.0, "自分側", "ブリジュラス")]
+
+    def test_distant_opponent_word_does_not_flip_side(self):
+        """フルスクリーンOCRで無関係な位置に「相手」があっても、名前の直前に
+        プレフィックスが無ければ自分側と判定する。"""
+        pipe = self._pipe(name="ブリジュラス")
+        pipe._update_protect_history(self._ocr(
+            ["相手の控え", "なにかのテキスト", "ブリジュラスは", "攻撃から身を守った!"]))
+        assert pipe._protect_history == [(176.0, "自分側", "ブリジュラス")]
+
+    def test_dedupe_within_window(self):
+        """同一メッセージが複数フレームでOCRされても1件だけ記録する。"""
+        pipe = self._pipe()
+        ocr = self._ocr(["相手の", "ライチュウは", "攻撃から身を守った!"])
+        pipe._update_protect_history(ocr)
+        pipe._video_now = 178.0
+        pipe._update_protect_history(ocr)
+        assert len(pipe._protect_history) == 1
+
+    def test_no_message_no_record(self):
+        pipe = self._pipe()
+        pipe._update_protect_history(self._ocr(["ライチュウの", "でんじほう!"]))
+        assert pipe._protect_history == []
+
+    def test_low_score_name_rejected(self):
+        pipe = self._pipe(score=50)
+        pipe._update_protect_history(self._ocr(["ラxチュxは", "攻撃から身を守った!"]))
+        assert pipe._protect_history == []
+
+
+class TestComputeSwitchFocus:
+    """交代ヒント（2026-08-15・switch/move_used実況のタイミングずれ対策）。"""
+
+    def _pipe(self):
+        pipe = Pipeline.__new__(Pipeline)
+        pipe._sendout_history = []
+        return pipe
+
+    def test_sendout_after_switch_event_detected(self):
+        """実機の実例(#18): switchイベント(291.7s)は交代選択画面で発火し、
+        「ゆけっ! ペリッパー」は約7秒後に出る。窓内の繰り出しから実際の交代先を
+        特定する（従来はLLMが直前のブリジュラス交代を今起きたかのように実況した）。"""
+        pipe = self._pipe()
+        pipe._sendout_history = [
+            (261.9, "player", "ブリジュラス"), (298.0, "player", "ペリッパー")]
+        focus = pipe._compute_switch_focus(291.7 - 3.0, 306.4)
+        assert focus == "自分のペリッパー"
+
+    def test_simultaneous_sendout_for_move_used(self):
+        """実機の実例(#14): ターン冒頭のコマンド交代の繰り出しはmove_used発火と
+        ほぼ同秒のため、遡り窓（5秒）で拾う。前のターンの繰り出し（ペリッパー248.9s）は
+        窓外で混ざらない。"""
+        pipe = self._pipe()
+        pipe._sendout_history = [
+            (248.9, "player", "ペリッパー"), (261.9, "player", "ブリジュラス")]
+        focus = pipe._compute_switch_focus(261.9 - 5.0, 265.0)
+        assert focus == "自分のブリジュラス"
+
+    def test_opponent_label(self):
+        pipe = self._pipe()
+        pipe._sendout_history = [(188.0, "opponent", "オオニューラ")]
+        assert pipe._compute_switch_focus(178.9, 200.1) == "相手のオオニューラ"
+
+    def test_multiple_joined(self):
+        pipe = self._pipe()
+        pipe._sendout_history = [
+            (295.0, "player", "ペリッパー"), (297.0, "opponent", "キュウコン")]
+        assert pipe._compute_switch_focus(290.0, 300.0) == "自分のペリッパー / 相手のキュウコン"
+
+    def test_no_data_returns_empty(self):
+        assert self._pipe()._compute_switch_focus(10.0, 30.0) == ""
+
+    def test_context_passthrough(self):
+        """game_stateのswitch_focusが_build_bedrock_contextに乗る。"""
+        gs = {"ocr_text": "", "hp_values": [], "balls_remaining": [],
+              "name_candidates_player": [], "name_candidates_opponent": [],
+              "status": "なし", "switch_focus": "自分のペリッパー"}
+        assert _build_bedrock_context(gs, "switch", None, None, [])["switch_focus"] == "自分のペリッパー"
+        gs2 = dict(gs)
+        del gs2["switch_focus"]
+        assert _build_bedrock_context(gs2, "switch", None, None, [])["switch_focus"] == ""
+
+
+class TestNoteSendoutHistory:
+    """_note_sendoutの全動画履歴（_sendout_history）記録とデデュープ。"""
+
+    def _pipe(self):
+        pipe = Pipeline.__new__(Pipeline)
+        pipe._recent_sendouts = []
+        pipe._sendout_history = []
+        pipe._video_now = 248.9
+        return pipe
+
+    def test_records_to_whole_video_history(self):
+        pipe = self._pipe()
+        pipe._note_sendout("player", "ペリッパー")
+        assert pipe._sendout_history == [(248.9, "player", "ペリッパー")]
+
+    def test_dedupes_ocr_jitter_double_detection(self):
+        """「ペリッパー」「ペリッパーー」等のOCR揺れが正規化後に連続するケース
+        （実機2026-08-14_20-46-44: 3秒差の二重検知）をデデュープ。既存の
+        _recent_sendoutsの挙動は変えない。"""
+        pipe = self._pipe()
+        pipe._note_sendout("player", "ペリッパー")
+        pipe._video_now = 251.0
+        pipe._note_sendout("player", "ペリッパー")
+        assert len(pipe._sendout_history) == 1
+        assert len(pipe._recent_sendouts) == 2
+
+    def test_reappearance_after_window_recorded(self):
+        """同じポケモンの再登場（気絶後の再繰り出し等）は別エントリとして記録する。"""
+        pipe = self._pipe()
+        pipe._note_sendout("player", "ペリッパー")
+        pipe._video_now = 291.7
+        pipe._note_sendout("player", "ペリッパー")
+        assert len(pipe._sendout_history) == 2
 
 
 class TestBuildBedrockContextPersona:
@@ -2114,18 +2390,34 @@ class TestTrackNewFaints:
         self.runner = Pipeline.__new__(Pipeline)
         self.runner._announced_faints = set()
 
-    def test_faint_event_registers_both_sides_and_returns_empty(self):
-        """OCRの0%表示由来の気絶は既存faint経路が実況するため、登録のみ行う。"""
+    def test_faint_event_registers_only_new_faints(self):
+        """faintイベント時は「今回のupdateで新規に気絶した分」だけ登録する。
+
+        2026-08-15変更: 従来は現在の全気絶を登録しており、faintイベントの実況対象では
+        ない未実況の気絶（実機2026-08-14_20-46-44: メッセージ由来で先に確定していた
+        ライチュウ）まで実況済み扱いになり、合成の機会が永久に失われていた。"""
+        prev = (set(), {"ライチュウ"})           # ライチュウは既にメッセージ由来で気絶済み（未実況）
+        curr = ({"メタグロス"}, {"ライチュウ"})  # 今回のfaintイベントの対象はメタグロス
+        result = Pipeline._track_new_faints(self.runner, prev, curr, "faint")
+        assert result == []
+        assert self.runner._announced_faints == {"メタグロス"}
+        # → 次の通常イベントでライチュウが合成対象として拾われる
+        result = Pipeline._track_new_faints(self.runner, curr, curr, "move_used")
+        assert result == [("opponent", "ライチュウ")]
+
+    def test_faint_event_with_empty_diff_falls_back_to_all(self):
+        """faintイベントで新規気絶を特定できない場合は従来通り全登録
+        （二重実況防止を優先する保守的フォールバック）。"""
         curr = ({"ガブリアス"}, {"リキキリン"})
-        result = Pipeline._track_new_faints(self.runner, curr, "faint")
+        result = Pipeline._track_new_faints(self.runner, curr, curr, "faint")
         assert result == []
         assert self.runner._announced_faints == {"ガブリアス", "リキキリン"}
 
     def test_non_faint_event_returns_unannounced_opponent_faints(self):
         """ボール数減少推定（update()内）で確定した相手の気絶を合成対象として返す。"""
         result = Pipeline._track_new_faints(
-            self.runner, (set(), {"リキキリン"}), "turn_start")
-        assert result == ["リキキリン"]
+            self.runner, (set(), set()), (set(), {"リキキリン"}), "turn_start")
+        assert result == [("opponent", "リキキリン")]
 
     def test_message_derived_faint_between_events_is_picked_up(self):
         """「たおれた」メッセージ由来（_apply_message_events経由）の気絶は
@@ -2135,30 +2427,39 @@ class TestTrackNewFaints:
         どの経路で立った気絶でも次のイベント処理時に必ず検出される。"""
         # メッセージ由来でfaintedが立った後の、通常イベント処理時点の状態を再現
         # （prev相当のスナップショットにも既に含まれている状況）
-        result = Pipeline._track_new_faints(
-            self.runner, (set(), {"リキキリン"}), "move_used")
-        assert result == ["リキキリン"]
+        curr = (set(), {"リキキリン"})
+        result = Pipeline._track_new_faints(self.runner, curr, curr, "move_used")
+        assert result == [("opponent", "リキキリン")]
         # 実況合成後（呼び出し側で登録）は二度と返さない
         self.runner._announced_faints.add("リキキリン")
-        result = Pipeline._track_new_faints(
-            self.runner, (set(), {"リキキリン"}), "battle_end")
+        result = Pipeline._track_new_faints(self.runner, curr, curr, "battle_end")
         assert result == []
 
     def test_already_announced_not_returned(self):
         """faintイベントで実況済みのポケモンは合成対象にしない（二重言及防止）。"""
         self.runner._announced_faints = {"リキキリン"}
-        result = Pipeline._track_new_faints(
-            self.runner, (set(), {"リキキリン"}), "move_used")
+        curr = (set(), {"リキキリン"})
+        result = Pipeline._track_new_faints(self.runner, curr, curr, "move_used")
         assert result == []
 
-    def test_player_side_not_synthesized(self):
-        """自分側の気絶は合成対象外（相手側のみ・スコープ決定済み）。"""
-        result = Pipeline._track_new_faints(
-            self.runner, ({"ガブリアス"}, set()), "turn_start")
-        assert result == []
+    def test_player_side_synthesized_since_20260815(self):
+        """自分側の気絶も合成対象（2026-08-15拡張）。
+
+        従来は相手側のみ（ボール数減少推定のスコープ）だったが、実機
+        2026-08-14_20-46-44でメッセージ由来の自分側気絶（メタグロス・コノヨザル）が
+        faintイベントの取り漏らし時に一切実況されない穴が実証されたため拡張した。"""
+        curr = ({"メタグロス"}, set())
+        result = Pipeline._track_new_faints(self.runner, curr, curr, "turn_start")
+        assert result == [("player", "メタグロス")]
+
+    def test_both_sides_player_first(self):
+        curr = ({"メタグロス"}, {"リキキリン"})
+        result = Pipeline._track_new_faints(self.runner, curr, curr, "turn_start")
+        assert result == [("player", "メタグロス"), ("opponent", "リキキリン")]
 
     def test_no_faints_returns_empty(self):
-        result = Pipeline._track_new_faints(self.runner, (set(), set()), "move_used")
+        result = Pipeline._track_new_faints(
+            self.runner, (set(), set()), (set(), set()), "move_used")
         assert result == []
 
 
@@ -2180,7 +2481,7 @@ class TestFaintInferredDispatch:
         game_state = {"event_type": "turn_start", "ocr_text": "コマンド画面"}
         battle_context = {"player_field": "ガブリアス"}
         Pipeline._dispatch_faint_inferred(
-            self.runner, ["リキキリン"], None, game_state, battle_context)
+            self.runner, [("opponent", "リキキリン")], None, game_state, battle_context)
 
         self.runner._dispatch_commentary.assert_called_once()
         args, kwargs = self.runner._dispatch_commentary.call_args
@@ -2192,20 +2493,46 @@ class TestFaintInferredDispatch:
         assert attempt_bedrock is True
         assert kwargs["event_time"] == 456.0
 
+    def test_player_side_faint_dispatched(self):
+        """自分側の気絶合成（2026-08-15拡張）: 「自分の」プレフィックス＋
+        faint_side="player"（表情連動で哀しみが選ばれる）。"""
+        Pipeline._dispatch_faint_inferred(
+            self.runner, [("player", "メタグロス")], None,
+            {"event_type": "turn_start"}, {})
+        self.runner._dispatch_commentary.assert_called_once()
+        args, _ = self.runner._dispatch_commentary.call_args
+        assert args[2]["faint_focus"] == "自分のメタグロス"
+        assert args[3]["faint_side"] == "player"
+
+    def test_both_sides_dispatch_two_events(self):
+        """両陣営同時に未実況気絶がある場合は陣営ごとに1イベントずつ合成する
+        （faint_sideを一意に保つため）。"""
+        Pipeline._dispatch_faint_inferred(
+            self.runner, [("player", "メタグロス"), ("opponent", "リキキリン")], None,
+            {"event_type": "turn_start"}, {})
+        assert self.runner._dispatch_commentary.call_count == 2
+        first = self.runner._dispatch_commentary.call_args_list[0].args
+        second = self.runner._dispatch_commentary.call_args_list[1].args
+        assert first[2]["faint_focus"] == "自分のメタグロス"
+        assert first[3]["faint_side"] == "player"
+        assert second[2]["faint_focus"] == "相手のリキキリン"
+        assert second[3]["faint_side"] == "opponent"
+
     def test_does_not_mutate_caller_dicts(self):
         """現行イベント（コピー元）のgame_state/battle_contextを汚さないこと。"""
         game_state = {"event_type": "turn_start"}
         battle_context = {"player_field": "ガブリアス"}
         Pipeline._dispatch_faint_inferred(
-            self.runner, ["リキキリン"], None, game_state, battle_context)
+            self.runner, [("opponent", "リキキリン")], None, game_state, battle_context)
         assert game_state == {"event_type": "turn_start"}
         assert battle_context == {"player_field": "ガブリアス"}
 
     def test_multiple_names_joined(self):
-        """2匹同時倒れ（ボールが一段階しか減らないケースの後追い確定含む）。"""
+        """同陣営2匹同時倒れ（ボールが一段階しか減らないケースの後追い確定含む）。"""
         Pipeline._dispatch_faint_inferred(
-            self.runner, ["ヘイラッシャ", "リキキリン"], None,
+            self.runner, [("opponent", "ヘイラッシャ"), ("opponent", "リキキリン")], None,
             {"event_type": "turn_start"}, {})
+        self.runner._dispatch_commentary.assert_called_once()
         sent_state = self.runner._dispatch_commentary.call_args.args[2]
         assert sent_state["faint_focus"] == "相手のヘイラッシャとリキキリン"
 
@@ -2213,13 +2540,13 @@ class TestFaintInferredDispatch:
         """_ec2_url未設定（他の既存テストの部分構築Pipeline）では何もせず早期returnする。"""
         del self.runner._ec2_url
         Pipeline._dispatch_faint_inferred(
-            self.runner, ["リキキリン"], None, {"event_type": "turn_start"}, {})
+            self.runner, [("opponent", "リキキリン")], None, {"event_type": "turn_start"}, {})
         self.runner._dispatch_commentary.assert_not_called()
 
     def test_not_battle_active_early_returns(self):
         self.runner._battle_active = False
         Pipeline._dispatch_faint_inferred(
-            self.runner, ["リキキリン"], None, {"event_type": "turn_start"}, {})
+            self.runner, [("opponent", "リキキリン")], None, {"event_type": "turn_start"}, {})
         self.runner._dispatch_commentary.assert_not_called()
 
 
@@ -2757,6 +3084,15 @@ class TestRenderContextFaintSide:
     def test_battle_result_omitted_when_not_battle_end(self):
         ctx = self.runner._render_context({"turn": 3})
         assert "battle_result" not in ctx
+
+    def test_battle_surrendered_included_when_present(self):
+        """降参による決着（2026-08-15）をmanifest.jsonlで実機確認できるように伝播する。"""
+        ctx = self.runner._render_context({"turn": 10, "battle_surrendered": True})
+        assert ctx["battle_surrendered"] is True
+
+    def test_battle_surrendered_omitted_when_not_surrender(self):
+        ctx = self.runner._render_context({"turn": 3})
+        assert "battle_surrendered" not in ctx
 
     def test_type_hint_included_when_present(self):
         """2026-08-04: 戦況推論強化のtype_hintをmanifest.jsonlで実機確認できるように伝播する。"""

@@ -144,6 +144,8 @@ class Phi3Client:
         result = (battle_context or {}).get("battle_result")
         if result:
             lines.append(persona.battle_result_line(result))
+        if (battle_context or {}).get("battle_surrendered"):
+            lines.append(persona.battle_surrendered_line(result))
         lines.append("")
 
         lines += ["【今回の対戦状況】", f"今回のイベント種別: {game_state.get('event_type', '不明')}"]
@@ -161,9 +163,30 @@ class Phi3Client:
         # move_focus/type_hintで過去2回あった片側配線漏れの再発防止として同時に配線）
         if game_state.get("event_type") == "faint" and game_state.get("faint_focus"):
             lines.append(
-                f"「{game_state['faint_focus']}」が倒れたことが残りポケモン数の減少から確定した"
+                f"「{game_state['faint_focus']}」が倒れたことが蓄積した戦況データから確定した"
                 "（画面にHP=0の表示は映っていない）。倒れたことに今気づいた体で、"
                 "このポケモンが倒れたことだけを実況する"
+            )
+        # 交代ヒント（2026-08-15・server.py側と同じ文言で配線）: switchイベントは
+        # 交代選択画面の時点で発火するため、実際に繰り出されたポケモンを直接指示する
+        if game_state.get("event_type") == "switch" and game_state.get("switch_focus"):
+            lines.append(
+                f"ポケモンの交代・繰り出しの場面。実際に繰り出されたのは「{game_state['switch_focus']}」"
+                "（画面の繰り出しメッセージから確定）。この繰り出しだけを実況し、"
+                "それより前の交代を今起きたかのように語らないこと"
+            )
+        elif game_state.get("switch_focus"):
+            lines.append(
+                f"直近で実際に繰り出されたポケモン（画面の繰り出しメッセージから確定）: "
+                f"{game_state['switch_focus']}。交代・繰り出しに言及する場合は必ずこれに従うこと"
+            )
+        # move_used=新しいターンの攻防が始まる瞬間（2026-08-15・server.py側と同じ趣旨）:
+        # 個別の技はmove_singleが都度実況するため、戦況全体に徹させる
+        if game_state.get("event_type") == "move_used":
+            lines.append(
+                "コマンドが確定して新しいターンの攻防が始まる場面。戦況全体（HP状況・残り数・"
+                "有利不利）とこのターンの注目ポイントを実況する。イベント履歴・技ログにある"
+                "過去の技や交代を今起きたかのように実況し直さないこと"
             )
         if game_state.get("faint_context"):
             lines.append(
@@ -202,6 +225,18 @@ class Phi3Client:
                 lines.append(
                     "※ ダメージを与えない変化技（能力変化・状態異常付与等）の場合、"
                     "「ダメージ」「効果ばつぐん」「〜に効いた」等の攻撃結果を表す言葉を使わないこと"
+                )
+            # 技の対象ヒント（2026-08-15・server.py側と同じ文言で配線）:
+            # move_single対象誤認（最頻NG）対策。技の直後の観測に厳密に従わせる
+            move_target_hint = battle_context.get("move_target_hint")
+            if move_target_hint:
+                lines.append(
+                    f"この技の直後に画面から観測された変化（Python側で照合済みの"
+                    f"確定情報）: {move_target_hint}"
+                )
+                lines.append(
+                    "※ この技の対象・結果は必ず上記の観測に従うこと。観測に登場しない"
+                    "ポケモンをこの技の対象として実況しないこと"
                 )
             condition_hint = battle_context.get("condition_hint")
             if condition_hint:

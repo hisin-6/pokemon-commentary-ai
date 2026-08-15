@@ -139,7 +139,7 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(
             self._context("faint", faint_focus="相手のリキキリン"), [], self._battle_state())
         assert "相手のリキキリン" in prompt
-        assert "残りポケモン数の減少から確定" in prompt
+        assert "蓄積した戦況データから確定" in prompt
         assert "HP=0のポケモンを特定すること" not in prompt
 
     def test_faint_focus_ignored_for_other_events(self):
@@ -148,7 +148,7 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(
             self._context("move_used", faint_focus="相手のリキキリン"), [], self._battle_state())
         assert "倒れたことに今気づいた体で" not in prompt
-        assert "今ターンで使われた技とその効果を実況する" in prompt
+        assert "新しいターンの攻防が始まる場面" in prompt
 
     def test_faint_context_included_when_present(self):
         """faint→move_used統合時のfaint_contextはpipeline側から送信されていたのに
@@ -172,6 +172,72 @@ class TestBuildVisionPrompt:
     def test_no_battle_result_rule_when_absent(self):
         prompt = _build_vision_prompt(self._context("battle_end"), [], self._battle_state())
         assert "勝敗に触れること" not in prompt
+
+    def test_switch_focus_overrides_event_hint(self):
+        """交代ヒント（2026-08-15）: switchイベントは交代選択画面で発火するため、
+        実際に繰り出されたポケモンをevent_hintで直接指示する。"""
+        prompt = _build_vision_prompt(
+            self._context("switch", switch_focus="自分のペリッパー"), [], self._battle_state())
+        assert "実際に繰り出されたのは「自分のペリッパー」" in prompt
+        assert "それより前の交代を今起きたかのように語らないこと" in prompt
+
+    def test_switch_without_focus_keeps_generic_hint(self):
+        prompt = _build_vision_prompt(self._context("switch"), [], self._battle_state())
+        assert "ポケモンの交代について実況する" in prompt
+
+    def test_switch_focus_info_line_for_move_used(self):
+        """move_usedはターン冒頭のコマンド交代と同時に発火するため、確定した
+        繰り出しを状況セクションに注入する（event_hintは差し替えない）。"""
+        prompt = _build_vision_prompt(
+            self._context("move_used", switch_focus="自分のブリジュラス"), [], self._battle_state())
+        assert "直近で実際に繰り出されたポケモン" in prompt
+        assert "自分のブリジュラス" in prompt
+        assert "新しいターンの攻防が始まる場面" in prompt  # event_hintはmove_usedのまま
+
+    def test_move_used_hint_reframed_as_turn_transition(self):
+        """2026-08-15: move_usedは発火時点でまだこのターンの技が出ていない
+        （通信終了＝ターン冒頭）ため、「今ターンの技を実況」から戦況全体
+        フレーミングに変更（前ターンの技を今起きたかのように語る誤実況対策）。"""
+        prompt = _build_vision_prompt(self._context("move_used"), [], self._battle_state())
+        assert "新しいターンの攻防が始まる場面" in prompt
+        assert "今起きたかのように実況し直さないこと" in prompt
+        assert "今ターンで使われた技とその効果を実況する" not in prompt
+
+    def test_move_target_hint_included_when_present(self):
+        """技の対象ヒント（2026-08-15・move_single対象誤認対策）: 技の直後の観測が
+        あればプロンプトに注入し、観測に従うルールも添える。"""
+        prompt = _build_vision_prompt(
+            self._context("move_single"), [],
+            self._battle_state(move_target_hint="メタグロス（自分側）のHPが100%→39%に減少"))
+        assert "メタグロス（自分側）のHPが100%→39%に減少" in prompt
+        assert "必ず上記の観測に従うこと" in prompt
+
+    def test_move_target_hint_omitted_when_absent(self):
+        prompt = _build_vision_prompt(
+            self._context("move_single"), [], self._battle_state())
+        assert "観測された変化" not in prompt
+
+    def test_surrender_rule_with_result(self):
+        """降参決着（2026-08-15）: 勝敗確定済みなら降参した側も明示する
+        （勝ち=相手が降参・負け=自分が降参）。気絶による全滅と捏造しない指示を出す。"""
+        prompt = _build_vision_prompt(
+            self._context("battle_end", battle_result="負け", battle_surrendered=True),
+            [], self._battle_state())
+        assert "降参（ギブアップ）によって終了した" in prompt
+        assert "自分が降参を選んだ" in prompt
+        assert "倒れた・全滅したという描写" in prompt
+
+    def test_surrender_rule_without_result(self):
+        """降参決着だが勝敗未検出（WIN/LOSE待ちタイムアウト等）の場合は
+        どちらの降参か断定させない。"""
+        prompt = _build_vision_prompt(
+            self._context("battle_end", battle_surrendered=True), [], self._battle_state())
+        assert "降参（ギブアップ）によって終了した" in prompt
+        assert "どちらの降参かは不明" in prompt
+
+    def test_no_surrender_rule_when_absent(self):
+        prompt = _build_vision_prompt(self._context("battle_end"), [], self._battle_state())
+        assert "降参（ギブアップ）" not in prompt
 
     def test_target_uncertainty_rule_present(self):
         """2026-08-14: 技の対象不明時に対象ポケモン名を決め打ちしないよう指示する

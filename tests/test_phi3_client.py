@@ -70,6 +70,54 @@ class TestBuildPrompt:
         assert "自分の勝ち" in prompt
         assert "締めの実況で必ず勝敗に触れること" in prompt
 
+    def test_switch_focus_instruction_for_switch_event(self, client):
+        """交代ヒント（2026-08-15・server.py側と同じ文言で配線）。"""
+        game_state = {"event_type": "switch", "switch_focus": "自分のペリッパー"}
+        prompt = client._build_prompt(game_state, None, None)
+        assert "実際に繰り出されたのは「自分のペリッパー」" in prompt
+
+    def test_switch_focus_info_line_for_move_used(self, client):
+        game_state = {"event_type": "move_used", "switch_focus": "自分のブリジュラス"}
+        prompt = client._build_prompt(game_state, None, None)
+        assert "自分のブリジュラス" in prompt
+        assert "必ずこれに従うこと" in prompt
+
+    def test_move_used_turn_transition_framing(self, client):
+        """2026-08-15: move_usedを戦況全体フレーミングに変更（server.py側と同じ趣旨）。"""
+        prompt = client._build_prompt({"event_type": "move_used"}, None, None)
+        assert "新しいターンの攻防が始まる場面" in prompt
+
+    def test_move_target_hint_included_when_present(self, client):
+        """技の対象ヒント（2026-08-15・server.py側と同じ文言で配線）。"""
+        battle_context = {
+            "turn": 3,
+            "move_target_hint": "ライチュウ（相手側）は攻撃から身を守った＝この技は防がれた",
+        }
+        prompt = client._build_prompt({"event_type": "move_single"}, None, battle_context)
+        assert "身を守った＝この技は防がれた" in prompt
+        assert "必ず上記の観測に従うこと" in prompt
+
+    def test_move_target_hint_omitted_when_absent(self, client):
+        prompt = client._build_prompt({"event_type": "move_single"}, None, {"turn": 3})
+        assert "観測された変化" not in prompt
+
+    def test_surrender_instruction_included_when_present(self, client):
+        """降参決着（2026-08-15）: 気絶による全滅と捏造しない指示を出す。"""
+        battle_context = {"turn": 3, "battle_result": "負け", "battle_surrendered": True}
+        prompt = client._build_prompt({"event_type": "battle_end"}, None, battle_context)
+        assert "降参（ギブアップ）によって終了した" in prompt
+        assert "自分が降参を選んだ" in prompt
+
+    def test_surrender_instruction_without_result(self, client):
+        """勝敗未検出の降参決着ではどちらの降参か断定させない。"""
+        battle_context = {"turn": 3, "battle_surrendered": True}
+        prompt = client._build_prompt({"event_type": "battle_end"}, None, battle_context)
+        assert "どちらの降参かは不明" in prompt
+
+    def test_no_surrender_instruction_when_absent(self, client):
+        prompt = client._build_prompt({"event_type": "battle_end"}, None, {"turn": 3})
+        assert "降参（ギブアップ）" not in prompt
+
     def test_bedrock_analysis_included_as_supplement(self, client):
         prompt = client._build_prompt({"event_type": "move_used"}, "画面には炎が見える", None)
         assert "画面の補足情報: 画面には炎が見える" in prompt
@@ -154,17 +202,17 @@ class TestBuildPrompt:
         game_state = {"event_type": "faint", "faint_focus": "相手のリキキリン"}
         prompt = client._build_prompt(game_state, None, None)
         assert "相手のリキキリン" in prompt
-        assert "残りポケモン数の減少から確定" in prompt
+        assert "蓄積した戦況データから確定" in prompt
 
     def test_faint_without_focus_has_no_inferred_hint(self, client):
         """通常のfaint（OCRの0%表示由来）ではfaint_focusが無く、指示行を追加しない。"""
         prompt = client._build_prompt({"event_type": "faint"}, None, None)
-        assert "残りポケモン数の減少から確定" not in prompt
+        assert "蓄積した戦況データから確定" not in prompt
 
     def test_non_faint_event_has_no_faint_focus_hint(self, client):
         game_state = {"event_type": "move_used", "faint_focus": "相手のリキキリン"}
         prompt = client._build_prompt(game_state, None, None)
-        assert "残りポケモン数の減少から確定" not in prompt
+        assert "蓄積した戦況データから確定" not in prompt
 
     def test_faint_context_included_when_present(self, client):
         """faint→move_used統合時の直前気絶情報（faint_context）の配線確認。"""

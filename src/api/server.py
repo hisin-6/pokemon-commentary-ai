@@ -177,14 +177,30 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
         # 合成faint（ボール数減少推定）: 画面にHP=0表示は映っていないため、
         # 「HP=0のポケモンを特定」ではなく確定済みの対象を直接指示する
         event_hint = (
-            f"「{context.get('faint_focus', '')}」が倒れたことが残りポケモン数の減少から確定した"
+            f"「{context.get('faint_focus', '')}」が倒れたことが蓄積した戦況データから確定した"
             "（画面にHP=0の表示は映っていない）。倒れたことに今気づいた体で、"
             "このポケモンが倒れたことだけを実況する"
+        )
+    elif event_type == "switch" and context.get("switch_focus"):
+        # 交代ヒント（2026-08-15）: switchイベントは交代選択画面の時点で発火するため、
+        # 実際に繰り出されたポケモンをパイプライン側で確定させて直接指示する
+        # （これが無いとLLMが直前の別の交代を今起きたかのように実況する）
+        event_hint = (
+            f"ポケモンの交代・繰り出しの場面。実際に繰り出されたのは「{context.get('switch_focus', '')}」"
+            "（画面の繰り出しメッセージから確定・信頼度高）。この繰り出しだけを実況し、"
+            "それより前の交代を今起きたかのように語らないこと"
         )
     else:
         event_hint = {
             "battle_start": "バトル開始！両者のポケモンを紹介して試合への期待感を高める実況をする",
-            "move_used":    "今ターンで使われた技とその効果を実況する",
+            # move_used=通信終了＝新しいターンの攻防が始まる瞬間に発火する。個別の技は
+            # move_singleが都度実況するため、ここでは戦況全体に徹させる（2026-08-15:
+            # 従来の「今ターンで使われた技と効果を実況」は発火時点でまだ技が出ておらず、
+            # 前ターンの技ログを今起きたかのように語る誤実況の温床だった）
+            "move_used":    "コマンドが確定して新しいターンの攻防が始まる場面。戦況全体"
+                            "（HP状況・残り数・有利不利）とこのターンの注目ポイントを実況する。"
+                            "イベント履歴・技ログにある過去の技や交代を今起きたかのように"
+                            "実況し直さないこと",
             "switch":       "ポケモンの交代について実況する",
             "faint":        "ポケモンが倒れた瞬間を実況する（HP=0のポケモンを特定すること）",
             "battle_end":   "試合終了を締めくくる実況をする",
@@ -241,6 +257,20 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
         lines += [
             f"- この試合の勝敗は「自分の{battle_result}」で確定している。"
             "締めの実況で必ず勝敗に触れること（勝ちなら喜び・負けなら悔しさ＋前向きな一言）",
+        ]
+    # 降参による決着（2026-08-15）。kurepi_persona.battle_surrendered_line()と手動同期
+    # （server.pyはboto3/flask依存でkurepi_persona.pyをimportできないため）
+    if context.get("battle_surrendered"):
+        if battle_result == "勝ち":
+            _surrender_who = "相手が降参を選んだ"
+        elif battle_result == "負け":
+            _surrender_who = "自分が降参を選んだ"
+        else:
+            _surrender_who = "どちらの降参かは不明・断定しない"
+        lines += [
+            f"- この試合は降参（ギブアップ）によって終了した（{_surrender_who}）。ポケモンが倒れて"
+            "決着したわけではないので、最後のポケモンが倒れた・全滅したという描写を"
+            "絶対にしないこと",
         ]
     if has_image:
         lines += [
@@ -301,6 +331,16 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
             "※ ダメージを与えない変化技（能力変化・状態異常付与等）の場合、"
             "「ダメージ」「効果ばつぐん」「〜に効いた」等の攻撃結果を表す言葉を使わないこと",
         ]
+    # 技の対象ヒント（2026-08-15・move_single対象誤認対策）: 技の直後に画面から
+    # 観測されたHP減少・状態異常付与・まもる成功。対象の推測誤りが最頻NGだったため、
+    # 観測がある場合はそれに厳密に従わせる
+    move_target_hint = battle_state.get("move_target_hint")
+    if move_target_hint:
+        lines += [
+            f"この技の直後に画面から観測された変化（Python側で照合済みの確定情報）: {move_target_hint}",
+            "※ この技の対象・結果は必ず上記の観測に従うこと。観測に登場しない"
+            "ポケモンをこの技の対象として実況しないこと",
+        ]
     condition_hint = battle_state.get("condition_hint")
     if condition_hint:
         lines += [
@@ -333,8 +373,13 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
     ]
     if context.get("faint_focus"):
         lines.append(
-            f"倒れたことが確定したポケモン（残りポケモン数の減少から確定・信頼度高）: {context['faint_focus']}"
+            f"倒れたことが確定したポケモン（蓄積した戦況データから確定・信頼度高）: {context['faint_focus']}"
         )
+    if context.get("switch_focus"):
+        lines += [
+            f"直近で実際に繰り出されたポケモン（画面の繰り出しメッセージから確定・信頼度高）: {context['switch_focus']}",
+            "※ 交代・繰り出しに言及する場合は必ず上記に従うこと",
+        ]
     if context.get("faint_context"):
         lines.append(
             f"直前に起きた気絶の時点の戦況（この直後に下記の技が使われた）: {context['faint_context']}"

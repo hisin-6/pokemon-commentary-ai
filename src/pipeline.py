@@ -2572,6 +2572,16 @@ def _detect_battle_result(text: str) -> str | None:
     return None
 
 
+def _is_surrender_text(text: str) -> bool:
+    """OCRテキストが「降参が選ばれました」（降参による決着）かを判定する。
+
+    _detect_battle_resultと同じくスペース・スラッシュ除去後に部分一致で判定する
+    （「降参が / 選ばれました」のような断片化を吸収）。
+    """
+    joined = text.replace(" ", "").replace("/", "")
+    return "降参が選ばれ" in joined
+
+
 # 「(相手名)との勝負に勝った/負けた」から相手トレーナー名を抜き出す
 # （2026-08-14・WIN/LOSE画面の左右判定用に新設。詳細は_detect_result_from_win_lose_ocr参照）
 _OPPONENT_TRAINER_NAME_RE = re.compile(r"(.{1,20}?)との勝負に(?:勝|負)")
@@ -2787,7 +2797,9 @@ def _build_bedrock_context(
         "faint_context":            game_state.get("faint_context", ""),  # 直前のfaint情報（統合時のみ）
         "faint_focus":              game_state.get("faint_focus", ""),  # ボール数推定で確定した気絶の対象（合成faintのみ）
         "battle_result":            game_state.get("battle_result", ""),  # 勝敗（battle_endのみ・"勝ち"/"負け"）
+        "battle_surrendered":       bool(game_state.get("battle_surrendered", False)),  # 降参による決着（battle_endのみ）
         "move_focus":               game_state.get("move_focus", ""),  # 実況対象の1技（move_singleのみ）
+        "switch_focus":             game_state.get("switch_focus", ""),  # 実際に繰り出されたポケモン（switch/move_used・後付けのみ）
         "persona":                  persona,  # "kurepi"/"neutral"（2026-08-14・3Dモデル一時差し替え検証用）
     }
 
@@ -2965,6 +2977,7 @@ class Pipeline:
         self._last_ball_yolo: BattleState | None = None  # ボールが見えたフレームの最新 YOLO 結果
         self._last_ability_msg: dict[str, str] = {}     # 最後に検出した特性・道具発動メッセージ
         self._battle_result: str | None = None  # 「勝負に勝った/負けた」検出結果（"勝ち"/"負け"）
+        self._battle_surrendered: bool = False  # 「降参が選ばれました」検出済み（降参による決着）
         self._opponent_trainer_name: str | None = None  # 「〜との勝負に」から抽出した相手トレーナー名
         # （2026-08-14発見・WIN/LOSE画面の左右判定用。「自分は常に右側」という固定前提が
         # 誤りだったため、既知の相手名との照合方式に切り替えた。詳細は
@@ -3005,6 +3018,16 @@ class Pipeline:
         # ライブモードは即時Bedrock Vision経路を維持するため対象外。
         self._posthoc_mode: bool = self._render_sink is not None and video_path is not None
         self._pending_render_events: list[dict] = []
+        # 技の対象ヒント用の観測履歴（2026-08-15・move_single対象誤認対策）。
+        # 後付け生成時に「技の直後のHP減少・状態異常付与・まもる成功」から対象を
+        # 逆引きするための時系列記録。動画全体で蓄積するため_reset_battle_stateでは
+        # クリアしない（_pending_render_eventsと同じライフサイクル）
+        self._panel_state_history: list[tuple[float, dict]] = []  # (動画内時刻, to_panel_state())
+        self._protect_history: list[tuple[float, str, str]] = []  # (動画内時刻, "自分側"/"相手側", 名前)
+        # 交代ヒント用の繰り出し履歴（2026-08-15・switch/move_used実況のタイミングずれ対策）。
+        # _recent_sendoutsは60秒トリム＋試合毎クリアがあるため後付け生成では使えず、
+        # 全動画分を保持する専用の履歴を別に持つ
+        self._sendout_history: list[tuple[float, str, str]] = []  # (動画内時刻, "player"/"opponent", 名前)
         # faint保留送信: faintイベントのBedrockを即送信せず次のmove_usedで統合する
         self._pending_faint_state: dict | None = None
         self._pending_faint_battle_context: dict | None = None
@@ -3065,6 +3088,7 @@ class Pipeline:
         self._last_ball_yolo = None   # バトル開始時にボール情報をリセット
         self._last_ability_msg = {}   # バトル開始時に特性・道具メッセージをリセット
         self._battle_result = None    # 前試合の勝敗をリセット（連戦動画対策）
+        self._battle_surrendered = False  # 前試合の降参フラグをリセット
         self._opponent_trainer_name = None  # 前試合の相手トレーナー名をリセット
         self._announced_faints = set()  # 前試合の気絶実況済み名をリセット
         self._end_screen_pending_turn = None       # 前試合のWIN/LOSE待ち状態をリセット
@@ -3182,6 +3206,9 @@ class Pipeline:
                                 # 待機中も_process_event呼び出し直前のループでこのテキストを
                                 # 優先的に監視する（下記「降参終了のWIN/LOSE画面待ち」参照）。
                                 log.info(f"[YOLO] 終了画面を{self._end_screen_count}回連続検出（降参・勝敗未確定）→ WIN/LOSE画面を最大{self._END_SCREEN_WIN_LOSE_TIMEOUT:.0f}秒待機")
+                                # キーワード一致かつ勝敗なし＝「降参が選ばれました」経由。
+                                # battle_end実況が気絶による全滅と捏造しないよう記録する
+                                self._battle_surrendered = True
                                 self._end_screen_count = 0
                                 self._end_screen_ocr_texts = []
                                 turn += 1
@@ -3319,6 +3346,7 @@ class Pipeline:
                     if self._battle_active:
                         self._update_move_log(ocr_results, is_main_ocr=True, frame=frame)
                         self._update_move_effectiveness(ocr_results)
+                        self._update_protect_history(ocr_results)
                         self._update_battle_conditions(ocr_results)
                         self._update_mega_evolution(ocr_results)
                         self._update_switch_out(ocr_results)
@@ -3396,6 +3424,13 @@ class Pipeline:
                         log.debug("battle_end を検知したがバトル未開始のためスキップ")
                         event_type = None
 
+                    # 降参のWIN/LOSE待機中はフェーズ経路のbattle_endを抑止（二重発行防止・
+                    # 発行は上の「降参終了のWIN/LOSE画面待ち」ブロックが担当する）
+                    if (event_type == "battle_end"
+                            and self._end_screen_pending_deadline is not None):
+                        log.debug("battle_end を検知したが降参のWIN/LOSE待機中のためスキップ")
+                        event_type = None
+
                     # battle_end 後クールダウン中は battle_start をブロック
                     # （リザルト画面・ロビー画面の command_select 誤検知対策）
                     if (event_type == "battle_start"
@@ -3462,6 +3497,27 @@ class Pipeline:
                                 self._pending_faint_battle_context = None
                                 self._pending_faint_frame = None
                         else:
+                            # ── 降参終了の保留（フェーズ遷移経路・2026-08-15）──────
+                            # 「降参が選ばれました」テキスト由来のbattle_endは勝敗情報を
+                            # 持たない。YOLO終了画面経路（2026-08-14修正済み）と同様に
+                            # 即発行せず、後続の「勝負に勝った/負けた」テキスト or
+                            # WIN/LOSE画面を待ってから発行する（実機2026-08-14_20-46-44で
+                            # この経路が先に発火し、battle_result未検出のまま実況が
+                            # 気絶による全滅と捏造した実例を確認）。
+                            if event_type == "battle_end":
+                                _be_joined = "".join(r["text"] for r in ocr_results)
+                                if _is_surrender_text(_be_joined):
+                                    self._battle_surrendered = True
+                                    if (self._battle_result is None
+                                            and _detect_battle_result(_be_joined) is None):
+                                        turn += 1
+                                        log.info(
+                                            f"[フェーズ] battle_end検知（降参・勝敗未確定）→ "
+                                            f"WIN/LOSE画面を最大{self._END_SCREEN_WIN_LOSE_TIMEOUT:.0f}秒待機")
+                                        self._end_screen_pending_turn = turn
+                                        self._end_screen_pending_deadline = (
+                                            self._now() + self._END_SCREEN_WIN_LOSE_TIMEOUT)
+                                        continue
                             turn += 1
                             log.info(f"[ターン {turn}] イベント検知 (diff={diff_score:.1f}, type={event_type}, phase={self._phase_classifier._prev_phase})")
                             self._phase_classifier.set_processing(True)
@@ -3507,6 +3563,7 @@ class Pipeline:
                         log.info("[密集OCR] %s", " / ".join(dense_texts[:10]))
                         self._update_move_log(dense_results, frame=frame)
                         self._update_move_effectiveness(dense_results)
+                        self._update_protect_history(dense_results)
                         self._update_battle_conditions(dense_results)
                         self._update_mega_evolution(dense_results)
 
@@ -3593,11 +3650,14 @@ class Pipeline:
                 self._battle_tracker.game_turn += 1
                 self._battle_tracker.record_turn_snapshot()
                 log.info(f"[ターン] T{self._battle_tracker.game_turn} 開始")
-            # 保留中のfaintがタイムアウトしていれば単独Bedrock送信でフラッシュ
-            if (self._pending_faint_state is not None
-                    and self._now() - self._pending_faint_time >= self._FAINT_PENDING_TIMEOUT):
-                log.info("[faintフラッシュ] タイムアウト(%gs超過) → 保留faintを単独送信",
-                         self._FAINT_PENDING_TIMEOUT)
+            # 保留中のfaintがあれば単独Bedrock送信でフラッシュ（2026-08-15:
+            # 従来は75秒タイムアウト超過時のみで、タイムアウト前にturn_startが来ると
+            # 保留を持ち越し→次ターンのmove_usedに統合され、47秒遅れ＋交代と混同した
+            # 実況になった（実機2026-08-14_20-46-44 #14「メタグロスは耐えきれず交代」）。
+            # turn_startが来た＝気絶したターンは終わっているので、ターンをまたぐ統合は
+            # やめて即フラッシュする。event_timeは検知時刻を使うため配置は正確）
+            if self._pending_faint_state is not None:
+                log.info("[faintフラッシュ] turn_start到達 → 保留faintを単独送信")
                 self._flush_pending_faint()
             return
 
@@ -3682,7 +3742,7 @@ class Pipeline:
             if event_type == "faint":
                 faint_side = self._battle_tracker.diff_fainted_side(
                     prev_fainted, curr_fainted)
-            inferred_faints = self._track_new_faints(curr_fainted, event_type)
+            inferred_faints = self._track_new_faints(prev_fainted, curr_fainted, event_type)
 
         battle_context = self._battle_tracker.to_context()
         type_hint = self._compute_type_hint()
@@ -3722,7 +3782,7 @@ class Pipeline:
         # ── 気絶実況の合成（ボール数推定で新規確定した相手の気絶）──────────────
         # 現行イベントの実況より先にディスパッチし、時系列順（気絶→現行イベント）を保つ
         if inferred_faints:
-            self._announced_faints.update(inferred_faints)
+            self._announced_faints.update(name for _side, name in inferred_faints)
             self._dispatch_faint_inferred(inferred_faints, frame, game_state, battle_context)
 
         # ── Bedrock Vision（バトル中のみ・対象イベントのみ・EC2 URL が設定されている場合）──
@@ -3731,6 +3791,13 @@ class Pipeline:
         if attempt_bedrock:
             # ── faint保留: 即送信せず次のmove_usedと統合するため保留する ──
             if event_type == "faint":
+                # 未処理の保留faintが残っていれば先にフラッシュする（2026-08-15:
+                # 従来は無条件に上書きしており、連続faintで前の気絶実況が消滅した。
+                # 実機2026-08-14_20-46-44: コノヨザルの保留faintがペリッパーの
+                # faintイベントで上書きされ実況されなかった）
+                if self._pending_faint_state is not None:
+                    log.info("[faintフラッシュ] 新しいfaint検知 → 未処理の保留faintを先に送信（上書き消滅防止）")
+                    self._flush_pending_faint()
                 log.info("[faint保留] Bedrock送信を保留（次のmove_usedで統合予定）")
                 self._pending_faint_state = game_state
                 self._pending_faint_battle_context = battle_context
@@ -3739,6 +3806,14 @@ class Pipeline:
                 self._pending_faint_game_turn = self._battle_tracker.game_turn
                 # 実況・VOICEVOX もスキップして終了（戦況更新は済み）
                 return
+
+            # ── battle_endで保留中のfaintがあれば先にフラッシュ ──
+            # （2026-08-15: 未フラッシュのままスキャン終了すると気絶実況が消滅する。
+            # 実機2026-08-14_20-46-44: ペリッパーの保留faintがbattle_endで消滅した。
+            # event_timeは検知時刻を使うため時系列順も保たれる）
+            if event_type == "battle_end" and self._pending_faint_state is not None:
+                log.info("[faintフラッシュ] battle_end検知 → 保留faintを先に送信")
+                self._flush_pending_faint()
 
             # ── move_usedで保留中のfaint情報があれば統合 ──
             if event_type == "move_used" and self._pending_faint_state is not None:
@@ -3785,13 +3860,22 @@ class Pipeline:
         if event_type == "battle_end":
             if self._battle_result is None:
                 self._battle_result = _detect_battle_result(game_state.get("ocr_text", ""))
-            if self._battle_result:
+            if not self._battle_surrendered and _is_surrender_text(game_state.get("ocr_text", "")):
+                self._battle_surrendered = True
+            if self._battle_result or self._battle_surrendered:
                 game_state = dict(game_state)
+            if self._battle_result:
                 game_state["battle_result"] = self._battle_result
                 log.info("[戦況] 勝敗検出: %s", self._battle_result)
                 # 改善ロードマップ③（表情連動）用: manifest.jsonlのcontextにも
                 # 載せ、VMC操作スクリプトが勝ち=喜び／負け=哀しみを選び分けられるようにする
                 battle_context["battle_result"] = self._battle_result
+            if self._battle_surrendered:
+                # 降参による決着（2026-08-15）: 実況が「〜が倒れて全滅」等の気絶を
+                # 捏造しないよう、プロンプト・manifest.jsonlの両方に明示する
+                game_state["battle_surrendered"] = True
+                battle_context["battle_surrendered"] = True
+                log.info("[戦況] 降参による決着を記録")
 
         # ── 実況文の生成・再生（ライブ）／後付け生成用バッファへの追加（動画モード）──
         # event_time はこのハンドラが処理中のフレームの動画内時刻（同期実行なので
@@ -3955,6 +4039,100 @@ class Pipeline:
             event_time=pending_time,
         )
 
+    # 技の対象ヒント（2026-08-15・move_single対象誤認対策）の調整定数
+    _TARGET_HINT_MAX_WINDOW_SEC = 20.0  # 次のイベントが無い場合の観測窓の上限
+    _TARGET_HINT_MIN_HP_DROP = 3.0      # HP減少をダメージとみなす最小ポイント（数値HPノイズ対策）
+    # 交代ヒント（2026-08-15・switch/move_used実況のタイミングずれ対策）の観測窓の遡り幅。
+    # switchイベントは交代選択画面で発火し「ゆけっ!」は数秒後に出るため遡りは小さめ、
+    # move_usedはターン冒頭のコマンド交代の繰り出しメッセージがイベント検知と
+    # ほぼ同時（実機2026-08-14_20-46-44: ブリジュラス繰り出しとmove_used #14が同秒）
+    # のため少し広めに取る
+    _SENDOUT_HINT_LOOKBACK = {"switch": 3.0, "move_used": 5.0}
+
+    @staticmethod
+    def _move_target_window_end(events: list[dict], index: int) -> float:
+        """move_singleイベント（events[index]）の観測窓の終端時刻を返す。
+
+        次の技・交代・試合終了イベントまでの区間が「この技の結果が画面に反映される
+        区間」（実機検証: HP変化・状態異常メッセージは次の技の前に必ず出る）。
+        faintはこの技の結果なので窓を区切らない。次イベントが無ければ上限で打ち切る。
+        """
+        start = events[index]["event_time"]
+        end = start + Pipeline._TARGET_HINT_MAX_WINDOW_SEC
+        for nxt in events[index + 1:]:
+            if nxt["event_type"] in ("move_single", "move_used", "switch", "battle_end"):
+                return min(end, nxt["event_time"])
+        return end
+
+    def _compute_move_target_hint(self, start: float, end: float) -> str:
+        """観測窓 (start, end] のHP減少・状態異常付与・まもる成功から、技の対象の
+        観測事実を組み立てる（後付け生成専用・2026-08-15）。
+
+        LLMが場のポケモンから対象を推測して外す誤認（パス1検証・新レンダー
+        2026-08-14_20-46-44で7件の最頻NG）への対策。観測が無い場合は空文字を返し、
+        既存のプロンプト安全策（対象不明時は断定しない・施策A）に委ねる。
+        """
+        hints: list[str] = []
+        # まもる成功（この技が防がれた証拠・最優先で提示）
+        for t, side, name in getattr(self, "_protect_history", []):
+            if start < t <= end:
+                hints.append(f"{name}（{side}）は攻撃から身を守った＝この技は防がれた")
+        # HP減少・状態異常付与（パネル状態履歴の差分）
+        def snap(state: dict) -> dict:
+            out = {}
+            for side_key, label in (("player", "自分側"), ("opponent", "相手側")):
+                for p in state.get(side_key, []):
+                    out[(label, p.get("name"))] = (p.get("hp_pct"), p.get("status"))
+            return out
+
+        baseline: dict | None = None
+        window_states: list[dict] = []
+        for t, state in getattr(self, "_panel_state_history", []):
+            if t <= start:
+                baseline = state
+            elif t <= end:
+                window_states.append(state)
+        if baseline is not None and window_states:
+            base_map = snap(baseline)
+            drops: dict[tuple, tuple[float, float]] = {}   # key -> (基準HP, 最小HP)
+            statuses: dict[tuple, str] = {}
+            for state in window_states:
+                for key, (hp, status) in snap(state).items():
+                    base_hp, base_status = base_map.get(key, (None, None))
+                    if (hp is not None and base_hp is not None
+                            and base_hp - hp >= self._TARGET_HINT_MIN_HP_DROP):
+                        prev = drops.get(key)
+                        if prev is None or hp < prev[1]:
+                            drops[key] = (base_hp, hp)
+                    if status and status != base_status and key not in statuses:
+                        statuses[key] = status
+            for (label, name), (base_hp, low_hp) in drops.items():
+                hints.append(
+                    f"{name}（{label}）のHPが{round(base_hp)}%→{round(low_hp)}%に減少")
+            for (label, name), status in statuses.items():
+                hints.append(f"{name}（{label}）が{status}状態になった")
+        return " / ".join(hints)
+
+    def _compute_switch_focus(self, start: float, end: float) -> str:
+        """観測窓 (start, end] の繰り出しメッセージ履歴から「実際に誰が繰り出されたか」を
+        組み立てる（後付け生成専用・2026-08-15）。
+
+        switchイベントは faint→switch_select 遷移＝交代選択画面の時点で発火するため、
+        ディスパッチ時点では繰り出されるポケモンがまだ画面に出ておらず、LLMが直前の
+        別の交代を今起きたかのように実況していた（実機2026-08-14_20-46-44 #18:
+        実際はペリッパー再登場なのに7秒前時点の情報から「ブリジュラスへの交代だ！」）。
+        move_usedもターン冒頭のコマンド交代と同時に発火し同じずれ方をする（同#14）。
+        観測が無い場合は空文字を返す。
+        """
+        labels = {"player": "自分", "opponent": "相手"}
+        parts: list[str] = []
+        for t, side, name in getattr(self, "_sendout_history", []):
+            if start < t <= end:
+                entry = f"{labels.get(side, side)}の{name}"
+                if entry not in parts:
+                    parts.append(entry)
+        return " / ".join(parts)
+
     def _generate_posthoc_commentary(self) -> None:
         """動画モードの後付け実況生成（ADR-009追記）。
 
@@ -3966,6 +4144,9 @@ class Pipeline:
         することで `history`（直前の実況の繰り返し防止）がライブ経路と同じように
         機能する。各イベントのcontext/battle_stateはスキャン中に捕捉した時点の
         値のままなので、未来の情報が混ざることはない（スポイラー安全性の担保）。
+        例外はmove_singleの「技の対象ヒント」（2026-08-15）: 技の直後〜次イベントまでの
+        観測（HP減少・状態異常・まもる成功）だけを注入する。実況音声自体が技の数秒後に
+        再生される上、観測内容はその技の結果そのものなのでネタバレにはならない。
         """
         render_sink = getattr(self, "_render_sink", None)
         # match_idは元動画ファイル名（拡張子なし）を使う。render_dir名（--render-out）
@@ -3988,7 +4169,32 @@ class Pipeline:
                 log.warning(f"戦況ウェアハウス クリアエラー: {e}")
 
         history: list[str] = []
-        for ev in self._pending_render_events:
+        for i, ev in enumerate(self._pending_render_events):
+            # 技の対象ヒント（2026-08-15）: 技の直後の観測から対象を逆引きして注入
+            if ev["event_type"] == "move_single":
+                window_end = self._move_target_window_end(self._pending_render_events, i)
+                target_hint = self._compute_move_target_hint(ev["event_time"], window_end)
+                if target_hint:
+                    if ev.get("battle_context") is None:
+                        ev["battle_context"] = {}
+                    ev["battle_context"]["move_target_hint"] = target_hint
+                    if ev.get("render_context") is not None:
+                        # manifest.jsonlで実機確認できるようにする（他ヒントと同パターン）
+                        ev["render_context"]["move_target_hint"] = target_hint
+                    log.info("[対象ヒント] t=%.1fs %s", ev["event_time"], target_hint)
+            # 交代ヒント（2026-08-15）: 発火後（switch=交代選択画面・move_used=ターン冒頭）に
+            # 出る繰り出しメッセージから「実際に誰が出てきたか」を逆引きして注入
+            if ev["event_type"] in ("switch", "move_used"):
+                window_end = self._move_target_window_end(self._pending_render_events, i)
+                lookback = self._SENDOUT_HINT_LOOKBACK[ev["event_type"]]
+                switch_focus = self._compute_switch_focus(
+                    ev["event_time"] - lookback, window_end)
+                if switch_focus:
+                    ev["game_state"] = dict(ev["game_state"])
+                    ev["game_state"]["switch_focus"] = switch_focus
+                    if ev.get("render_context") is not None:
+                        ev["render_context"]["switch_focus"] = switch_focus
+                    log.info("[交代ヒント] t=%.1fs %s", ev["event_time"], switch_focus)
             self._record_situation_snapshot(match_id, ev)
             bedrock_commentary, bedrock_analysis = _call_bedrock_text(
                 self._ec2_url, ev["game_state"], ev["event_type"], history,
@@ -4096,7 +4302,13 @@ class Pipeline:
         if render_sink is None or not self._battle_active:
             return
         try:
-            render_sink.add_state(self._now(), self._battle_tracker.to_panel_state())
+            state = self._battle_tracker.to_panel_state()
+            render_sink.add_state(self._now(), state)
+            # 技の対象ヒント用のインメモリ履歴（2026-08-15）。RenderSink同様に
+            # 同一状態はスキップして肥大を防ぐ
+            history = getattr(self, "_panel_state_history", None)
+            if history is not None and (not history or history[-1][1] != state):
+                history.append((self._now(), state))
         except Exception as e:
             log.error(f"パネル状態記録エラー: {e}")
 
@@ -4273,6 +4485,9 @@ class Pipeline:
                 # 改善ロードマップ③（表情連動）用: "勝ち"/"負け"。battle_end時の
                 # 表情（喜び/哀しみ）選択に使う
                 ctx["battle_result"] = battle_context["battle_result"]
+            if "battle_surrendered" in battle_context:
+                # 降参による決着（2026-08-15）: manifest.jsonlで実機確認できるようにする
+                ctx["battle_surrendered"] = battle_context["battle_surrendered"]
             if "type_hint" in battle_context:
                 # 戦況推論強化（2026-08-04）用: manifest.jsonlで実機確認できるようにする
                 ctx["type_hint"] = battle_context["type_hint"]
@@ -4451,6 +4666,13 @@ class Pipeline:
         self._recent_sendouts = [(t, s, n) for (t, s, n) in self._recent_sendouts
                                  if now - t <= 60.0]
         self._recent_sendouts.append((now, side, name))
+        # 交代ヒント用の全動画履歴（2026-08-15）。同一繰り出しのOCR揺れによる
+        # 二重記録（「ペリッパー」「ペリッパーー」等が正規化後に連続する）をデデュープ
+        history = getattr(self, "_sendout_history", None)
+        if history is not None:
+            if not (history and history[-1][1:] == (side, name)
+                    and now - history[-1][0] < 15.0):
+                history.append((now, side, name))
 
     def _handle_message_event(self, ev: dict) -> None:
         """BattleMessageParser から受け取ったメッセージイベントで戦況を補完する。"""
@@ -4545,6 +4767,39 @@ class Pipeline:
             if any(token in r.get("text", "") for r in ocr_results):
                 self._move_effectiveness[latest] = tag
                 break
+
+    # 「(名前)は 攻撃から身を守った!」のまもる成功メッセージ。名前とメッセージ本文の
+    # 間にOCR誤読断片（「こうげきみまも」等）が挟まる実例があるため間に最大12文字許容
+    # （実機2026-08-14_20-46-44:「あいて相手のライチュウはこうげきみまも攻撃から身を守った!」）
+    _PROTECT_MSG_RE = re.compile(r"([ァ-ヴー]{2,})は.{0,12}身を守った")
+    _PROTECT_DEDUP_SEC = 10.0  # 同一メッセージが複数フレームでOCRされるためのデデュープ窓
+
+    def _update_protect_history(self, ocr_results: list[dict]) -> None:
+        """「Xは攻撃から身を守った」（まもる成功）を検出し、時刻・陣営・名前を記録する
+        （2026-08-15・技の対象ヒント用）。守った側＝直前の攻撃技の対象なので、
+        後付け生成時に「この技は防がれた」という対象証拠として使う。
+        """
+        classifier = getattr(self, "_classifier", None)
+        if classifier is None:
+            return
+        joined = "".join(r.get("text", "") for r in ocr_results).replace(" ", "")
+        m = self._PROTECT_MSG_RE.search(joined)
+        if not m:
+            return
+        result = classifier.classify(m.group(1))
+        if not (result and result.category == CATEGORY_POKEMON and result.score >= 80):
+            return
+        name = result.canonical_ja
+        # 陣営は名前の直前の「あいて相手の」プレフィックスで判定する。joined全体で
+        # 判定すると、フルスクリーンOCRで無関係な位置の「相手」を拾って誤判定しうる
+        prefix = joined[max(0, m.start() - 8):m.start()]
+        side = "相手側" if ("相手" in prefix or "あいて" in prefix) else "自分側"
+        history = self._protect_history
+        if history and history[-1][1:] == (side, name) \
+                and self._now() - history[-1][0] < self._PROTECT_DEDUP_SEC:
+            return
+        history.append((self._now(), side, name))
+        log.info("[まもる成功] %s %s (t=%.1fs)", side, name, self._now())
 
     @staticmethod
     def _condition_message_side(ocr_results: list[dict]) -> str:
@@ -4657,14 +4912,16 @@ class Pipeline:
 
     def _track_new_faints(
         self,
+        prev_fainted: tuple[set[str], set[str]],
         curr_fainted: tuple[set[str], set[str]],
         event_type: str,
-    ) -> list[str]:
-        """現在のfainted_names()と実況済み集合の差分から、合成faint実況の対象を返す。
+    ) -> list[tuple[str, str]]:
+        """現在のfainted_names()と実況済み集合の差分から、合成faint実況の対象を
+        (side, 名前) のリストで返す（side="player"/"opponent"）。
 
         faintイベント（OCRの0%表示由来）の気絶は既存経路が実況するため
         _announced_faints への登録のみ行い、空リストを返す。それ以外のイベントでは、
-        faintイベントを経ずに確定した相手の未実況気絶を返す。呼び出し側が実況合成時に
+        faintイベントを経ずに確定した両陣営の未実況気絶を返す。呼び出し側が実況合成時に
         _announced_faints へ登録する（重複実況防止）。
 
         「更新前後のdiff」ではなく「現在の気絶−実況済み」で判定するのは、気絶確定が
@@ -4673,11 +4930,29 @@ class Pipeline:
         フレーム処理中＝イベント間に立つので、update()前後のdiffでは常に空になり
         取りこぼす（実機2026-06-07 12-48-22のリキキリンで確認。0%表示も2Hz
         サンプリングから漏れており、diff方式では一度も実況されなかった）。
+
+        ⚠️2026-08-15の2つの変更（実機2026-08-14_20-46-44の気絶未実況3件の対策）:
+        1. faintイベント時の実況済み登録を「今回のupdateで新規に気絶した分」に限定した。
+           従来は現在の全気絶を登録しており、faintイベントの実況対象ではない
+           未実況の気絶（メッセージ由来で先に確定していたライチュウ）まで
+           「実況済み」扱いになり、合成の機会が永久に失われていた。
+           diffが空（対象を特定できない）場合のみ従来通り全登録（二重実況防止優先）。
+        2. 自分側の気絶も合成対象に拡張した。従来は相手側のみ（ボール数減少推定の
+           スコープ）だったが、メッセージ由来の気絶確定（「メタグロスはたおれた!」）は
+           自分側でも起きており、faintイベントの取り漏らし時に保険が効かなかった。
+        ※既知の限界: _announced_faintsは名前のみの集合のため、同名ミラー戦では
+        片側の実況で両側が実況済み扱いになる（同名ミラーの根本解決はフェーズ2候補）。
         """
         if event_type == "faint":
-            self._announced_faints |= curr_fainted[0] | curr_fainted[1]
+            new_names = ((curr_fainted[0] - prev_fainted[0])
+                         | (curr_fainted[1] - prev_fainted[1]))
+            if new_names:
+                self._announced_faints |= new_names
+            else:
+                self._announced_faints |= curr_fainted[0] | curr_fainted[1]
             return []
-        return sorted(curr_fainted[1] - self._announced_faints)
+        return ([("player", n) for n in sorted(curr_fainted[0] - self._announced_faints)]
+                + [("opponent", n) for n in sorted(curr_fainted[1] - self._announced_faints)])
 
     def _dispatch_faint_inferred(
         self,
@@ -4686,13 +4961,17 @@ class Pipeline:
         game_state: dict,
         battle_context: dict,
     ) -> None:
-        """ボール数減少推定で気絶が新規確定した瞬間に、単独のfaint実況イベントを合成する。
+        """faintイベントを経ずに気絶が確定した瞬間に、単独のfaint実況イベントを合成する。
+
+        names は _track_new_faints が返す (side, 名前) のリスト（side="player"/"opponent"）。
+        陣営ごとに1イベントとしてディスパッチする（2026-08-15拡張・従来は相手側のみ）。
 
         通常のfaint実況はOCRで「0%」等が映ったフレーム（_HP_ZERO_RE）でのみ発火するため、
-        2Hzサンプリングから0%表示が漏れると気絶が一度も実況されない。ボール数推定は
-        サンプリング漏れに強い（ボールアイコンは常時表示）ので、こちらの確定タイミングで
-        実況を補完する。誤ひんし推定がOCR再検出で後から解除されるケースは誤実況として
-        残るが、取りこぼし削減を優先する（move_singleのtentative実況と同方針・ユーザー決定）。
+        2Hzサンプリングから0%表示が漏れると気絶が一度も実況されない。ボール数減少推定や
+        「たおれた」メッセージ由来の気絶確定はサンプリング漏れに強いので、こちらの確定
+        タイミングで実況を補完する。誤ひんし推定がOCR再検出で後から解除されるケースは
+        誤実況として残るが、取りこぼし削減を優先する（move_singleのtentative実況と
+        同方針・ユーザー決定）。
 
         既存の_pending_faint_*保留・統合機構は意図的に使わない（faint統合のgame_turn
         繰り上げが、コマンド画面検知タイミングの合成faintでは誤作動するため）。
@@ -4704,19 +4983,25 @@ class Pipeline:
             return
         if not self._battle_active:
             return
-        game_state = dict(game_state)
-        # コピー元は現行イベント（turn_start等）のgame_stateのため、event_typeを
-        # faintに上書きする（phi3_client/_build_bedrock_contextはこのキーで分岐する）
-        game_state["event_type"] = "faint"
-        game_state["faint_focus"] = "相手の" + "と".join(names)
-        battle_context = dict(battle_context)
-        # 表情連動（manifest.jsonlのcontext.faint_side）が既存経路でそのまま効く
-        battle_context["faint_side"] = "opponent"
         attempt_bedrock = bool(
             self._ec2_url and "faint" in BEDROCK_EVENTS and self._battle_active)
-        self._dispatch_commentary(
-            "faint", frame, game_state, battle_context,
-            self._move_log_display(5), attempt_bedrock, event_time=self._now())
+        # 陣営ごとに1イベントとして合成する（faint_sideを一意に保ち、表情連動＝
+        # 自分が倒れたら哀しい/相手を倒したら嬉しい、がそのまま効くようにする）
+        for side, prefix in (("player", "自分の"), ("opponent", "相手の")):
+            side_names = [n for s, n in names if s == side]
+            if not side_names:
+                continue
+            side_state = dict(game_state)
+            # コピー元は現行イベント（turn_start等）のgame_stateのため、event_typeを
+            # faintに上書きする（phi3_client/_build_bedrock_contextはこのキーで分岐する）
+            side_state["event_type"] = "faint"
+            side_state["faint_focus"] = prefix + "と".join(side_names)
+            side_context = dict(battle_context)
+            # 表情連動（manifest.jsonlのcontext.faint_side）が既存経路でそのまま効く
+            side_context["faint_side"] = side
+            self._dispatch_commentary(
+                "faint", frame, side_state, side_context,
+                self._move_log_display(5), attempt_bedrock, event_time=self._now())
 
     def _dispatch_move_commentary(
         self,
