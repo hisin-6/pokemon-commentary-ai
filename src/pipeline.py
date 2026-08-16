@@ -165,6 +165,16 @@ _WEATHER_KEYWORDS = {
     "すなあらし": "すなあらし", "すなおこし": "すなあらし",   # 技: すなあらし / 特性: すなおこし
     "ゆきげしき": "ゆき", "ゆきふらし": "ゆき",               # 技: ゆきげしき / 特性: ゆきふらし
 }
+# 天候を発生させる特性のキーワード（2026-08-16新設）。技と特性で発動メッセージの
+# 検出キーワードは共有するが、特性由来の天候は技と違って5ターンで切れず、
+# そのポケモンが場を離れるまで（近似実装では明示的に上書きされるまで）継続する。
+# 表示文言も「あまごい」等の技名ではなく状態名にするための判定に使う
+# （あめふらし由来の雨を「あまごいが4ターン継続中」と実況していた誤りの対策）。
+_WEATHER_ABILITY_KEYWORDS = {"ひでり", "あめふらし", "すなおこし", "ゆきふらし"}
+# 天候の表示名（技名ではなく状態名に統一・2026-08-16）。にほんばれ/あまごいは
+# 技名でもあるため、特性由来の場合にLLMが「あまごいを使った」と誤読しないよう
+# 状態名に正規化する。すなあらし/ゆきは元々状態名と技名がほぼ同一のためそのまま。
+_WEATHER_DISPLAY_NAME = {"にほんばれ": "はれ", "あまごい": "あめ"}
 _SCREEN_KEYWORDS = {"リフレクター": "リフレクター", "ひかりのかべ": "ひかりのかべ",
                     "オーロラベール": "オーロラベール"}
 # ウェザーボールは天候下で技タイプが変わる（無天候時はノーマル・DB値のまま）。
@@ -1264,6 +1274,11 @@ class BattleStateTracker:
         # 一切手を加えずに済む設計）。
         self._weather: str | None = None
         self._weather_start_turn: int | None = None
+        # 天候の発生源（技/特性）。技（あまごい等）は5ターンで切れるが、特性
+        # （あめふらし等）は本来そのポケモンが場を離れるまで永続する（2026-08-16・
+        # あめふらし由来の雨を「あまごいが4ターン継続中」と技扱いで実況していた
+        # 誤りの対策）。to_context()で残りターン数の扱いを分岐するのに使う。
+        self._weather_is_ability: bool = False
         self._screens: dict[str, tuple[str, int]] = {}       # side -> (名前, 開始turn)
         self._trick_room_start_turn: int | None = None
         self._tailwind_start_turn: dict[str, int] = {}       # side -> 開始turn
@@ -2376,7 +2391,15 @@ class BattleStateTracker:
         player_names   = [p.name for p in sorted(self._player,   key=lambda p: -p.confidence)]
         opponent_names = [p.name for p in sorted(self._opponent, key=lambda p: -p.confidence)]
 
-        weather_left = self._turns_left(self._weather_start_turn, self._WEATHER_DURATION)
+        # 特性由来の天候（あめふらし等）は技（あまごい等）と違って5ターンで切れず、
+        # そのポケモンが場を離れるまで継続する（2026-08-16）。近似実装として
+        # 固定ターン切れは適用せず、発生が記録されている限り継続扱いにする
+        # （weather_turns_leftはcondition_hintで技由来の場合のみ表示するため
+        # ここでは使わない）。
+        if self._weather_is_ability:
+            weather_left = 1 if self._weather_start_turn is not None else 0
+        else:
+            weather_left = self._turns_left(self._weather_start_turn, self._WEATHER_DURATION)
         # 残りターン数はフィルタ判定にしか使わず辞書に残していなかった実装漏れを修正
         # （2026-08-07・トリックルーム/おいかぜ/天候と違って壁だけ「あと○ターン」が
         # 表示されないバグ。renders/07-03-23-34-29_condition_checkの実機ログで確認）。
@@ -2406,7 +2429,10 @@ class BattleStateTracker:
         }
         if weather_left > 0:
             ctx["weather"] = self._weather
-            ctx["weather_turns_left"] = weather_left
+            if self._weather_is_ability:
+                ctx["weather_is_ability"] = True
+            else:
+                ctx["weather_turns_left"] = weather_left
         if screens:
             ctx["screens"] = screens
         if trick_room_left > 0:
@@ -3024,6 +3050,7 @@ class Pipeline:
         # クリアしない（_pending_render_eventsと同じライフサイクル）
         self._panel_state_history: list[tuple[float, dict]] = []  # (動画内時刻, to_panel_state())
         self._protect_history: list[tuple[float, str, str]] = []  # (動画内時刻, "自分側"/"相手側", 名前)
+        self._miss_history: list[float] = []  # 命中失敗（外れた）を検出した動画内時刻（2026-08-16）
         # 交代ヒント用の繰り出し履歴（2026-08-15・switch/move_used実況のタイミングずれ対策）。
         # _recent_sendoutsは60秒トリム＋試合毎クリアがあるため後付け生成では使えず、
         # 全動画分を保持する専用の履歴を別に持つ
@@ -3040,6 +3067,13 @@ class Pipeline:
         # （ボール数減少推定）で既に実況済みのポケモン名。0%表示がサンプリング
         # から漏れた気絶をボール数確定時に合成実況するとき、両経路の二重言及を防ぐ
         self._announced_faints: set[str] = set()
+        # 直近で通常のfaintイベント（OCRの0%/たおれたテキスト検知）を処理した
+        # 動画内時刻（2026-08-16・気絶の二重実況対策）。合成キャッチアップ
+        # （_dispatch_faint_inferred）がこの直後の場合は抑制する
+        self._last_faint_event_seen_time: float = float("-inf")
+        # 合成キャッチアップの抑制窓（秒）。実機2026-08-14_20-52-59で観測された
+        # 二重実況の間隔（18.3秒）に余裕を持たせた値
+        self._FAINT_CATCHUP_SUPPRESS_SEC: float = 25.0
 
         # battle_start保留送信: ダブルスで味方2匹目のOCR登録がbattle_start発火に間に
         # 合わない場合（実機2026-06-03 22-57-11で確認: 2匹目が2秒遅れて登録され、
@@ -3091,6 +3125,7 @@ class Pipeline:
         self._battle_surrendered = False  # 前試合の降参フラグをリセット
         self._opponent_trainer_name = None  # 前試合の相手トレーナー名をリセット
         self._announced_faints = set()  # 前試合の気絶実況済み名をリセット
+        self._last_faint_event_seen_time = float("-inf")  # 前試合のfaint抑制窓をリセット
         self._end_screen_pending_turn = None       # 前試合のWIN/LOSE待ち状態をリセット
         self._end_screen_pending_deadline = None
 
@@ -3341,12 +3376,25 @@ class Pipeline:
                                 _periodic_gs.get("hp_opponent_with_xy", []))
                             # レンダーモード: 戦況パネル用スナップショット（v2b）
                             self._record_panel_state()
+                            # 保留中のbattle_startが登録完了を待っている場合、次の
+                            # イベントを待たずこの時点で即座に確定させる（2026-08-16）。
+                            # 従来は「次のイベントまで」待っており、その間に別の
+                            # ポケモンが新しく登場すると、開始時点にはまだ場にいない
+                            # ポケモンの話をしてしまう事故があった（実機
+                            # 2026-08-14_20-52-59: battle_start実況にペリッパー登場後の
+                            # 情報が混入・約17秒早い）。event_timeは検知時点のまま
+                            # 変えないため音声の配置はずれない。
+                            if (self._pending_battle_start_time is not None
+                                    and not self._battle_start_roster_incomplete()):
+                                log.info("[戦況] battle_start: 登録完了を検知 → 保留実況を確定")
+                                self._flush_pending_battle_start(self._battle_tracker.to_context())
 
                     # ── 技使用・交代メッセージの検出（バトル中は常時監視）──────
                     if self._battle_active:
                         self._update_move_log(ocr_results, is_main_ocr=True, frame=frame)
                         self._update_move_effectiveness(ocr_results)
                         self._update_protect_history(ocr_results)
+                        self._update_miss_history(ocr_results)
                         self._update_battle_conditions(ocr_results)
                         self._update_mega_evolution(ocr_results)
                         self._update_switch_out(ocr_results)
@@ -3564,6 +3612,7 @@ class Pipeline:
                         self._update_move_log(dense_results, frame=frame)
                         self._update_move_effectiveness(dense_results)
                         self._update_protect_history(dense_results)
+                        self._update_miss_history(dense_results)
                         self._update_battle_conditions(dense_results)
                         self._update_mega_evolution(dense_results)
 
@@ -3791,6 +3840,16 @@ class Pipeline:
         if attempt_bedrock:
             # ── faint保留: 即送信せず次のmove_usedと統合するため保留する ──
             if event_type == "faint":
+                # 通常のfaintイベント（OCRの「0%/たおれた」テキスト検知）を記録
+                # （2026-08-16・気絶の二重実況対策用）。この時点ではトラッカー内部の
+                # ひんしフラグがまだ確定していないことがある（コマンド画面外だと
+                # HPスロット代入がゲートされ、ボールカウント確定はさらに後になる
+                # ため）ので、_track_new_faintsのdiffだけでは「実況済み」を把握
+                # できない。下の合成キャッチアップ（_dispatch_faint_inferred）が
+                # 数秒〜数十秒後に「まだ実況していない」と誤認して同じ気絶を
+                # 再実況する事故があった（実機2026-08-14_20-52-59: ブリジュラスが
+                # 363.5秒→381.8秒の2回実況された）。
+                self._last_faint_event_seen_time = self._now()
                 # 未処理の保留faintが残っていれば先にフラッシュする（2026-08-15:
                 # 従来は無条件に上書きしており、連続faintで前の気絶実況が消滅した。
                 # 実機2026-08-14_20-46-44: コノヨザルの保留faintがペリッパーの
@@ -4065,18 +4124,28 @@ class Pipeline:
         return end
 
     def _compute_move_target_hint(self, start: float, end: float) -> str:
-        """観測窓 (start, end] のHP減少・状態異常付与・まもる成功から、技の対象の
-        観測事実を組み立てる（後付け生成専用・2026-08-15）。
+        """観測窓 (start, end] のHP減少・状態異常付与・まもる成功・命中失敗から、
+        技の対象・結果の観測事実を組み立てる（後付け生成専用・2026-08-15、
+        命中失敗の追加と観測ゼロ時の否定ヒントは2026-08-16）。
 
         LLMが場のポケモンから対象を推測して外す誤認（パス1検証・新レンダー
-        2026-08-14_20-46-44で7件の最頻NG）への対策。観測が無い場合は空文字を返し、
-        既存のプロンプト安全策（対象不明時は断定しない・施策A）に委ねる。
+        2026-08-14_20-46-44で7件の最頻NG）への対策。観測が何も無い場合、以前は
+        空文字を返して既存のプロンプト安全策（対象不明時は断定しない・施策A）に
+        委ねていたが、実機2026-08-14_20-52-59の検証でLLMが「観測が無い」ことを
+        「断定しない」ではなく「憶測で埋める」方向に倒れる事故が複数件あった
+        （ダメージが無いのに与えた体で実況する等）。観測ゼロの場合も明示的な
+        否定ヒントを返すよう変更した。
         """
         hints: list[str] = []
         # まもる成功（この技が防がれた証拠・最優先で提示）
         for t, side, name in getattr(self, "_protect_history", []):
             if start < t <= end:
                 hints.append(f"{name}（{side}）は攻撃から身を守った＝この技は防がれた")
+        # 命中失敗（この技が外れた証拠・2026-08-16）
+        for t in getattr(self, "_miss_history", []):
+            if start < t <= end:
+                hints.append("この技は外れた（対象に命中していない＝ダメージ・効果なし）")
+                break
         # HP減少・状態異常付与（パネル状態履歴の差分）
         def snap(state: dict) -> dict:
             out = {}
@@ -4111,6 +4180,13 @@ class Pipeline:
                     f"{name}（{label}）のHPが{round(base_hp)}%→{round(low_hp)}%に減少")
             for (label, name), status in statuses.items():
                 hints.append(f"{name}（{label}）が{status}状態になった")
+        if not hints:
+            # 観測ゼロ＝ダメージ・状態変化・まもる・命中失敗のいずれも確認できていない。
+            # 「ヒントが無い」を「LLMが自由に憶測してよい」と誤読させないための否定ヒント
+            # （2026-08-16）。数値HPノイズ等でごく小さいダメージを見逃す可能性はあるため、
+            # 「無かった」と断定はせず「確認できていない」という表現に留める。
+            return ("この技の直後、ダメージ・状態変化・まもる成立のいずれも観測されて"
+                    "いない（対象・効果を断定しないこと。「対象不明」等ぼかした表現に留める）")
         return " / ".join(hints)
 
     def _compute_switch_focus(self, start: float, end: float) -> str:
@@ -4778,7 +4854,14 @@ class Pipeline:
     # 間にOCR誤読断片（「こうげきみまも」等）が挟まる実例があるため間に最大12文字許容
     # （実機2026-08-14_20-46-44:「あいて相手のライチュウはこうげきみまも攻撃から身を守った!」）
     _PROTECT_MSG_RE = re.compile(r"([ァ-ヴー]{2,})は.{0,12}身を守った")
-    _PROTECT_DEDUP_SEC = 10.0  # 同一メッセージが複数フレームでOCRされるためのデデュープ窓
+    # 同一メッセージが複数フレームでOCRされるためのデデュープ窓。
+    # ⚠️2026-08-16まで10.0秒だったが、ダブルバトルで同じポケモンが同一ターン内に
+    # 2回別の攻撃をまもった場合（例: 1回目のインファイトを防いだ4.3秒後に2回目の
+    # オーバーヒートも防いだ）、2回目の成功メッセージが「1回目と同じメッセージの
+    # OCR再検出」と誤ってデデュープされ、2回目の技のmove_target_hintが空になって
+    # 「ダメージを受けた」体で誤実況される事故があった（実機2026-08-14_20-52-59）。
+    # 同一メッセージの複数フレームOCRは通常1〜2秒以内に収まるため、3秒に短縮。
+    _PROTECT_DEDUP_SEC = 3.0
 
     def _update_protect_history(self, ocr_results: list[dict]) -> None:
         """「Xは攻撃から身を守った」（まもる成功）を検出し、時刻・陣営・名前を記録する
@@ -4807,12 +4890,59 @@ class Pipeline:
         history.append((self._now(), side, name))
         log.info("[まもる成功] %s %s (t=%.1fs)", side, name, self._now())
 
+    # 「こうげきは 外れた!」「〜に あたらなかった!」の命中失敗メッセージ。
+    # まもる成功と違い攻撃側・対象名がメッセージに含まれないことが多いため、
+    # 名前は取らずタイムスタンプだけ記録する（2026-08-16・技の対象/結果ヒント用）。
+    _MISS_MSG_RE = re.compile(r"(?:こうげきは.{0,10})?(?:外れた|あたらなかった)")
+    _MISS_DEDUP_SEC = 3.0  # 同一メッセージの複数フレームOCR対策（_PROTECT_DEDUP_SECと同じ理由）
+
+    def _update_miss_history(self, ocr_results: list[dict]) -> None:
+        """技が外れた（命中しなかった）メッセージを検出し、時刻を記録する（2026-08-16）。
+
+        まもるの検出はあるのに命中失敗の検出が無く、外れた技をLLMが「ダメージを
+        与えた」体で誤実況する事故があった（実機2026-08-14_20-52-59: 2ターン目に
+        まもられたオーバーヒートを、3ターン目に「もう一度使って再度ダメージ」と
+        誤解＋実際は外れていた技を無視）。後付け生成時に「この技は外れた」という
+        対象ヒントとして使う（`_compute_move_target_hint`参照）。
+        """
+        joined = "".join(r.get("text", "") for r in ocr_results).replace(" ", "")
+        if not self._MISS_MSG_RE.search(joined):
+            return
+        history = self._miss_history
+        if history and self._now() - history[-1] < self._MISS_DEDUP_SEC:
+            return
+        history.append(self._now())
+        log.info("[技が外れた] t=%.1fs", self._now())
+
     @staticmethod
-    def _condition_message_side(ocr_results: list[dict]) -> str:
+    def _msg_roi_texts(ocr_results: list[dict]) -> list[str]:
+        """メッセージボックスROI（`BattleMessageParser`と同じ領域）内のOCRテキストだけを返す。
+
+        天候/壁/トリックルーム/おいかぜの発動検出（`_update_battle_conditions`）用
+        （2026-08-16新設）。以前は画面全体のOCRテキストを対象にしていたため、
+        技選択メニューに並ぶ技名候補（そのポケモンが覚えているだけで実際には
+        使われていない技）まで「発動した」と誤検出していた（実機
+        2026-08-14_20-52-59: 未使用の「おいかぜ」が発動中として実況される事故）。
+        `dense_results`はbboxが既にオリジナルフレーム座標系にオフセット補正済み
+        （呼び出し元のdense scan参照）なのでそのまま同じ判定式が使える。
+        """
+        out = []
+        for r in ocr_results:
+            if r.get("confidence", 0) < 0.3 or not r.get("bbox"):
+                continue
+            cx = (r["bbox"][0][0] + r["bbox"][2][0]) / 2
+            cy = (r["bbox"][0][1] + r["bbox"][2][1]) / 2
+            if (BattleMessageParser.MSG_X_MIN <= cx < BattleMessageParser.MSG_X_MAX
+                    and BattleMessageParser.MSG_Y_MIN < cy < BattleMessageParser.MSG_Y_MAX):
+                out.append(r.get("text", ""))
+        return out
+
+    @classmethod
+    def _condition_message_side(cls, ocr_results: list[dict]) -> str:
         """壁/おいかぜ発動メッセージがどちら側のものかを判定する（`_FAINT_RE`と同じ
-        「あいて/相手の」プレフィックス有無による簡易判定。位置ROIまでは使わない
-        近似実装）。"""
-        texts = [r.get("text", "") for r in ocr_results]
+        「あいて/相手の」プレフィックス有無による簡易判定。メッセージボックスROI
+        限定・2026-08-16）。"""
+        texts = cls._msg_roi_texts(ocr_results)
         if any("あいて" in t or "相手" in t for t in texts):
             return "opponent"
         return "player"
@@ -4820,9 +4950,8 @@ class Pipeline:
     def _update_battle_conditions(self, ocr_results: list[dict]) -> None:
         """OCR結果から天候・壁・トリックルーム・おいかぜの発動メッセージを検出し、
         `BattleStateTracker`に開始ターンを記録する（改善ロードマップ「戦況推論強化」続き・
-        2026-08-04）。"""
-        texts = [r.get("text", "") for r in ocr_results]
-        joined = "".join(texts)
+        2026-08-04）。メッセージボックスROI限定（2026-08-16・誤検出対策）。"""
+        joined = "".join(self._msg_roi_texts(ocr_results))
         tracker = self._battle_tracker
         turn = tracker.game_turn
 
@@ -4830,6 +4959,7 @@ class Pipeline:
             if keyword in joined:
                 tracker._weather = weather
                 tracker._weather_start_turn = turn
+                tracker._weather_is_ability = keyword in _WEATHER_ABILITY_KEYWORDS
                 break
 
         for keyword, screen in _SCREEN_KEYWORDS.items():
@@ -4892,10 +5022,17 @@ class Pipeline:
         （呼び出し側で計算済みのものをそのまま渡す・二重計算を避ける）。
         """
         lines = []
-        if battle_context.get("weather"):
-            lines.append(
-                f"{battle_context['weather']}が{battle_context.get('weather_turns_left', '?')}"
-                "ターン継続中")
+        weather = battle_context.get("weather")
+        if weather:
+            # 表示名は技名（あまごい/にほんばれ）ではなく状態名（あめ/はれ）に正規化
+            # （2026-08-16）。特性由来（あめふらし等）は技と違って5ターンで切れず
+            # 継続するため、ターン数を示さず「特性による」と明示する
+            display = _WEATHER_DISPLAY_NAME.get(weather, weather)
+            if battle_context.get("weather_is_ability"):
+                lines.append(f"{display}状態が継続中（特性による発生のため終了ターンなし）")
+            else:
+                lines.append(
+                    f"{display}が{battle_context.get('weather_turns_left', '?')}ターン継続中")
 
         for side, (name, left) in (battle_context.get("screens") or {}).items():
             side_label = "自分" if side == "player" else "相手"
@@ -4988,6 +5125,18 @@ class Pipeline:
         if not hasattr(self, "_ec2_url"):
             return
         if not self._battle_active:
+            return
+        # 気絶の二重実況対策（2026-08-16）: 直近で通常のfaintイベント（OCRの
+        # 0%/たおれたテキスト検知）を処理していた場合、その気絶がトラッカー内部で
+        # 確定するのが数秒〜数十秒遅れて、この合成キャッチアップが「まだ実況して
+        # いない」と誤認し同じ気絶を再実況することがある（実機
+        # 2026-08-14_20-52-59・詳細は_process_event内のコメント参照）。
+        # 側の特定まではできないため全体を対象に抑制する（同時多発的な気絶は
+        # 元々この関数がまとめて1メッセージに合成するため実害は小さい）。
+        if (self._now() - getattr(self, "_last_faint_event_seen_time", float("-inf"))
+                < getattr(self, "_FAINT_CATCHUP_SUPPRESS_SEC", 25.0)):
+            log.info("[faint合成抑制] 直近の通常faintイベントと近接のため合成実況を抑制（二重実況防止）: %s",
+                      names)
             return
         attempt_bedrock = bool(
             self._ec2_url and "faint" in BEDROCK_EVENTS and self._battle_active)

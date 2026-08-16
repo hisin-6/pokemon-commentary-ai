@@ -309,6 +309,30 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context(), [], self._battle_state())
         assert "場のコンディション" not in prompt
 
+    def test_no_conditions_active_explicitly_stated_when_absent(self):
+        """2026-08-16: condition_hintが無い（＝何も発生していない）場合、その旨を
+        明示しないとLLMが独自の知識・連想で天候/おいかぜ等を捏造することがあった
+        （実機2026-08-14_20-52-59: 未使用のおいかぜを「場に残っている」と実況）。"""
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "いずれも発生していない" in prompt
+
+    def test_condition_hint_present_forbids_inventing_unlisted_conditions(self):
+        """2026-08-16: condition_hintがある場合でも、そこに書かれていない天候/壁/
+        トリックルーム/おいかぜを勝手に補って言及しないよう明示する。"""
+        prompt = _build_vision_prompt(
+            self._context(), [],
+            self._battle_state(condition_hint="あめが3ターン継続中"))
+        assert "独自の知識や一般的な戦術の連想で" in prompt
+
+    def test_move_effect_hint_weather_power_caution(self):
+        """2026-08-16: 技効果テキストに天候ボーナスの記載が無い限り、天候を理由に
+        威力アップ等を独自の知識で付け足さないよう明示する（実機
+        2026-08-14_20-52-59: ぼうふうを「あまごい下で威力絶大」と誤実況）。"""
+        prompt = _build_vision_prompt(
+            self._context(), [], self._battle_state(
+                move_effect_hint="ぼうふう: 強烈な風で相手を包みこんで攻撃する。"))
+        assert "天候による技の威力アップ" in prompt
+
     def test_condition_hint_overrides_transient_ocr_text(self):
         """2026-08-07: renders/07-03-23-34-29_condition_checkの実機検証で、
         condition_hintが「壁が張られている」と言ってるのにBedrockが「壁が消えた」と

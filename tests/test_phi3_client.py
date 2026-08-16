@@ -195,6 +195,25 @@ class TestBuildPrompt:
         prompt = client._build_prompt({"event_type": "move_used"}, None, {"turn": 1})
         assert "場のコンディション" not in prompt
 
+    def test_no_conditions_active_explicitly_stated_when_absent(self, client):
+        """2026-08-16: server.py側と同じ「いずれも発生していない」の明示。
+        condition_hintが無い場合にLLMが独自の知識で天候/おいかぜ等を捏造する事故
+        （実機2026-08-14_20-52-59）への対策をPhi3Client側にも配線。"""
+        prompt = client._build_prompt({"event_type": "move_used"}, None, {"turn": 1})
+        assert "いずれも発生していない" in prompt
+
+    def test_condition_hint_present_forbids_inventing_unlisted_conditions(self, client):
+        battle_context = {"condition_hint": "あめが3ターン継続中"}
+        prompt = client._build_prompt({"event_type": "move_used"}, None, battle_context)
+        assert "独自の知識や一般的な戦術の連想で" in prompt
+
+    def test_move_effect_hint_weather_power_caution(self, client):
+        """2026-08-16: server.py側と同じ天候ボーナス捏造禁止の注記
+        （実機2026-08-14_20-52-59: ぼうふうを「あまごい下で威力絶大」と誤実況）。"""
+        battle_context = {"move_effect_hint": "ぼうふう: 強烈な風で相手を包みこんで攻撃する。"}
+        prompt = client._build_prompt({"event_type": "move_used"}, None, battle_context)
+        assert "天候による技の威力アップ" in prompt
+
     def test_faint_focus_embeds_inferred_faint_hint(self, client):
         """合成faint（ボール数減少推定）: 画面に0%表示が無いため、確定済みの対象を
         直接指示する。server.py側と同時配線（move_focus/type_hintで過去2回あった

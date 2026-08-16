@@ -253,6 +253,7 @@ class TestMoveTargetHint:
         pipe = Pipeline.__new__(Pipeline)
         pipe._panel_state_history = []
         pipe._protect_history = []
+        pipe._miss_history = []
         return pipe
 
     @staticmethod
@@ -301,25 +302,44 @@ class TestMoveTargetHint:
         assert "ライチュウ（相手側）は攻撃から身を守った＝この技は防がれた" in hint
 
     def test_observation_outside_window_ignored(self):
-        """窓の外（次の技以降）の観測は前の技に帰属させない。"""
+        """窓の外（次の技以降）の観測は前の技に帰属させない→観測ゼロの否定ヒントになる
+        （2026-08-16: 観測ゼロを「断定しない」ではなく「憶測で埋める」方向にLLMが
+        倒れる事故があったため、空文字ではなく明示的な否定ヒントを返すよう変更）。"""
         pipe = self._pipe()
         pipe._panel_state_history = [
             (120.0, self._state(opponent=[("ライチュウ", 100.0, None)])),
             (140.0, self._state(opponent=[("ライチュウ", 12.0, None)])),
         ]
-        assert pipe._compute_move_target_hint(123.3, 132.4) == ""
+        hint = pipe._compute_move_target_hint(123.3, 132.4)
+        assert "観測されていない" in hint
+        assert "断定しない" in hint
 
     def test_small_drop_ignored_as_noise(self):
-        """数値HPの軽微ノイズ（既知の許容事項）を誤ってダメージ扱いしない。"""
+        """数値HPの軽微ノイズ（既知の許容事項）を誤ってダメージ扱いしない→観測ゼロ扱い。"""
         pipe = self._pipe()
         pipe._panel_state_history = [
             (120.0, self._state(player=[("メタグロス", 100.0, None)])),
             (125.0, self._state(player=[("メタグロス", 98.0, None)])),
         ]
-        assert pipe._compute_move_target_hint(123.3, 132.4) == ""
+        assert "観測されていない" in pipe._compute_move_target_hint(123.3, 132.4)
 
-    def test_no_data_returns_empty(self):
-        assert self._pipe()._compute_move_target_hint(10.0, 20.0) == ""
+    def test_no_data_returns_negative_hint(self):
+        assert "観測されていない" in self._pipe()._compute_move_target_hint(10.0, 20.0)
+
+    def test_miss_evidence(self):
+        """実機2026-08-14_20-52-59の実例: オーバーヒートが外れたのに命中した体で
+        誤実況していた（#7）。命中失敗メッセージから「外れた」ヒントを返す。"""
+        pipe = self._pipe()
+        pipe._miss_history = [179.9]
+        hint = pipe._compute_move_target_hint(179.4, 182.9)
+        assert "この技は外れた" in hint
+
+    def test_protect_dedup_window_short_enough_for_second_attack(self):
+        """同一ターン内で同じポケモンが2回別の攻撃をまもった場合、2回目の成功も
+        （デデュープで消えず）別々に観測できる必要がある（実機2026-08-14_20-52-59
+        #5: オーバーヒートの2回目のまもりが1回目のインファイトの重複OCRと誤認され
+        消えていた）。ここではデデュープ窓の値そのものを確認する。"""
+        assert Pipeline._PROTECT_DEDUP_SEC <= 5.0
 
     def test_window_end_capped_by_next_move_not_faint(self):
         """観測窓は次の技/交代/試合終了で区切る。faintはこの技の結果なので区切らない。"""
@@ -395,6 +415,47 @@ class TestUpdateProtectHistory:
         pipe = self._pipe(score=50)
         pipe._update_protect_history(self._ocr(["ラxチュxは", "攻撃から身を守った!"]))
         assert pipe._protect_history == []
+
+
+class TestUpdateMissHistory:
+    """「こうげきは外れた/あたらなかった」メッセージの捕捉（2026-08-16新設・
+    技の対象/結果ヒント用）。まもる検出はあるのに命中失敗の検出が無く、外れた技を
+    「ダメージを与えた」体で誤実況していた事故（実機2026-08-14_20-52-59）への対策。
+    """
+
+    def _pipe(self):
+        pipe = Pipeline.__new__(Pipeline)
+        pipe._miss_history = []
+        pipe._video_now = 179.9
+        return pipe
+
+    @staticmethod
+    def _ocr(texts):
+        return [{"text": t} for t in texts]
+
+    def test_detects_miss_phrase(self):
+        pipe = self._pipe()
+        pipe._update_miss_history(self._ocr(["オーバーヒートの", "こうげきは", "外れた!"]))
+        assert pipe._miss_history == [179.9]
+
+    def test_detects_bare_atarana_katta(self):
+        pipe = self._pipe()
+        pipe._update_miss_history(self._ocr(["スコヴィランには", "あたらなかった!"]))
+        assert pipe._miss_history == [179.9]
+
+    def test_no_message_no_record(self):
+        pipe = self._pipe()
+        pipe._update_miss_history(self._ocr(["ライチュウの", "でんじほう!"]))
+        assert pipe._miss_history == []
+
+    def test_dedupe_within_window(self):
+        """同一メッセージが複数フレームでOCRされても1件だけ記録する。"""
+        pipe = self._pipe()
+        ocr = self._ocr(["こうげきは", "外れた!"])
+        pipe._update_miss_history(ocr)
+        pipe._video_now = 181.0
+        pipe._update_miss_history(ocr)
+        assert pipe._miss_history == [179.9]
 
 
 class TestComputeSwitchFocus:
@@ -1524,6 +1585,18 @@ class TestToContextConditions:
         ctx = self.tracker.to_context()
         assert "weather" not in ctx
 
+    def test_ability_weather_never_expires(self):
+        """特性由来（あめふらし等）の天候は技（あまごい等）と違って5ターンで切れない
+        （2026-08-16新設）。ターンがどれだけ進んでもweatherが残り続ける。"""
+        self.tracker._weather = "あまごい"
+        self.tracker._weather_start_turn = 2
+        self.tracker._weather_is_ability = True
+        self.tracker.game_turn = 20
+        ctx = self.tracker.to_context()
+        assert ctx["weather"] == "あまごい"
+        assert ctx.get("weather_is_ability") is True
+        assert "weather_turns_left" not in ctx
+
     def test_screens_included_while_active(self):
         # 残りターン数もctx["screens"]に持たせる（2026-08-07修正・以前は名前だけで
         # 「あと○ターン」が実況に出せなかった実装漏れがあった）。
@@ -1552,13 +1625,20 @@ class TestToContextConditions:
             assert key not in ctx
 
 
+# メッセージボックスROI内の座標（BattleMessageParser.MSG_X_MIN/MAX, MSG_Y_MIN/MAX
+# の範囲内・2026-08-16のROI限定対策のテスト用）
+_MSG_BBOX = [[300, 800], [400, 800], [400, 820], [300, 820]]
+# ROI外（技選択メニュー相当のy座標）の座標。誤検出しないことを確認するのに使う
+_MENU_BBOX = [[300, 300], [400, 300], [400, 320], [300, 320]]
+
+
 class TestConditionMessageSide:
     def test_opponent_prefix_detected(self):
-        ocr = [{"text": "あいての リフレクターの効果で", "confidence": 0.9}]
+        ocr = [{"text": "あいての リフレクターの効果で", "confidence": 0.9, "bbox": _MSG_BBOX}]
         assert Pipeline._condition_message_side(ocr) == "opponent"
 
     def test_no_prefix_defaults_to_player(self):
-        ocr = [{"text": "リフレクターの効果で", "confidence": 0.9}]
+        ocr = [{"text": "リフレクターの効果で", "confidence": 0.9, "bbox": _MSG_BBOX}]
         assert Pipeline._condition_message_side(ocr) == "player"
 
 
@@ -1568,8 +1648,8 @@ class TestUpdateBattleConditions:
         self.runner._battle_tracker = BattleStateTracker()
         self.runner._battle_tracker.game_turn = 3
 
-    def _ocr(self, *texts):
-        return [{"text": t, "confidence": 0.9} for t in texts]
+    def _ocr(self, *texts, bbox=_MSG_BBOX):
+        return [{"text": t, "confidence": 0.9, "bbox": bbox} for t in texts]
 
     def test_weather_detected_by_move_name(self):
         # 2026-08-07修正: 演出フレーバー文の推測ではなく技名/特性名そのものを直接
@@ -1579,17 +1659,21 @@ class TestUpdateBattleConditions:
         Pipeline._update_battle_conditions(self.runner, self._ocr("アシレーヌの", "あまごい！"))
         assert self.runner._battle_tracker._weather == "あまごい"
         assert self.runner._battle_tracker._weather_start_turn == 3
+        assert self.runner._battle_tracker._weather_is_ability is False
 
     def test_weather_detected_by_ability_name(self):
         # 技だけでなく特性発動（例: ペリッパーのあめふらし）でも同じキーワードで拾える
         # ことを確認する（天候は技/特性どちらでも発動メッセージが共通のため）。
+        # 2026-08-16: 特性由来は_weather_is_abilityがTrueになる（期限なし扱いの判定用）。
         Pipeline._update_battle_conditions(self.runner, self._ocr("ペリッパーの", "あめふらし"))
         assert self.runner._battle_tracker._weather == "あまごい"
         assert self.runner._battle_tracker._weather_start_turn == 3
+        assert self.runner._battle_tracker._weather_is_ability is True
 
     def test_sunny_day_detected_by_move_or_ability(self):
         Pipeline._update_battle_conditions(self.runner, self._ocr("コータスの", "ひでり"))
         assert self.runner._battle_tracker._weather == "にほんばれ"
+        assert self.runner._battle_tracker._weather_is_ability is True
 
     def test_screen_detected_with_side(self):
         Pipeline._update_battle_conditions(
@@ -1622,6 +1706,19 @@ class TestUpdateBattleConditions:
         assert self.runner._battle_tracker._weather is None
         assert self.runner._battle_tracker._screens == {}
         assert self.runner._battle_tracker._trick_room_start_turn is None
+
+    def test_menu_keyword_outside_roi_ignored(self):
+        """技選択メニューに並ぶ技名候補（実際には使われていない）はメッセージ
+        ボックスROI外なので発動と誤検出しない（2026-08-16新設）。実機
+        2026-08-14_20-52-59で、未使用の「おいかぜ」がペリッパーの技選択メニュー
+        表示から「発動中」と誤検出され、使ってもいないのに実況される事故があった。
+        """
+        Pipeline._update_battle_conditions(
+            self.runner, self._ocr("おいかぜ", bbox=_MENU_BBOX))
+        assert self.runner._battle_tracker._tailwind_start_turn == {}
+        Pipeline._update_battle_conditions(
+            self.runner, self._ocr("あまごい", bbox=_MENU_BBOX))
+        assert self.runner._battle_tracker._weather is None
 
 
 class TestComputeSpeedStageHint:
@@ -1686,9 +1783,18 @@ class TestComputeConditionHint:
         assert self.runner._compute_condition_hint({}) is None
 
     def test_weather_line(self):
+        # 2026-08-16: 表示名は技名（あまごい）ではなく状態名（あめ）に正規化
+        # （あめふらし由来の雨を「あまごいが継続中」と技扱いで実況していた誤り対策）。
         hint = self.runner._compute_condition_hint(
             {"weather": "あまごい", "weather_turns_left": 4})
-        assert hint == "あまごいが4ターン継続中"
+        assert hint == "あめが4ターン継続中"
+
+    def test_weather_line_ability_source_has_no_turn_limit(self):
+        # 特性由来（あめふらし等）は技と違って5ターンで切れないため、ターン数を
+        # 出さず「特性による」と明示する（2026-08-16新設）。
+        hint = self.runner._compute_condition_hint(
+            {"weather": "あまごい", "weather_is_ability": True})
+        assert hint == "あめ状態が継続中（特性による発生のため終了ターンなし）"
 
     def test_screens_lines_per_side(self):
         # screensの値は(名前, 残りターン)のtuple（2026-08-07〜。残りターン数が
@@ -1711,7 +1817,7 @@ class TestComputeConditionHint:
         self.runner._battle_tracker._opponent.append(FieldPokemon(name="ドドゲザン", on_field=True))
         self.runner._move_log = ["T1:ペリッパーのこごえるかぜ"]
         hint = self.runner._compute_condition_hint({"weather": "あまごい", "weather_turns_left": 4})
-        assert "あまごいが4ターン継続中" in hint
+        assert "あめが4ターン継続中" in hint
         assert "ドドゲザンの素早さが1段階下がっている" in hint
 
 
@@ -2548,6 +2654,23 @@ class TestFaintInferredDispatch:
         Pipeline._dispatch_faint_inferred(
             self.runner, [("opponent", "リキキリン")], None, {"event_type": "turn_start"}, {})
         self.runner._dispatch_commentary.assert_not_called()
+
+    def test_suppressed_shortly_after_real_faint_event(self):
+        """気絶の二重実況対策（2026-08-16）: 直近で通常のfaintイベント（OCRの
+        0%/たおれたテキスト検知）を処理していた場合、合成キャッチアップは抑制する
+        （実機2026-08-14_20-52-59: ブリジュラスが363.5秒→381.8秒の2回実況された）。"""
+        self.runner._last_faint_event_seen_time = self.runner._video_now - 18.3
+        self.runner._FAINT_CATCHUP_SUPPRESS_SEC = 25.0
+        Pipeline._dispatch_faint_inferred(
+            self.runner, [("player", "ブリジュラス")], None, {"event_type": "switch"}, {})
+        self.runner._dispatch_commentary.assert_not_called()
+
+    def test_not_suppressed_after_window_elapses(self):
+        self.runner._last_faint_event_seen_time = self.runner._video_now - 30.0
+        self.runner._FAINT_CATCHUP_SUPPRESS_SEC = 25.0
+        Pipeline._dispatch_faint_inferred(
+            self.runner, [("player", "ブリジュラス")], None, {"event_type": "switch"}, {})
+        self.runner._dispatch_commentary.assert_called_once()
 
 
 class TestResetBattleState:
