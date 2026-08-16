@@ -369,6 +369,21 @@ class PokeClassifier:
         ).fetchone()
         return row["effect"] if row and row["effect"] else None
 
+    def get_move_target(self, move_name_ja: str) -> str | None:
+        """技名（日本語）から対象範囲（自分自身/相手単体/相手全体等）を取得する
+        （2026-08-16新設）。
+
+        move_target_hint（技の対象誤認対策）は技の直後に画面で観測された結果からの
+        事後推測のみで、変化技（自分対象）・範囲技（相手複数対象）の事前情報を
+        一切持っていなかった。つるぎのまい等の自分対象技で対象を誤って断定したり、
+        観測ゼロの単体対象技をLLMが憶測で決め打ちする事故への対策。データは
+        PokeAPI の move.target 由来（`scripts/build_pokedb.py`の`fetch_move_targets`
+        でバックフィル）。見つからない/target未設定の場合はNone。"""
+        row = self._conn.execute(
+            "SELECT target FROM moves WHERE name_ja = ?", (move_name_ja,)
+        ).fetchone()
+        return row["target"] if row and row["target"] else None
+
     def _get_moves_for_pokemon(self, pokemon_id: int) -> list[str]:
         """pokemon_moves テーブルから代表技リストを取得する。"""
         rows = self._conn.execute(

@@ -572,6 +572,48 @@ class TestGetMoveEffect:
         assert clf_with_move_effects.get_move_effect("存在しない技12345") is None
 
 
+class TestGetMoveTarget:
+    """get_move_target: 2026-08-16新設。技の対象範囲ヒント（変化技/範囲技の事前情報が
+    無く対象を誤爆する問題への対策）用に技の対象範囲を取得する。"""
+
+    @pytest.fixture(scope="class")
+    def clf_with_move_targets(self, tmp_path_factory):
+        db_dir = tmp_path_factory.mktemp("pokedb_movetargets")
+        db_path = db_dir / "test_move_targets.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE pokemon (
+                id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL,
+                type1 TEXT, type2 TEXT, ability1 TEXT, ability2 TEXT, ability_hidden TEXT
+            );
+            CREATE TABLE moves (
+                id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL,
+                type TEXT, category TEXT, power INTEGER, target TEXT
+            );
+            CREATE TABLE abilities (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+            CREATE TABLE items (id INTEGER PRIMARY KEY, name_ja TEXT NOT NULL, name_en TEXT NOT NULL);
+            CREATE TABLE pokemon_moves (pokemon_id INTEGER, move_id INTEGER);
+
+            INSERT INTO moves VALUES
+              (1, 'つるぎのまい', 'Swords Dance', 'ノーマル', '変化', NULL, '自分自身'),
+              (2, 'かみなり', 'Thunder', 'でんき', '特殊', 110, NULL);
+        """)
+        conn.commit()
+        conn.close()
+        return PokeClassifier(db_path=str(db_path))
+
+    def test_known_move_with_target_returns_text(self, clf_with_move_targets):
+        assert clf_with_move_targets.get_move_target("つるぎのまい") == "自分自身"
+
+    def test_move_without_target_returns_none(self, clf_with_move_targets):
+        """target列がNULL（backfill未取得）の技はNoneを返す（get_move_effect等と
+        同じフォールバック動作）。"""
+        assert clf_with_move_targets.get_move_target("かみなり") is None
+
+    def test_unknown_move_returns_none(self, clf_with_move_targets):
+        assert clf_with_move_targets.get_move_target("存在しない技12345") is None
+
+
 class TestIsMoveLearnable:
     """is_move_learnable: 技帰属の断片一致幽霊技対策で使う学習可能技チェック。"""
 

@@ -3801,6 +3801,9 @@ class Pipeline:
             move_effect_hint = self._latest_move_effect_hint(self._classifier)
             if move_effect_hint:
                 battle_context["move_effect_hint"] = move_effect_hint
+            move_range_hint = self._latest_move_target_type(self._classifier)
+            if move_range_hint:
+                battle_context["move_range_hint"] = move_range_hint
         condition_hint = self._compute_condition_hint(battle_context)
         if condition_hint:
             battle_context["condition_hint"] = condition_hint
@@ -4123,10 +4126,26 @@ class Pipeline:
                 return min(end, nxt["event_time"])
         return end
 
-    def _compute_move_target_hint(self, start: float, end: float) -> str:
+    # 技の対象範囲（PokeAPI move.target由来・_TARGET_JA参照）のうち、事前に
+    # 「対象がどういう種類か」を言い切れる高価値なケースだけを文章化する
+    # （2026-08-16新設）。単体対象（相手単体等）はダブルスでどちらか分からない
+    # という既存の断定回避指示と実質同じなので、あえて追加しない
+    _MOVE_RANGE_HINT_TEXT = {
+        "自分自身":   "この技は自分自身が対象（変化技等）で、相手のポケモンを対象にしていない",
+        "相手全体":   "この技は範囲技で相手の場のポケモン全員が対象",
+        "自分以外全員": "この技は自分以外の場のポケモン全員が対象の範囲技",
+        "場の全員":   "この技は自分・相手を問わず場の全員が対象の範囲技",
+        "自分の場":   "この技は自分側の場全体が対象（壁等の設置技）で、特定のポケモンを対象にしていない",
+        "相手の場":   "この技は相手側の場全体が対象（撒き菱等の設置技）で、特定のポケモンを対象にしていない",
+        "場全体":     "この技は場全体が対象（天候等）で、特定のポケモンを対象にしていない",
+    }
+
+    def _compute_move_target_hint(self, start: float, end: float,
+                                   move_range: str | None = None) -> str:
         """観測窓 (start, end] のHP減少・状態異常付与・まもる成功・命中失敗から、
         技の対象・結果の観測事実を組み立てる（後付け生成専用・2026-08-15、
-        命中失敗の追加と観測ゼロ時の否定ヒントは2026-08-16）。
+        命中失敗の追加と観測ゼロ時の否定ヒントは2026-08-16、技の対象範囲
+        （move_range・PokeAPI由来の事前情報）の合流も2026-08-16）。
 
         LLMが場のポケモンから対象を推測して外す誤認（パス1検証・新レンダー
         2026-08-14_20-46-44で7件の最頻NG）への対策。観測が何も無い場合、以前は
@@ -4135,8 +4154,16 @@ class Pipeline:
         「断定しない」ではなく「憶測で埋める」方向に倒れる事故が複数件あった
         （ダメージが無いのに与えた体で実況する等）。観測ゼロの場合も明示的な
         否定ヒントを返すよう変更した。
+
+        move_rangeは事後観測とは独立した「技そのものの対象範囲」という確定事実
+        （つるぎのまい＝自分自身、おいかぜ＝自分の場、等）。これがあれば観測の
+        有無に関わらず最優先で提示する（自分対象の変化技を相手への攻撃として
+        誤爆する等、観測ベースだけでは防げないケースの対策）。
         """
         hints: list[str] = []
+        range_text = self._MOVE_RANGE_HINT_TEXT.get(move_range) if move_range else None
+        if range_text:
+            hints.append(range_text)
         # まもる成功（この技が防がれた証拠・最優先で提示）
         for t, side, name in getattr(self, "_protect_history", []):
             if start < t <= end:
@@ -4249,7 +4276,9 @@ class Pipeline:
             # 技の対象ヒント（2026-08-15）: 技の直後の観測から対象を逆引きして注入
             if ev["event_type"] == "move_single":
                 window_end = self._move_target_window_end(self._pending_render_events, i)
-                target_hint = self._compute_move_target_hint(ev["event_time"], window_end)
+                move_range = (ev.get("battle_context") or {}).get("move_range_hint")
+                target_hint = self._compute_move_target_hint(
+                    ev["event_time"], window_end, move_range=move_range)
                 if target_hint:
                     if ev.get("battle_context") is None:
                         ev["battle_context"] = {}
@@ -4499,6 +4528,24 @@ class Pipeline:
             return None
         return f"{move_name}: {effect}"
 
+    def _latest_move_target_type(self, classifier) -> str | None:
+        """直近の技ログエントリの対象範囲（自分自身/相手単体/相手全体等）をDBから
+        取得する（2026-08-16新設）。`_latest_move_effect_hint`と同じ「直近の技ログ
+        1件だけを見る」設計。
+
+        move_target_hint（技の対象誤認対策）が事後観測のみに頼っていたため、
+        つるぎのまい等の自分対象技・全体対象の範囲技で対象を誤爆する問題があった。
+        技そのものの対象範囲というPython側で確定できる事実を先に渡すことで、
+        観測が無い/薄いケースでも誤爆を減らす。
+        """
+        move_log = getattr(self, "_move_log", None)
+        if not move_log:
+            return None
+        m = self._MOVE_LOG_ENTRY_RE.match(move_log[-1])
+        if not m:
+            return None
+        return classifier.get_move_target(m.group(2))
+
     def _compute_type_hint(self) -> str | None:
         """場に出ている自分/相手ポケモンのタイプ相性ヒントを計算する
         （Cicero型アーキテクチャ・改善ロードマップ「戦況推論強化」2026-08-04）。
@@ -4576,6 +4623,9 @@ class Pipeline:
             if "move_effect_hint" in battle_context:
                 # 技効果ヒントRAG（2026-08-14）用: manifest.jsonlで実機確認できるようにする
                 ctx["move_effect_hint"] = battle_context["move_effect_hint"]
+            if "move_range_hint" in battle_context:
+                # 技の対象範囲ヒント（2026-08-16）用: manifest.jsonlで実機確認できるようにする
+                ctx["move_range_hint"] = battle_context["move_range_hint"]
             if "condition_hint" in battle_context:
                 ctx["condition_hint"] = battle_context["condition_hint"]
         return ctx
@@ -5193,6 +5243,9 @@ class Pipeline:
             move_effect_hint = self._latest_move_effect_hint(self._classifier)
             if move_effect_hint:
                 battle_context["move_effect_hint"] = move_effect_hint
+            move_range_hint = self._latest_move_target_type(self._classifier)
+            if move_range_hint:
+                battle_context["move_range_hint"] = move_range_hint
         condition_hint = self._compute_condition_hint(battle_context)
         if condition_hint:
             battle_context["condition_hint"] = condition_hint

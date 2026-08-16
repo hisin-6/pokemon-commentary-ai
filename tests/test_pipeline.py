@@ -334,6 +334,41 @@ class TestMoveTargetHint:
         hint = pipe._compute_move_target_hint(179.4, 182.9)
         assert "この技は外れた" in hint
 
+    def test_move_range_self_target(self):
+        """実機の実例: つるぎのまい等の自分対象の変化技を、観測ゼロのまま相手への
+        攻撃として誤爆する事故があった（2026-08-16対策）。move_range（PokeAPI由来の
+        事前情報）があれば観測ゼロでも明確な事実として提示する。"""
+        pipe = self._pipe()
+        hint = pipe._compute_move_target_hint(120.0, 130.0, move_range="自分自身")
+        assert "自分自身が対象" in hint
+        assert "相手のポケモンを対象にしていない" in hint
+        # 観測ゼロの否定ヒントにはフォールバックしない（range_textが確定情報のため）
+        assert "観測されていない" not in hint
+
+    def test_move_range_spread_target(self):
+        pipe = self._pipe()
+        hint = pipe._compute_move_target_hint(120.0, 130.0, move_range="相手全体")
+        assert "相手の場のポケモン全員が対象" in hint
+
+    def test_move_range_field_target(self):
+        pipe = self._pipe()
+        hint = pipe._compute_move_target_hint(120.0, 130.0, move_range="自分の場")
+        assert "壁等の設置技" in hint
+
+    def test_move_range_single_target_not_verbose(self):
+        """単体対象（相手単体）は既存の断定回避指示と実質同じなので、あえて
+        追加の文言を出さない（観測が無ければ従来通り否定ヒントに委ねる）。"""
+        pipe = self._pipe()
+        hint = pipe._compute_move_target_hint(120.0, 130.0, move_range="相手単体")
+        assert "観測されていない" in hint
+
+    def test_move_range_combines_with_observation(self):
+        """move_rangeと事後観測は排他ではなく両方載る。"""
+        pipe = self._pipe()
+        pipe._protect_history = [(125.0, "相手側", "ライチュウ")]
+        hint = pipe._compute_move_target_hint(120.0, 130.0, move_range="相手単体")
+        assert "ライチュウ（相手側）は攻撃から身を守った" in hint
+
     def test_protect_dedup_window_short_enough_for_second_attack(self):
         """同一ターン内で同じポケモンが2回別の攻撃をまもった場合、2回目の成功も
         （デデュープで消えず）別々に観測できる必要がある（実機2026-08-14_20-52-59
@@ -2391,6 +2426,7 @@ class TestMoveSingleDispatch:
         clf.classify.side_effect = classify
         clf.is_move_learnable.return_value = learnable
         clf.get_move_effect.return_value = None
+        clf.get_move_target.return_value = None
         self.runner._classifier = clf
 
     def test_confirmed_move_dispatches_move_single(self):
@@ -2421,6 +2457,19 @@ class TestMoveSingleDispatch:
 
         _, _, _, battle_context, _, _ = self.runner._dispatch_commentary.call_args.args
         assert battle_context.get("move_effect_hint") == "おいかぜ: 味方全員の素早さをあげる。"
+
+    def test_move_range_hint_propagated_to_battle_context(self):
+        """2026-08-16: move_single専用のdispatch経路でも技の対象範囲ヒントが
+        battle_contextに配線されること（move_effect_hintと同じ回帰ガード）。"""
+        self.runner._battle_tracker._player.append(FieldPokemon(name="メタグロス", on_field=True))
+        self._set_classifier(moves={"つるぎのまい"}, pokemon={"メタグロス": "メタグロス"})
+        self.runner._classifier.get_move_target.side_effect = (
+            lambda name: "自分自身" if name == "つるぎのまい" else None)
+        events = [_ocr("メタグロスの", y_center=800.0), _ocr("つるぎのまい!", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+
+        _, _, _, battle_context, _, _ = self.runner._dispatch_commentary.call_args.args
+        assert battle_context.get("move_range_hint") == "自分自身"
 
     def test_tentative_move_still_dispatches(self):
         """断片一致救済等でtentative扱いになった技も実況の対象にする（ユーザー決定）。"""
@@ -3006,6 +3055,42 @@ class TestLatestMoveEffectHint:
     def test_malformed_entry_returns_none(self):
         self.runner._move_log = ["これは形式に合わない文字列"]
         assert self.runner._latest_move_effect_hint(self.clf) is None
+
+
+class TestLatestMoveTargetType:
+    """_latest_move_target_type: 技の対象範囲ヒント新設（2026-08-16）。
+    move_target_hintが事後観測ベースのみで、変化技（自分対象）・範囲技（相手複数対象）の
+    事前情報が無く対象を誤爆する問題（つるぎのまい等）への対策。
+    _latest_move_effect_hintと同じ「直近の技ログ1件だけを見る」設計。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._move_log = []
+        self._move_targets = {}
+        self.clf = MagicMock()
+        self.clf.get_move_target.side_effect = lambda name: self._move_targets.get(name)
+
+    def test_no_move_log_returns_none(self):
+        assert self.runner._latest_move_target_type(self.clf) is None
+
+    def test_known_move_returns_target_type(self):
+        self.runner._move_log = ["T1:メタグロスのつるぎのまい"]
+        self._move_targets["つるぎのまい"] = "自分自身"
+        assert self.runner._latest_move_target_type(self.clf) == "自分自身"
+
+    def test_unknown_target_returns_none(self):
+        self.runner._move_log = ["T1:フシギバナのつるのムチ"]
+        assert self.runner._latest_move_target_type(self.clf) is None
+
+    def test_uses_latest_entry_only(self):
+        self.runner._move_log = ["T1:メタグロスのつるぎのまい", "T2:ペリッパーのぼうふう"]
+        self._move_targets["つるぎのまい"] = "自分自身"
+        self._move_targets["ぼうふう"] = "相手単体"
+        assert self.runner._latest_move_target_type(self.clf) == "相手単体"
+
+    def test_malformed_entry_returns_none(self):
+        self.runner._move_log = ["これは形式に合わない文字列"]
+        assert self.runner._latest_move_target_type(self.clf) is None
 
 
 class TestUpdateMegaEvolution:

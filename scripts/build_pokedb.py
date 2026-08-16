@@ -136,7 +136,8 @@ CREATE TABLE IF NOT EXISTS moves (
     category TEXT,
     power    INTEGER,
     accuracy INTEGER,
-    effect   TEXT
+    effect   TEXT,
+    target   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS abilities (
@@ -202,6 +203,16 @@ def init_db(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         pass  # カラムが既に存在する場合は無視
 
+    # 既存 DB へのマイグレーション（target カラムがない古い DB に対応・2026-08-16
+    # 技の対象範囲ヒント新設。move_target_hintが事後観測ベースのみで、変化技/範囲技の
+    # 事前情報が無く対象を誤爆する問題への対策）
+    try:
+        conn.execute("ALTER TABLE moves ADD COLUMN target TEXT")
+        conn.commit()
+        log.info("マイグレーション: moves.target カラムを追加しました")
+    except sqlite3.OperationalError:
+        pass  # カラムが既に存在する場合は無視
+
     log.info("DB スキーマ初期化完了")
 
 # ─── 技データ取得 ─────────────────────────────────────────────────────────────
@@ -235,6 +246,30 @@ def _pick_move_effect_text(flavor_text_entries: list[dict]) -> str | None:
         if vg in by_vg:
             return by_vg[vg]
     return next(iter(by_vg.values()), None)
+
+
+# PokeAPI の move.target.name → 日本語の対象範囲ラベル（2026-08-16新設）。
+# ダブルバトルでのmove_target_hint（技の対象誤認対策）が事後観測ベースのみで、
+# 変化技（自分対象）・範囲技（相手複数対象）の事前情報を一切持っていなかったため、
+# 「そもそも対象がどういう種類の技か」をPython側の確定事実として持たせる目的で追加。
+_TARGET_JA = {
+    "selected-pokemon":          "相手単体",
+    "selected-pokemon-me-first": "相手単体",
+    "random-opponent":           "相手のランダム1体",
+    "all-opponents":             "相手全体",
+    "all-other-pokemon":         "自分以外全員",
+    "all-pokemon":               "場の全員",
+    "user":                      "自分自身",
+    "user-and-allies":           "自分と味方",
+    "user-or-ally":              "自分か味方",
+    "ally":                      "味方1体",
+    "all-allies":                "味方全体",
+    "users-field":               "自分の場",
+    "opponents-field":           "相手の場",
+    "entire-field":              "場全体",
+    "specific-move":             "直前の技に関連",
+    "fainting-pokemon":          "瀕死になった味方",
+}
 
 
 def fetch_moves(conn: sqlite3.Connection) -> None:
@@ -300,6 +335,35 @@ def fetch_move_effects(conn: sqlite3.Connection) -> None:
 
     conn.commit()
     log.info("技効果データ backfill 完了: %d / %d 件", updated, len(rows))
+
+
+def fetch_move_targets(conn: sqlite3.Connection) -> None:
+    """既存 moves 全行に、PokeAPI キャッシュ済みの target フィールドから
+    対象範囲（自分自身/相手単体/相手全体等）を後付け補完する（2026-08-16新設）。
+
+    move_target_hint（技の対象誤認対策）が「技の直後に画面で観測された結果」
+    からの事後推測のみで、変化技（自分対象）・範囲技（相手複数対象）の事前情報を
+    一切持っていなかった。つるぎのまい等の自分対象技で対象不明のまま実況したり、
+    観測が無い単体対象技の対象をLLMが憶測で決め打ちする事故があったための対策。
+    fetch_move_effects() と同じくキャッシュ済みJSONを使うため通常は新規
+    ネットワークアクセスは発生しない。
+    """
+    log.info("=== 技対象範囲データ backfill 開始 ===")
+    rows = conn.execute("SELECT id FROM moves").fetchall()
+    updated = 0
+    for i, (move_id,) in enumerate(rows):
+        m = _fetch(f"{POKEAPI_BASE}/move/{move_id}/")
+        target_en = (m or {}).get("target", {}).get("name")
+        target_ja = _TARGET_JA.get(target_en)
+        if target_ja:
+            conn.execute("UPDATE moves SET target = ? WHERE id = ?", (target_ja, move_id))
+            updated += 1
+        if i % 100 == 0:
+            conn.commit()
+            log.info("  技対象範囲: %d / %d 処理済み", i, len(rows))
+
+    conn.commit()
+    log.info("技対象範囲データ backfill 完了: %d / %d 件", updated, len(rows))
 
 
 # ─── 特性データ取得 ───────────────────────────────────────────────────────────
@@ -456,6 +520,7 @@ def main() -> None:
         # 技・特性・アイテムを先に取得（ポケモン取得時に参照するため）
         fetch_moves(conn)
         fetch_move_effects(conn)
+        fetch_move_targets(conn)
         fetch_abilities(conn)
         fetch_items(conn)
         fetch_pokemon(conn)

@@ -217,7 +217,7 @@ class TestBuildVisionPrompt:
             self._context("move_single"), [],
             self._battle_state(move_target_hint="メタグロス（自分側）のHPが100%→39%に減少"))
         assert "メタグロス（自分側）のHPが100%→39%に減少" in prompt
-        assert "必ず上記の観測に従うこと" in prompt
+        assert "必ず上記に従うこと" in prompt
 
     def test_move_target_hint_omitted_when_absent(self):
         prompt = _build_vision_prompt(

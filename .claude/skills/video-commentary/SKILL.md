@@ -211,6 +211,23 @@ python3 scripts/generate_thumbnail.py renders/<動画名> --time 230.5 --label "
   流用しているが、こちらは体まで大きく見せる用途なのでscaleは合成側より大きめ。
   モデルが変わったら合成側と同様に再計測すること
 
+## YouTubeチャプター自動生成（2026-08-16新設・任意・WSL）
+
+パス1の素材（manifest.jsonl）からターンの切り替わり・試合開始・決着のタイミングを拾い、
+YouTube概要欄にそのまま貼れるチャプターリストをテキスト出力する。動画本体には無関係
+（読み取り専用）なので、パス2より後ならいつでも実行できる。
+
+```
+python3 scripts/generate_chapters.py renders/<動画名>
+```
+
+- 出力: `renders/<動画名>/chapters.txt`（`--out`で変更可）。標準出力にも表示
+- ラベルは「オープニング／試合開始／ターンN／決着」のみで**内容（誰が倒れた・勝敗）は
+  含めない**（チャプターは視聴前の概要欄で見えてしまうため、これ以上書くと本編以上の
+  ネタバレになる）
+- チャプター間隔はYouTube仕様の最低10秒を既定にしている（`--min-gap`で調整可）。
+  最低3チャプター無いとYouTube側でチャプター機能が有効化されない点に注意
+
 ## 合成後の検証チェックリスト（必ずやる）
 
 1. **スケジュール確認**: `renders/<動画名>/schedule.json` の `scheduled` を時刻順に見る。
@@ -266,7 +283,7 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | VMCのOSC表情操作（`play_and_animate_avatar.py`）が無反応 | OSCメッセージを送っても表情が一切変わらない | VMCの設定画面でReceiver（39540/39541）のポート番号は入っていても、**「有効化」チェックボックスがデフォルトOFFだと外部OSC入力が反映されない**（2026-07-30に実機で確認・チェックを入れたら即動作した）。必ずONにしてから実行すること |
 | switch/move_used実況のタイミングずれ（1テンポ前の交代を今起きたかのように実況） | 「ブリジュラスへの交代だ！」（実際はペリッパー再登場）等、直前の別の交代・技を現在形で実況する（実機2026-08-14_20-46-44の#11/#14/#18） | **2026-08-15に恒久対策済み（後付け生成モードのみ＋プロンプト改善は両モード）**: 原因は2つ。①switchイベントは faint→switch_select 遷移＝**交代選択画面の時点**で発火し、「ゆけっ!」メッセージ（実際の交代先）は数秒後に出るため、LLMが直前の交代で穴埋めしていた。②move_usedは通信終了＝**ターン冒頭（技がまだ出ていない時点）**で発火するのに、event_hintが「今ターンで使われた技を実況」だったため前ターンの技ログを現在形で語っていた。対策=(a)後付け生成時に繰り出しメッセージ履歴（`_sendout_history`・`_note_sendout`で全動画分蓄積）から実際の交代先を逆引きし`switch_focus`として注入（switchはevent_hint差し替え・move_usedは状況行）(b)move_usedのevent_hintを「新しいターンの攻防が始まる場面・戦況全体を実況・過去の技や交代を実況し直さない」に変更。**server.py変更を含むためEC2再デプロイが必要**。manifest.jsonlのcontextに`switch_focus`が出ていれば動作している |
 | 気絶イベントの実況未検出（トラッカーは把握しているのに実況されない） | 「たおれた」メッセージやHP0を正しく検出しているのに、faint実況が生成されない（実機2026-08-14_20-46-44で4件: ライチュウ/メタグロス/コノヨザル/ペリッパー。ミロカロスだけ実況された） | **2026-08-15に恒久対策済み**。原因は4系統の複合: ①faintイベント時に`_track_new_faints`が現在の全気絶を「実況済み」登録→未実況の気絶が封印（ライチュウ）②保留faint（move_used統合待ち）が75秒タイムアウト前のturn_startで持ち越され、次ターンのmove_usedに統合されて47秒遅れ＋交代と混同（メタグロス=#14の混乱実況）③連続faintで保留が上書き消滅（コノヨザル）④battle_end時に保留が未フラッシュのまま消滅（ペリッパー）。対策: 実況済み登録をdiff限定化＋turn_start/battle_end/新faint検知時に保留を必ずフラッシュ（event_time=検知時刻なので配置は正確）＋合成faintを自分側にも拡張（従来は相手側のみ）。pipeline.py側のみ=EC2デプロイ不要（faint_focus文言の微修正のみserver.py） |
-| move_singleの技の対象（方向）誤認 | 「インファイトがオオニューラへ！」等、実際と違うポケモンを対象として実況する（実機2026-08-14_20-46-44で7件・最頻NG） | **2026-08-15に恒久対策済み（後付け生成モードのみ）**: move_singleは技テキスト検出の瞬間に発火するが、対象の証拠（HP減少・状態異常メッセージ・まもる成功）は数秒〜20秒後に出るため、LLMが場のポケモンから対象を推測して外していた。後付け生成時に「技の直後〜次イベントまでの観測」（`_panel_state_history`のHP/状態異常差分＋`_protect_history`のまもる成功メッセージ）から対象を逆引きし、`move_target_hint`としてプロンプト注入する（観測に厳密に従う指示付き・観測ゼロなら従来の「断定しない」安全策に委ねる）。**server.py変更を含むためEC2再デプロイが必要**。manifest.jsonlのcontextに`move_target_hint`が出ていれば動作している。実データドライランでNG7件中3件を確実修正・残りは断定回避へ倒れることを確認済み |
+| move_singleの技の対象（方向）誤認 | 「インファイトがオオニューラへ！」等、実際と違うポケモンを対象として実況する（実機2026-08-14_20-46-44で7件・最頻NG） | **2026-08-15に恒久対策済み（後付け生成モードのみ）**: move_singleは技テキスト検出の瞬間に発火するが、対象の証拠（HP減少・状態異常メッセージ・まもる成功）は数秒〜20秒後に出るため、LLMが場のポケモンから対象を推測して外していた。後付け生成時に「技の直後〜次イベントまでの観測」（`_panel_state_history`のHP/状態異常差分＋`_protect_history`のまもる成功メッセージ）から対象を逆引きし、`move_target_hint`としてプロンプト注入する（観測に厳密に従う指示付き・観測ゼロなら従来の「断定しない」安全策に委ねる）。**server.py変更を含むためEC2再デプロイが必要**。manifest.jsonlのcontextに`move_target_hint`が出ていれば動作している。実データドライランでNG7件中3件を確実修正・残りは断定回避へ倒れることを確認済み。**2026-08-16追加**: 上記は「技の直後の事後観測」のみに頼っており、つるぎのまい等の自分対象の変化技・範囲技（相手全体対象）は観測が原理的に薄い/存在しないため誤爆が残っていた。`moves`テーブルに`target`列（PokeAPI由来・`fetch_move_targets`でbackfill）を追加し、「技そのものの対象範囲」（自分自身/相手全体/自分の場等）という事後観測と独立した事実を`move_range_hint`として`_dispatch_move_commentary`/`_process_event`の両方でbattle_contextに配線→`_compute_move_target_hint`が観測より最優先で合流させる。単体対象（相手単体等）は既存の断定回避指示と同義のためあえて文言を足さない。manifest.jsonlのcontextに`move_range_hint`が出ていれば配線されている（プロンプト自体は`move_target_hint`に統合済みなのでserver.py/phi3_client.py側の新規キーは無し・文言修正のみでEC2再デプロイ必要） |
 | 降参で終わった試合のbattle_end実況が気絶・全滅を捏造 | 「〜が落ちた、これで全滅です」等、実際は降参なのに倒れた描写で締める（実機2026-08-14_20-46-44で実発生）。battle_resultも未検出になりがち | **2026-08-15に恒久対策済み**: battle_endの発火経路は「YOLO終了画面」「フェーズ遷移（`_END_KW`の「降参が選ばれ」）」の2つあり、降参のWIN/LOSE待機（2026-08-14実装）はYOLO経路のみ対応でフェーズ遷移経路が先に即発行していた。フェーズ遷移経路にも同じ待機を追加し、`_battle_surrendered`フラグを新設してプロンプト（server.py/phi3両方）に「降参による決着・倒れた描写をしない」を注入する。**server.py変更を含むためEC2再デプロイが必要**。manifest.jsonlのcontextに`battle_surrendered: true`が出ていれば動作している |
 
 ## レイアウト調整ポイント（scripts/render_commentary_video.py の定数）
@@ -292,9 +309,14 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 検証チェックリストは毎回実施（特にネタバレ検査）。書き起こしがある動画なら
 パネルのHP値と書き起こしの照合も行うと確実。
 
+**投稿準備の一環として`scripts/generate_chapters.py`も毎回実行する**（2026-08-16〜）。
+パス2完了後ならいつでも実行できる（動画本体とは無関係な読み取り専用処理）。
+出力される`chapters.txt`をYouTubeの概要欄にそのまま貼り付ける。
+
 ## 関連ファイル
 
-- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック/`BattleStateTracker.fainted_names`・`diff_fainted_side`）・`src/api/server.py`（`/api/script`・プロンプト）・`scripts/generate_gap_commentary.py`・`scripts/render_commentary_video.py`・`scripts/generate_thumbnail.py`（サムネイル自動生成）・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）・`scripts/play_and_animate_avatar.py`（表情連動版wav再生・Windows・改善ロードマップ③）
+- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック/`BattleStateTracker.fainted_names`・`diff_fainted_side`）・`src/api/server.py`（`/api/script`・プロンプト）・`scripts/generate_gap_commentary.py`・`scripts/render_commentary_video.py`・`scripts/generate_thumbnail.py`（サムネイル自動生成）・`scripts/generate_chapters.py`
+（YouTubeチャプター自動生成）・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）・`scripts/play_and_animate_avatar.py`（表情連動版wav再生・Windows・改善ロードマップ③）
 - テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_server.py`（TestScript系）・`tests/test_play_and_animate_avatar.py`
 - 設計: `docs/adr/ADR-009-video-first-commentary.md`・レイアウト原案 `docs/design/frame-mockups/mockup_A_biim.png`
 - 経緯・実測値: `docs/daily/2026-07-14.md`

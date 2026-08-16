@@ -95,7 +95,7 @@ class TestBuildPrompt:
         }
         prompt = client._build_prompt({"event_type": "move_single"}, None, battle_context)
         assert "身を守った＝この技は防がれた" in prompt
-        assert "必ず上記の観測に従うこと" in prompt
+        assert "必ず上記に従うこと" in prompt
 
     def test_move_target_hint_omitted_when_absent(self, client):
         prompt = client._build_prompt({"event_type": "move_single"}, None, {"turn": 3})

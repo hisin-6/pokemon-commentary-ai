@@ -232,16 +232,17 @@ class Phi3Client:
                     "「威力が上がる/絶大」等と独自の知識で付け足さないこと（2026-08-16・"
                     "server.py側と同じ文言で配線）"
                 )
-            # 技の対象ヒント（2026-08-15・server.py側と同じ文言で配線）:
-            # move_single対象誤認（最頻NG）対策。技の直後の観測に厳密に従わせる
+            # 技の対象ヒント（2026-08-15・server.py側と同じ文言で配線。技の対象範囲
+            # （自分自身/相手全体等）の合流は2026-08-16）:
+            # move_single対象誤認（最頻NG）対策。技の仕様＋直後の観測に厳密に従わせる
             move_target_hint = battle_context.get("move_target_hint")
             if move_target_hint:
                 lines.append(
-                    f"この技の直後に画面から観測された変化（Python側で照合済みの"
-                    f"確定情報）: {move_target_hint}"
+                    f"この技の対象・結果に関する確定情報（技の仕様＋画面から観測された"
+                    f"変化。Python側で照合済み）: {move_target_hint}"
                 )
                 lines.append(
-                    "※ この技の対象・結果は必ず上記の観測に従うこと。観測に登場しない"
+                    "※ この技の対象・結果は必ず上記に従うこと。そこに登場しない"
                     "ポケモンをこの技の対象として実況しないこと"
                 )
             condition_hint = battle_context.get("condition_hint")

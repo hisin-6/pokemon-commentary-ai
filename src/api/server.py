@@ -341,13 +341,15 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
             "独自の知識で付け足さないこと（命中率アップ等、記載の無い天候効果も同様）",
         ]
     # 技の対象ヒント（2026-08-15・move_single対象誤認対策）: 技の直後に画面から
-    # 観測されたHP減少・状態異常付与・まもる成功。対象の推測誤りが最頻NGだったため、
-    # 観測がある場合はそれに厳密に従わせる
+    # 観測されたHP減少・状態異常付与・まもる成功に加え、技そのものの対象範囲
+    # （自分自身/相手全体等・2026-08-16追加）も含む。対象の推測誤りが最頻NGだったため、
+    # 情報がある場合はそれに厳密に従わせる
     move_target_hint = battle_state.get("move_target_hint")
     if move_target_hint:
         lines += [
-            f"この技の直後に画面から観測された変化（Python側で照合済みの確定情報）: {move_target_hint}",
-            "※ この技の対象・結果は必ず上記の観測に従うこと。観測に登場しない"
+            f"この技の対象・結果に関する確定情報（技の仕様＋画面から観測された変化。"
+            f"Python側で照合済み）: {move_target_hint}",
+            "※ この技の対象・結果は必ず上記に従うこと。そこに登場しない"
             "ポケモンをこの技の対象として実況しないこと",
         ]
     condition_hint = battle_state.get("condition_hint")
