@@ -488,6 +488,61 @@ class TestAvatarCommand:
         assert "main_h-overlay_h-16+250:" in fc
 
 
+class TestBubbleCommand:
+    """プレイヤーのツッコミ吹き出し（v2d・2026-08-16新設）のffmpegコマンド組み立て。"""
+
+    def _bubble(self, path="b0.png", start=10.0, end=14.5):
+        return {"path": Path(path), "start": start, "end": end}
+
+    def test_without_bubbles_unchanged(self, tmp_path):
+        """bubbles未指定（既定None）では従来コマンドと同一（2入力・[vout]直結）。"""
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0)
+        assert cmd.count("-i") == 2
+        assert "overlay=0:0" not in " ".join(cmd)
+
+    def test_single_bubble_adds_input_and_timed_overlay(self, tmp_path):
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
+            bubbles=[self._bubble()])
+        assert cmd.count("-i") == 3
+        assert "b0.png" in cmd
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        assert "[2:v]overlay=0:0:enable='between(t\\,10.000\\,14.500)'[vout]" in fc
+        joined = " ".join(cmd)
+        assert "[vout]" in joined and "[aout]" in joined
+
+    def test_multiple_bubbles_chain_sequentially(self, tmp_path):
+        """複数の吹き出しは重ならない前提で連鎖合成される（最後だけ[vout]）。"""
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
+            bubbles=[self._bubble("b0.png", 10.0, 14.5), self._bubble("b1.png", 40.0, 44.5)])
+        assert cmd.count("-i") == 4
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        assert "[vsub][2:v]overlay=0:0:enable='between(t\\,10.000\\,14.500)'[vb0]" in fc
+        assert "[vb0][3:v]overlay=0:0:enable='between(t\\,40.000\\,44.500)'[vout]" in fc
+
+    def test_bubbles_layered_above_avatar(self, tmp_path):
+        """アバターがある場合、吹き出しはアバターの後段（＝最前面）に重なる。"""
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0,
+            avatar_video=Path("avatar.mp4"), bubbles=[self._bubble()])
+        assert cmd.count("-i") == 4  # video, wav, avatar, bubble
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        assert fc.index("eof_action=repeat[vavatar]") < fc.index("[3:v]overlay=0:0")
+        assert "[vavatar][3:v]overlay=0:0:enable='between(t\\,10.000\\,14.500)'[vout]" in fc
+
+    def test_empty_bubbles_list_same_as_none(self, tmp_path):
+        cmd = rcv.build_ffmpeg_command_biim(
+            Path("in.mp4"), Path("t.wav"), Path("o.mp4"), tmp_path / "c.ass",
+            gain=1.4, duck_threshold=0.03, duck_ratio=8.0, bubbles=[])
+        assert cmd.count("-i") == 2
+
+
 class TestLoadStates:
     def test_missing_file_returns_empty(self, tmp_path):
         assert rcv.load_states(tmp_path) == []

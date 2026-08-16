@@ -124,11 +124,38 @@ RVC WebUIの**「ckpt処理」タブ**にモデル融合機能がある。
 
 ## 推論・パイプライン統合
 
-- 自分の声モデルをRVCの推論（Inference）に読み込む
-- VOICEVOX（四国めたん）で生成した音声を入力として声質変換
+- 自分の声モデルをRVCの**「モデル推論」タブ**（Inference・日本語UIの表記）に読み込む
+- VOICEVOX（四国めたん・speaker=2）で生成した音声を入力として声質変換
 - 声の高さが合わない場合はピッチ調整（pitch shift）で補正
 
+### 推論パラメータ（2026-08-16実機確認・`i18n/locale/ja_JP.json`で文言を確認済み）
+
+- **検索特徴率（Index Rate）**: 上げるほど自分のコーパスの声質特徴を強く引っ張ってくる。
+  自分の声に近づけたい場合は高め（0.75〜1.0）から試す
+- **保護値（Protect）**: ⚠️直感と逆の仕様。**0.5＝保護オフ**で、**上げる（0.5に近づける）
+  ほどindexの効果が強まり自分の声に近づく**が、子音・呼吸音のアーティファクト（電子音の
+  途切れ等）のリスクが増える。下げると保護は強化されるがindexの効果（＝自分の声への
+  寄せ）が下がる
+- **ピッチ変更（半音数）**: 変換元（VOICEVOX四国めたんは声が高め）と自分の地声の音域差が
+  大きいと変換品質が落ちる（モデルが学習した音域から外れるため）。マイナス方向へシフトして
+  自分の地声の音域に近づけるのが有効
+- 上記3つを軸に、実際に聴きながら微調整する（**2026-08-16時点ではユーザーが後日実施予定・
+  最適値は未確定**）
+
 ---
+
+## 地雷リスト（2026-08-16・実際に踏んだもの）
+
+RVC-WebUI本体（`Retrieval-based-Voice-Conversion-WebUI-main`）側の問題。AITuberProject
+リポジトリとは別管理だが、次回同じ環境で学習する時のために記録しておく。
+
+| 地雷 | 症状 | 対処 |
+|------|------|------|
+| `assets/pretrained_v2`が空 | 学習に必須の事前学習済みモデルが無く即失敗する | `tools/download_models.py`を実行（HuggingFaceから一括DL・数GB規模・要requests）。`assets/rmvpe`のrmvpe.pt本体・`assets/hubert`のhubert_base.ptも同スクリプトで揃う |
+| `go-web.bat`が起動しない | 存在しない`runtime\python.exe`を参照（プリビルド版の同梱Python前提の設定が残っている） | `venv\Scripts\python.exe`を使うよう書き換える（GitHubから直接cloneした環境の場合） |
+| `RuntimeError: use_libuv was requested but PyTorch was build without libuv support` | モデル学習が即クラッシュ（Windows版PyTorchがlibuv非対応なのに`torch.distributed`がデフォルトで要求） | `infer/modules/train/train.py`冒頭に`os.environ.setdefault("USE_LIBUV", "0")`を追加 |
+| `AttributeError: 'FigureCanvasAgg' object has no attribute 'tostring_rgb'` | Epoch 1のTensorBoard画像出力でクラッシュ（新しいmatplotlibでAPI廃止） | `infer/lib/train/utils.py`の`plot_spectrogram_to_numpy`/`plot_alignment_to_numpy`を`buffer_rgba()`ベースに書き換え |
+| モデル推論タブでインデックスの候補が出ない | 「特徴インデックスのトレーニング」を実行したはずなのに反映されない | `logs/<モデル名>/`に`trained_*.index`（中間・空のIVF構造）しか無く、`added_*.index`（実際に特徴ベクトルを詰めた実ファイル）が無い可能性が高い。RVC-WebUIは`trained`を含むファイル名を候補から**意図的に除外**する仕様。ブラウザのリロード/通信切れ等でインデックス作成が中断されると起きる。`total_fea.npy`があれば、`train_index()`と同じfaissロジック（trainしてadd）を直接実行して復旧できる |
 
 ## 参考リンク
 
@@ -137,11 +164,17 @@ RVC WebUIの**「ckpt処理」タブ**にモデル融合機能がある。
 
 ## 進捗
 
-- **ITAコーパス録音: 155/324文 完了（2026-08-03時点）**。recitation（朗読）324文中の進捗。
-  残り169文は今後のセッションで継続録音
+- **✅ITAコーパス録音: 324/324文 完了（2026-08-15）**
+- **✅モデル学習完了（2026-08-16）**: v2/40k・バッチサイズ7・250epoch・約2時間45分
+  （20:25〜23:10）。25epoch毎の中間モデル（e25〜e250）と最終`kurepi.pth`が
+  `assets/weights/`に生成済み。検索インデックス（`added_IVF1717_Flat_nprobe_1_kurepi_v2.index`）
+  も復旧済み（上記地雷リスト参照）
 - 録音データの保存先: `data/voices/`（**`.gitignore`済み**・リポジトリには含まれない）
 
 ## 未決事項（次回以降）
 
-- ITAコーパス録音の続き（上記進捗参照）
+- 複数エポックの聴き比べ・最適エポックの選定（250が必ずしも最良とは限らない）
+- 推論パラメータ（検索特徴率・保護値・ピッチ）の最適値決定
 - VOICEVOX四国めたんの感情スタイル（ノーマル/たのしみ等）の実況用途での選定
+- RVCをVOICEVOX後段の声質変換としてAITuberProjectパイプラインに統合する設計・実装
+  （現状は手動でRVC WebUIの推論タブを使うのみ）

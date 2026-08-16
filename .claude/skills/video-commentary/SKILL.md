@@ -228,6 +228,32 @@ python3 scripts/generate_chapters.py renders/<動画名>
 - チャプター間隔はYouTube仕様の最低10秒を既定にしている（`--min-gap`で調整可）。
   最低3チャプター無いとYouTube側でチャプター機能が有効化されない点に注意
 
+## プレイヤーの吹き出し（v2d・2026-08-16新設・任意・WSL）
+
+AIの実況ミス（NG）をそのまま茶番のネタにする演出。プレイヤー本人（文字のみ出演）が
+「それ違うよ〜」のようにツッコむ吹き出しを画面に焼き込む。ボイロ実況的な「掛け合い」を
+台本無しで実現する方向性の一部（[[project_video_first_policy]]参照）。LLMには**書かせない**
+（本人の生の言葉としての強みを残すため）。
+
+1. NGチェック（`review_checklist.md`）で見つけた間違いのうち、面白い/分かりやすいものを
+   厳選し、`renders/<動画名>/bubbles.jsonl` に1行1件で書く:
+   ```
+   {"time": 275.8, "text": "あれ、それペリッパーじゃなくてブリジュラス狙ってたんじゃ…？"}
+   ```
+   `duration`（省略可・既定4.5秒）で表示秒数を調整できる。全部のNGに付けると煩いので
+   **厳選する**こと
+2. パス2（`render_commentary_video.py`）を通常どおり実行するだけ。`bubbles.jsonl`が
+   あれば**自動で検出・合成**される（fillers.jsonlと同じ「無ければ何も起きない」方式・
+   専用CLIフラグは無い）
+3. 見た目は`scripts/render_bubble_overlay.py`の`draw_speech_bubble`が描画（暖色クリーム地＋
+   オレンジ枠の吹き出し・「トレーナー」ラベル・左上配置）。ゲーム画面の寒色（シアン枠）・
+   戦況パネルとはっきり区別し「AIとは別の声が割り込んでいる」印象を狙った配色。
+   絵文字は字幕と同じフォント（meiryo太字）で豆腐化するので本文に使わないこと
+4. 単体で見た目だけ試したい場合:
+   ```
+   python3 scripts/render_bubble_overlay.py --frame <1920x1080のPNG> --text "好きな文言" --out preview.png
+   ```
+
 ## 合成後の検証チェックリスト（必ずやる）
 
 1. **スケジュール確認**: `renders/<動画名>/schedule.json` の `scheduled` を時刻順に見る。
@@ -313,10 +339,18 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 パス2完了後ならいつでも実行できる（動画本体とは無関係な読み取り専用処理）。
 出力される`chapters.txt`をYouTubeの概要欄にそのまま貼り付ける。
 
+**プレイヤーの吹き出し（v2d）も毎回検討する**（2026-08-16〜）。手順:
+1. 一度パス2まで通して合成し、通し視聴（検証チェックリスト）でNGを見つける
+2. 面白い/分かりやすいNGを厳選して`renders/<動画名>/bubbles.jsonl`に手書きする
+   （詳細は「プレイヤーの吹き出し」節参照）
+3. パス2を**再実行するだけ**（`bubbles.jsonl`を自動検出・音声もBedrockもVOICEVOXも
+   再実行不要・パス2のやり直しと同じ扱い）
+
 ## 関連ファイル
 
 - 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック/`BattleStateTracker.fainted_names`・`diff_fainted_side`）・`src/api/server.py`（`/api/script`・プロンプト）・`scripts/generate_gap_commentary.py`・`scripts/render_commentary_video.py`・`scripts/generate_thumbnail.py`（サムネイル自動生成）・`scripts/generate_chapters.py`
-（YouTubeチャプター自動生成）・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）・`scripts/play_and_animate_avatar.py`（表情連動版wav再生・Windows・改善ロードマップ③）
-- テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_server.py`（TestScript系）・`tests/test_play_and_animate_avatar.py`
+（YouTubeチャプター自動生成）・`scripts/render_bubble_overlay.py`（プレイヤーの吹き出し・v2d）
+・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）・`scripts/play_and_animate_avatar.py`（表情連動版wav再生・Windows・改善ロードマップ③）
+- テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_server.py`（TestScript系）・`tests/test_play_and_animate_avatar.py`・`tests/test_render_bubble_overlay.py`・`tests/test_generate_chapters.py`
 - 設計: `docs/adr/ADR-009-video-first-commentary.md`・レイアウト原案 `docs/design/frame-mockups/mockup_A_biim.png`
 - 経緯・実測値: `docs/daily/2026-07-14.md`

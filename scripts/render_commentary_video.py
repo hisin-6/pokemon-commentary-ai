@@ -524,7 +524,8 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
                               avatar_x_shift: int = _AVATAR_X_SHIFT,
                               avatar_y_shift: int = _AVATAR_Y_SHIFT,
                               tail_pad: float = 0.0,
-                              max_duration: float = 0.0) -> list:
+                              max_duration: float = 0.0,
+                              bubbles: list = None) -> list:
     """biim風レイアウト（案A）合成のffmpegコマンドを組み立てる。
 
     ゲーム画面を左上に縮小配置し、右サイドパネルの下地・下部実況帯を描画、
@@ -552,6 +553,12 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
     （実機07-03-23-34-29で確認: 本編309.9秒・アバター396.8秒の組み合わせで
     出力が396.8秒に間延びし、末尾87秒が試合とは無関係な静止画+アバターだけの
     無駄な尻尾になっていた）。本編の長さに揃えて余剰分を切り捨てるための安全弁。
+
+    bubbles指定時（v2d・プレイヤーのツッコミ吹き出し・2026-08-16新設）は、各要素
+    {"path": PNG（透過・1920x1080）, "start": 秒, "end": 秒} を追加inputとして
+    取り込み、指定区間だけ`overlay=0:0:enable='between(...)'`で最前面に重ねる。
+    アバターより後段（アバターの上に吹き出しが乗る）。事前にPNGを描画しておく
+    のは呼び出し側の責務（`scripts/render_bubble_overlay.py`の`render_bubble_pngs`）。
     """
     if avatar_video is not None and avatar_offset < 0:
         raise ValueError("avatar_offset は0以上（録画をWAV再生より先に開始する運用）")
@@ -562,6 +569,11 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
     panel_w = 1920 - panel_x - 16
     tpad_part = (f"tpad=stop_mode=clone:stop_duration={tail_pad:.3f},"
                  if tail_pad > 0 else "")
+    has_avatar = avatar_video is not None
+    has_bubbles = bool(bubbles)
+    # 最終段（[vout]）になるのは「これ以上重ねるものが無い」場合だけ。
+    # アバター・吹き出しのどちらかでも後段にあれば中間ラベルにする
+    base_label = "vout" if not (has_avatar or has_bubbles) else "vsub"
     video_filter = (
         # ゲーム画面を縮小し、パディングで1920x1080のキャンバスに配置
         f"[0:v]{tpad_part}scale={_BIIM_GAME_W}:{_BIIM_GAME_H},"
@@ -580,25 +592,46 @@ def build_ffmpeg_command_biim(video: Path, track_wav: Path, out_path: Path,
         f"drawtext=fontfile={_BIIM_FONT_FILE}:text='◆ 戦況':"
         f"x={panel_x + 24}:y=44:fontsize=34:fontcolor=0x66CCFF,"
         # 実況字幕（音声シンクロ）
-        f"subtitles={ass_path}:fontsdir={_BIIM_FONTS_DIR}"
+        f"subtitles={ass_path}:fontsdir={_BIIM_FONTS_DIR}[{base_label}]"
     )
     inputs = ["-i", str(video), "-i", str(track_wav)]
-    if avatar_video is not None:
+    next_input_idx = 2
+    current_label = base_label
+
+    if has_avatar:
         # -ss で録画先頭（WAV再生開始前の部分）をスキップして頭を合わせる
         inputs += ["-ss", f"{avatar_offset}", "-i", str(avatar_video)]
+        avatar_idx = next_input_idx
+        next_input_idx += 1
         crop_filter = f"crop={avatar_crop}," if avatar_crop else ""
-        video_filter = (
-            f"{video_filter}[vsub];"
-            f"[2:v]{crop_filter}scale={avatar_width}:-2,"
+        avatar_out_label = "vout" if not has_bubbles else "vavatar"
+        video_filter += (
+            f";[{avatar_idx}:v]{crop_filter}scale={avatar_width}:-2,"
             f"chromakey={avatar_chroma}:{avatar_similarity}:0.08,"
             f"despill=type=green:mix=0.5:expand=0[av];"
-            f"[vsub][av]overlay="
+            f"[{current_label}][av]overlay="
             f"main_w-overlay_w-{_AVATAR_MARGIN}+{avatar_x_shift}:"
             f"main_h-overlay_h-{_AVATAR_MARGIN}+{avatar_y_shift}:"
-            f"eof_action=repeat[vout]"
+            f"eof_action=repeat[{avatar_out_label}]"
         )
-    else:
-        video_filter = f"{video_filter}[vout]"
+        current_label = avatar_out_label
+
+    if has_bubbles:
+        # プレイヤーのツッコミ吹き出し（v2d・2026-08-16）: アバターの上に最前面で重ねる。
+        # 指定区間だけ表示されるよう enable='between(...)' を使う（filtergraphの
+        # 構造上のコンマと区別するためbetween内のコンマはバックスラッシュで
+        # エスケープする＝ffmpeg公式ドキュメント記載の作法）
+        for i, b in enumerate(bubbles):
+            idx = next_input_idx
+            next_input_idx += 1
+            inputs += ["-i", str(b["path"])]
+            is_last = (i == len(bubbles) - 1)
+            out_label = "vout" if is_last else f"vb{i}"
+            video_filter += (
+                f";[{current_label}][{idx}:v]overlay=0:0:"
+                f"enable='between(t\\,{b['start']:.3f}\\,{b['end']:.3f})'[{out_label}]"
+            )
+            current_label = out_label
     audio_filter = (
         f"[1:a]volume={gain},aresample=48000,"
         f"aformat=channel_layouts=stereo,asplit=2[sc][cm];"
@@ -820,6 +853,20 @@ def main(argv=None) -> int:
         out_path = Path(args.out) if args.out else render_dir / f"{render_dir.name}{suffix}"
         # アバター録画が本編（動画+tail_pad）より長い場合の間延び防止（末尾を本編長で打ち切る）
         max_duration = (video_dur or track_end) + tail_pad if avatar_video else 0.0
+
+        # プレイヤーのツッコミ吹き出し（v2d・2026-08-16新設・任意）:
+        # <render_dir>/bubbles.jsonlがあれば自動で合成する（fillers.jsonlと同じ
+        # 「無ければ何も起きない」自動検出方式・専用CLIフラグは設けない）。
+        # render_bubble_overlay.pyがgenerate_thumbnail.py経由でrender_commentary_video.py
+        # 自身に依存するため、循環importを避けて関数内で遅延importする
+        from render_bubble_overlay import load_bubbles, render_bubble_pngs
+        bubble_specs = load_bubbles(render_dir)
+        bubbles = None
+        if bubble_specs:
+            bubbles = render_bubble_pngs(bubble_specs, render_dir / "bubbles")
+            logger.info("プレイヤー吹き出しを合成: %d件（%s）",
+                        len(bubbles), render_dir / "bubbles.jsonl")
+
         cmd = build_ffmpeg_command_biim(video, track_wav, out_path, ass_path,
                                         args.gain, args.duck_threshold, args.duck_ratio,
                                         avatar_video=avatar_video,
@@ -830,7 +877,8 @@ def main(argv=None) -> int:
                                         avatar_x_shift=args.avatar_x_shift,
                                         avatar_y_shift=args.avatar_y_shift,
                                         tail_pad=tail_pad,
-                                        max_duration=max_duration)
+                                        max_duration=max_duration,
+                                        bubbles=bubbles)
     else:
         if args.avatar_video:
             logger.error("--avatar-video は --layout biim でのみ使えます")
