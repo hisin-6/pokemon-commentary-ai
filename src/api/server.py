@@ -54,6 +54,13 @@ app.config["MAX_CONTENT_LENGTH"] = IMAGE_MAX_BYTES * 2
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# Bedrockに実際に送るプロンプト全文をログに出す（RAGヒント等の確認用・2026-08-21）。
+# CLIが無いFlask/gunicorn運用のため環境変数で切り替える（起動前に export DEBUG_PROMPTS=1、
+# もしくはsystemdユニットに Environment=DEBUG_PROMPTS=1 を追加して要再起動）。
+if os.environ.get("DEBUG_PROMPTS") == "1":
+    logger.setLevel(logging.DEBUG)
+    logger.info("DEBUG_PROMPTS=1: Bedrockプロンプト全文のログ出力を有効化しました")
+
 bedrock = boto3.client(
     "bedrock-runtime",
     region_name=BEDROCK_REGION,
@@ -432,7 +439,12 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
         "【実況】",
         "（1〜2文の実況文）",
     ]
-    return "\n".join(lines)
+    prompt = "\n".join(lines)
+    # Bedrockに実際に送るプロンプト全文をデバッグログに出す（2026-08-21新設・
+    # RAGヒント等が実際どう組み込まれたかを事後確認できるように）。既定ではroot
+    # ロガーがINFOのため出力されない。確認時はログレベルをDEBUGに上げること。
+    logger.debug("[Bedrockプロンプト]\n%s", prompt)
+    return prompt
 
 
 def _parse_commentary(text: str) -> tuple[str, str]:

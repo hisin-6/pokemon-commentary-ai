@@ -6000,8 +6000,18 @@ def main() -> None:
                              "中立実況になる（3Dモデル一時差し替え検証用のオプション・"
                              "2026-08-14）。--ec2-url使用時はEC2側server.pyにも同じ変更を"
                              "デプロイしないとBedrock経路には反映されない点に注意。")
+    parser.add_argument("--debug-prompts", action="store_true",
+                        help="LLM（Phi-3ローカルフォールバック）に実際に送るプロンプト全文を"
+                             "ログに出力する（RAGヒント等の確認用・2026-08-21）。"
+                             "Bedrock（EC2 server.py）側のプロンプトはこのフラグでは出ない。"
+                             "EC2側で見たい場合はserver.py起動環境の環境変数 DEBUG_PROMPTS=1 を"
+                             "別途設定すること。")
 
     args = parser.parse_args()
+
+    if args.debug_prompts:
+        logging.getLogger("src.commentary.phi3_client").setLevel(logging.DEBUG)
+        log.info("--debug-prompts: Phi-3プロンプト全文のログ出力を有効化しました")
 
     pipeline = Pipeline(
         camera_index=args.camera,

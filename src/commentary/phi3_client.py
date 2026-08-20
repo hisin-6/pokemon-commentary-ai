@@ -274,7 +274,12 @@ class Phi3Client:
             lines.append(f"直前の実況（繰り返さないこと）: {self._history[-1]}")
 
         lines.append("\n実況文（1〜2文・日本語のみ）：")
-        return "\n".join(lines)
+        prompt = "\n".join(lines)
+        # ローカルLLMに実際に送るプロンプト全文をデバッグログに出す（2026-08-21新設・
+        # RAGヒント等が実際どう組み込まれたかを事後確認できるように）。既定ではroot
+        # ロガーがINFOのため出力されない。確認時はログレベルをDEBUGに上げること。
+        log.debug("[Phi3プロンプト]\n%s", prompt)
+        return prompt
 
     def _add_history(self, commentary: str) -> None:
         self._history.append(commentary)
