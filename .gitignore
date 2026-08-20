@@ -125,3 +125,5 @@ scripts/compute_bone_local_frames.py
 scripts/visualize_vmd_stick_figure.py
 data/battle_situations.sqlite.bak_20260809
 test_voice_metan.wav
+docs/portfolio.md
+docs/diagrams/system-architecture.svg

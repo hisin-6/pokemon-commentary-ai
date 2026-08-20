@@ -185,6 +185,18 @@ _SCREEN_KEYWORDS = {"リフレクター": "リフレクター", "ひかりのか
 _WEATHER_BALL_TYPE_BY_WEATHER = {
     "にほんばれ": "ほのお", "あまごい": "みず", "すなあらし": "いわ", "ゆき": "こおり",
 }
+# 溜め技（2ターン技）の効果ヒント・DB欠落時のフォールバック（2026-08-20新設）。
+# DBのeffectテキストはPokeAPIキャッシュに日本語flavor_textが無い技（新世代の技に
+# 多い。全919技中94件が該当）でNULLになり`_latest_move_effect_hint`が空を返すため、
+# 実機renders/2026-08-18_22-24-52で「エレクトロビーム炸裂！」と1ターン目（溜め）を
+# 攻撃済みであるかのように誤実況していた（雨→晴れに変わった後で溜め省略の特例も
+# 発動しない状態だった）。DBに既に効果テキストがある溜め技（ソーラービーム等）は
+# そちらで足りているため、ここにはDBがNULLの技のみを収録する（ダブり・記述の
+# 食い違いを避けるため、DBに情報がある技はこの辞書で上書きしない）。
+_CHARGE_MOVE_NOTES = {
+    "エレクトロビーム": "1ターン目は特攻を上げるだけで攻撃せず、2ターン目に攻撃が発動する"
+                       "溜め技。あめ状態の間は例外的に溜めなしで即座に攻撃できる。",
+}
 # トリックルーム/おいかぜは演出フレーバー文の推測キーワードだと実際のゲーム文言と
 # 食い違い一度も検出できないバグがあった（2026-08-06発見）。壁（_SCREEN_KEYWORDS）と
 # 同じ「技名そのもの」を直接マッチする方式に統一（2026-08-07・ユーザー判断）。
@@ -2707,7 +2719,8 @@ _GLITCH_CAUSE_KEYWORDS: list[tuple[tuple[str, ...], str]] = [
     (("見えにく", "読み取れ"), "画面がチカチカしてた"),
     (("確定できて", "お待ち"), "情報がまだ揃ってない"),
     (("モヤモヤ", "教えてほし", "教えてもらえ", "実況できな"), "ナゾのノイズ"),
-    (("了解しました", "担当させていただきます", "性格・口調の確認", "実況時の重要ルール"),
+    (("了解しました", "了解いたしました", "担当させていただきます", "性格・口調の確認",
+      "実況時の重要ルール", "スタンバイ完了", "実況AIとして"),
      "指示書を読みすぎちゃった"),
 ]
 
@@ -3072,8 +3085,12 @@ class Pipeline:
         # （_dispatch_faint_inferred）がこの直後の場合は抑制する
         self._last_faint_event_seen_time: float = float("-inf")
         # 合成キャッチアップの抑制窓（秒）。実機2026-08-14_20-52-59で観測された
-        # 二重実況の間隔（18.3秒）に余裕を持たせた値
-        self._FAINT_CATCHUP_SUPPRESS_SEC: float = 25.0
+        # 二重実況の間隔（18.3秒）に余裕を持たせた値だったが、実機
+        # 2026-08-18_22-24-52では間隔46.7秒（ペリッパー452.5s直接faint→
+        # battle_end499.2sの合成「両方」バンドルにペリッパーが再度混入）で
+        # 抑制されず二重実況が発生した（2026-08-20修正）。より大きな余裕を
+        # 持たせて60秒に拡大。
+        self._FAINT_CATCHUP_SUPPRESS_SEC: float = 60.0
 
         # battle_start保留送信: ダブルスで味方2匹目のOCR登録がbattle_start発火に間に
         # 合わない場合（実機2026-06-03 22-57-11で確認: 2匹目が2秒遅れて登録され、
@@ -3792,11 +3809,35 @@ class Pipeline:
                 faint_side = self._battle_tracker.diff_fainted_side(
                     prev_fainted, curr_fainted)
             inferred_faints = self._track_new_faints(prev_fainted, curr_fainted, event_type)
+            # 気絶確定ヒント（2026-08-20新設）: faint/switch経由でない任意のイベント
+            # （典型例はbattle_end）の処理中にポケモンのひんしがボール数推定等で
+            # 新規に確定した場合、会話履歴頼みの推測に任せず対象名を直接注入する。
+            # 実機renders/2026-08-18_22-24-52で発覚——ボール数推定の確定が実際の
+            # 気絶（画面上の「たおれた」表示）より数十秒遅れることがあり、battle_end
+            # 処理時に初めてペリッパー・ブリジュラス両方の確定が同時に起きた際、
+            # 会話履歴の直近の名前（47秒前に既に実況済みのペリッパー）をそのまま
+            # 踏襲し、実際に試合を終わらせたブリジュラスの名前が一切出てこなかった。
+            # 直接のfaintイベントはOCRの「たおれた」テキストから既に正しく対象を
+            # 特定できているため対象外（過剰な上書きを避ける）。
+            if event_type != "faint":
+                new_player = sorted(curr_fainted[0] - prev_fainted[0])
+                new_opponent = sorted(curr_fainted[1] - prev_fainted[1])
+                if new_player or new_opponent:
+                    parts = []
+                    if new_player:
+                        parts.append("自分の" + "と".join(new_player))
+                    if new_opponent:
+                        parts.append("相手の" + "と".join(new_opponent))
+                    game_state = dict(game_state)
+                    game_state["faint_focus"] = "と".join(parts)
+                    log.info("[気絶確定ヒント] event_type=%s %s", event_type, game_state["faint_focus"])
 
         battle_context = self._battle_tracker.to_context()
         type_hint = self._compute_type_hint()
         if type_hint:
             battle_context["type_hint"] = type_hint
+        if getattr(self, "_last_type_hint_candidates", None):
+            battle_context["_type_hint_candidates"] = self._last_type_hint_candidates
         if getattr(self, "_classifier", None) is not None:
             move_effect_hint = self._latest_move_effect_hint(self._classifier)
             if move_effect_hint:
@@ -3889,6 +3930,15 @@ class Pipeline:
                         self._battle_tracker.game_turn += 1
                         log.info(f"[ターン] T{self._battle_tracker.game_turn} 開始（faint統合による繰り上げ）")
                         self._skip_next_turn_start = True  # 直後のturn_startによる二重加算を防ぐ
+                        # 天候/壁/トリックルーム/おいかぜの残りターンはgame_turn基準で
+                        # 計算されるため、繰り上げ後の値で再計算しないと「ターンを
+                        # またいだのに前のターンの残りターン数のまま」になる
+                        # （2026-08-20修正: renders/2026-08-18_22-24-52の実機検証で発覚
+                        # ——ジャラランガの気絶→おいかぜ失効→ゲンガー交代、の順で実
+                        # ゲームは進んでいたのに、この交代の実況は上でbattle_context
+                        # 構築時点＝ターン繰り上げ前に固定計算した「おいかぜあと1ターン」
+                        # のまま失効前の情報を使ってしまっていた）。
+                        self._refresh_condition_hint(battle_context)
                     else:
                         log.info(
                             f"[faint統合] turn_start 済み (T{self._battle_tracker.game_turn}) → "
@@ -4140,6 +4190,116 @@ class Pipeline:
         "場全体":     "この技は場全体が対象（天候等）で、特定のポケモンを対象にしていない",
     }
 
+    @staticmethod
+    def _snap_panel_state(state: dict) -> dict:
+        """パネル状態スナップショット1件を (陣営ラベル, 名前) -> (HP%, 状態異常) に
+        変換する。`_hp_drop_observations`/`_status_change_observations`で共有。"""
+        out = {}
+        for side_key, label in (("player", "自分側"), ("opponent", "相手側")):
+            for p in state.get(side_key, []):
+                out[(label, p.get("name"))] = (p.get("hp_pct"), p.get("status"))
+        return out
+
+    def _panel_state_window(self, start: float, end: float) -> tuple[dict | None, list[dict]]:
+        """観測窓(start, end]の基準スナップショットと窓内スナップショット一覧を返す。"""
+        baseline: dict | None = None
+        window_states: list[dict] = []
+        for t, state in getattr(self, "_panel_state_history", []):
+            if t <= start:
+                baseline = state
+            elif t <= end:
+                window_states.append(state)
+        return baseline, window_states
+
+    def _name_reappears_after(self, label: str, name: str, after: float) -> bool:
+        """`_panel_state_history`の`after`より後のスナップショットに
+        (陣営ラベル, 名前) が一度でも現れるか。`_hp_drop_observations`の
+        気絶消滅補完（2026-08-20新設）の誤爆防止に使う。"""
+        for t, state in getattr(self, "_panel_state_history", []):
+            if t <= after:
+                continue
+            if (label, name) in self._snap_panel_state(state):
+                return True
+        return False
+
+    def _hp_drop_observations(self, start: float, end: float
+                               ) -> dict[tuple[str, str], tuple[float, float]] | None:
+        """観測窓(start, end]でHPが基準より一定以上下がったポケモンを
+        (陣営ラベル, 名前) -> (基準HP, 最小HP) で返す。パネル状態履歴が無い/
+        観測窓に該当するスナップショットが無ければNone。
+
+        `_compute_move_target_hint`（技の対象・結果ヒント）と`_infer_primary_target_name`
+        （type_hintの対象確定・2026-08-20新設）で共有する。
+
+        気絶したポケモンは`to_panel_state()`のフィルタ（`on_field and not fainted`）
+        によりHP0%表示ではなく**スナップショットからエントリごと消える**ため、
+        以下のHP差分ループだけでは大ダメージ（＝気絶）が一切検出できない
+        （2026-08-20修正: renders/2026-08-18_22-24-52の実機検証で発覚——気絶する
+        ほどの技だったのに`move_target_hint`が「観測されていない」を返していた）。
+        窓内のどのスナップショットにも一度も現れなかった＝消えたベースラインの
+        キーは、(1)最終的に本当に気絶していた（`fainted_names()`に含まれる）
+        (2) 窓の後も二度と現れない（生きて控えに下がっただけなら後で再登場し
+        得るため、それと区別する誤爆防止）の両方を満たす場合のみ
+        「HPが0まで落ちた」として補完する。"""
+        baseline, window_states = self._panel_state_window(start, end)
+        if baseline is None or not window_states:
+            return None
+        base_map = self._snap_panel_state(baseline)
+        drops: dict[tuple, tuple[float, float]] = {}
+        seen_in_window: set = set()
+        for state in window_states:
+            for key, (hp, _status) in self._snap_panel_state(state).items():
+                seen_in_window.add(key)
+                base_hp, _base_status = base_map.get(key, (None, None))
+                if (hp is not None and base_hp is not None
+                        and base_hp - hp >= self._TARGET_HINT_MIN_HP_DROP):
+                    prev = drops.get(key)
+                    if prev is None or hp < prev[1]:
+                        drops[key] = (base_hp, hp)
+
+        tracker = getattr(self, "_battle_tracker", None)
+        fainted_p, fainted_o = tracker.fainted_names() if tracker is not None else (set(), set())
+        fainted_by_label = {"自分側": fainted_p, "相手側": fainted_o}
+        for key, (base_hp, _base_status) in base_map.items():
+            if key in drops or key in seen_in_window or base_hp is None:
+                continue
+            label, name = key
+            if name not in fainted_by_label.get(label, set()):
+                continue
+            if self._name_reappears_after(label, name, end):
+                continue
+            drops[key] = (base_hp, 0.0)
+        return drops
+
+    def _status_change_observations(self, start: float, end: float) -> dict[tuple[str, str], str]:
+        """観測窓(start, end]で状態異常が新規に付与されたポケモンを
+        (陣営ラベル, 名前) -> 状態異常名 で返す。`_hp_drop_observations`と対になる
+        ヘルパー（`_compute_move_target_hint`から分離・2026-08-20）。"""
+        baseline, window_states = self._panel_state_window(start, end)
+        if baseline is None or not window_states:
+            return {}
+        base_map = self._snap_panel_state(baseline)
+        statuses: dict[tuple, str] = {}
+        for state in window_states:
+            for key, (_hp, status) in self._snap_panel_state(state).items():
+                _base_hp, base_status = base_map.get(key, (None, None))
+                if status and status != base_status and key not in statuses:
+                    statuses[key] = status
+        return statuses
+
+    def _infer_primary_target_name(self, start: float, end: float) -> str | None:
+        """観測窓(start, end]で最もHPが減ったポケモンの名前を返す（無ければNone）。
+
+        `_latest_move_type_hint`が対象を確定できず候補だけ返した場合
+        （`battle_context["_type_hint_candidates"]`）に、`_generate_posthoc_commentary`
+        側で実際の対象を確定させて正しい候補を選び直すために使う（2026-08-20新設）。
+        """
+        drops = self._hp_drop_observations(start, end)
+        if not drops:
+            return None
+        (_label, name), _hp = max(drops.items(), key=lambda kv: kv[1][0] - kv[1][1])
+        return name
+
     def _compute_move_target_hint(self, start: float, end: float,
                                    move_range: str | None = None) -> str:
         """観測窓 (start, end] のHP減少・状態異常付与・まもる成功・命中失敗から、
@@ -4174,37 +4334,12 @@ class Pipeline:
                 hints.append("この技は外れた（対象に命中していない＝ダメージ・効果なし）")
                 break
         # HP減少・状態異常付与（パネル状態履歴の差分）
-        def snap(state: dict) -> dict:
-            out = {}
-            for side_key, label in (("player", "自分側"), ("opponent", "相手側")):
-                for p in state.get(side_key, []):
-                    out[(label, p.get("name"))] = (p.get("hp_pct"), p.get("status"))
-            return out
-
-        baseline: dict | None = None
-        window_states: list[dict] = []
-        for t, state in getattr(self, "_panel_state_history", []):
-            if t <= start:
-                baseline = state
-            elif t <= end:
-                window_states.append(state)
-        if baseline is not None and window_states:
-            base_map = snap(baseline)
-            drops: dict[tuple, tuple[float, float]] = {}   # key -> (基準HP, 最小HP)
-            statuses: dict[tuple, str] = {}
-            for state in window_states:
-                for key, (hp, status) in snap(state).items():
-                    base_hp, base_status = base_map.get(key, (None, None))
-                    if (hp is not None and base_hp is not None
-                            and base_hp - hp >= self._TARGET_HINT_MIN_HP_DROP):
-                        prev = drops.get(key)
-                        if prev is None or hp < prev[1]:
-                            drops[key] = (base_hp, hp)
-                    if status and status != base_status and key not in statuses:
-                        statuses[key] = status
+        drops = self._hp_drop_observations(start, end)
+        if drops is not None:
             for (label, name), (base_hp, low_hp) in drops.items():
                 hints.append(
                     f"{name}（{label}）のHPが{round(base_hp)}%→{round(low_hp)}%に減少")
+            statuses = self._status_change_observations(start, end)
             for (label, name), status in statuses.items():
                 hints.append(f"{name}（{label}）が{status}状態になった")
         if not hints:
@@ -4287,6 +4422,27 @@ class Pipeline:
                         # manifest.jsonlで実機確認できるようにする（他ヒントと同パターン）
                         ev["render_context"]["move_target_hint"] = target_hint
                     log.info("[対象ヒント] t=%.1fs %s", ev["event_time"], target_hint)
+                # タイプ相性ヒントの対象確定（2026-08-20新設）: ダブルバトル等で対象が
+                # 複数いて即断定を見送っていた場合、技の直後の観測（上と同じ手段）で
+                # 実際の対象を確定させ、候補の中から正しい1件に差し替える。対象が
+                # 確定できない/候補に無い（＝実は等倍だった）場合は誤った断定を残さず
+                # 削除する（renders/2026-08-18_22-24-52の実機検証で発覚したバグの対策。
+                # 詳細は`_latest_move_type_hint`のdocstring参照）。
+                candidates = (ev.get("battle_context") or {}).pop("_type_hint_candidates", None)
+                if candidates:
+                    actual_target = self._infer_primary_target_name(ev["event_time"], window_end)
+                    corrected = candidates.get(actual_target) if actual_target else None
+                    if corrected:
+                        ev["battle_context"]["type_hint"] = corrected
+                        if ev.get("render_context") is not None:
+                            ev["render_context"]["type_hint"] = corrected
+                        log.info("[タイプ相性ヒント対象確定] t=%.1fs %s", ev["event_time"], corrected)
+                    else:
+                        ev["battle_context"].pop("type_hint", None)
+                        if ev.get("render_context") is not None:
+                            ev["render_context"].pop("type_hint", None)
+                        log.info("[タイプ相性ヒント破棄] t=%.1fs 対象未確定のため断定を取り消し",
+                                 ev["event_time"])
             # 交代ヒント（2026-08-15）: 発火後（switch=交代選択画面・move_used=ターン冒頭）に
             # 出る繰り出しメッセージから「実際に誰が出てきたか」を逆引きして注入
             if ev["event_type"] in ("switch", "move_used"):
@@ -4452,19 +4608,31 @@ class Pipeline:
         if slot:
             slot.mega_evolved = True
 
-    def _latest_move_type_hint(self, classifier, on_field_p: list, on_field_o: list) -> str | None:
+    def _latest_move_type_hint(self, classifier, on_field_p: list, on_field_o: list
+                                ) -> tuple[str | None, dict[str, str]]:
         """直近の技ログエントリから、実際に使われた技のタイプで相性を計算する
         （2026-08-04追加: 攻撃側の持ちタイプだけでは拾えないカバー技への対応。実機で
         「メタグロスのじだんだ（じめん技）はドドゲザン（あく/はがね）にバツグンのはずが、
         メタグロス自身のタイプ（はがね/エスパー）基準のヒントしか無くLLMが誤答した」
         実例を受けて追加。取得できた場合はこちらを優先表示する）。
+
+        戻り値は (即断定してよいヒント文字列 or None, 対象候補dict[対象名, ヒント文字列])。
+        ダブルバトル等で場の相手（防御側）が2体以上いる場合、対象を見ずに「最初に
+        見つかった等倍じゃない方」を「実際に使った」と断定していたバグへの対策
+        （2026-08-20修正: renders/2026-08-18_22-24-52の実機検証で発覚——ねっぷう
+        （ほのお）がブリジュラス（はがね/ドラゴン・等倍）に当たったのに、場にいた
+        別のペリッパー（みず/ひこう・いまひとつ）が先にヒットして誤断定していた）。
+        対象が1体だけなら曖昧さが無いので即座に断定し、2体以上いる場合は断定を
+        見送って候補dictだけ返す。呼び出し側（`_generate_posthoc_commentary`）が
+        技の直後の観測（`_infer_primary_target_name`）で対象を確定させてから、
+        候補dictの中から正しい1件を選び直す。
         """
         move_log = getattr(self, "_move_log", None)
         if not move_log:
-            return None
+            return None, {}
         m = self._MOVE_LOG_ENTRY_RE.match(move_log[-1])
         if not m:
-            return None
+            return None, {}
         pokemon_name, move_name = m.group(1), m.group(2)
         # 変化技（リフレクター/おいかぜ/トリックルーム/まもる等）はダメージを与えない
         # ためタイプ相性という概念自体が無意味。判定なしで計算すると「フシギバナの
@@ -4472,7 +4640,7 @@ class Pipeline:
         # しまい、壁が弱まった/消えたと誤解釈するハルシネーションを誘発していた
         # （2026-08-07発見・renders/07-03-23-34-29_condition_check_fixの実機検証）。
         if classifier.get_move_category(move_name) == "変化":
-            return None
+            return None, {}
         move_type = classifier.get_move_type(move_name)
         # ウェザーボール: 天候下ではDBのベース値（ノーマル）ではなく実際に発動する
         # タイプに上書きする（無天候時はDB値のまま）。効果が「等倍」でタイプ相性の
@@ -4488,7 +4656,7 @@ class Pipeline:
                 move_type = resolved
                 weather_type_note = f"天候「{weather}」により{move_name}は{resolved}タイプになっている"
         if not move_type:
-            return None
+            return weather_type_note, {}
         p_names = {p.name for p in on_field_p}
         o_names = {p.name for p in on_field_o}
         if pokemon_name in p_names:
@@ -4496,16 +4664,27 @@ class Pipeline:
         elif pokemon_name in o_names:
             defenders = on_field_p
         else:
-            return weather_type_note
+            return weather_type_note, {}
+
+        candidates: dict[str, str] = {}
         for defender in defenders:
             d_types = self._effective_pokemon_types(defender, classifier)
             if not d_types:
                 continue
             label = describe_matchup(move_type, d_types)
             if label != "等倍":
-                matchup = f"（実際に使った）{pokemon_name}の{move_name}は{defender.name}に{label}"
-                return f"{weather_type_note} / {matchup}" if weather_type_note else matchup
-        return weather_type_note
+                candidates[defender.name] = (
+                    f"（実際に使った）{pokemon_name}の{move_name}は{defender.name}に{label}")
+
+        if not candidates:
+            return weather_type_note, {}
+        if len(defenders) == 1:
+            # 対象が1体のみなら曖昧さが無いので即座に断定してよい
+            matchup = next(iter(candidates.values()))
+            hint = f"{weather_type_note} / {matchup}" if weather_type_note else matchup
+            return hint, {}
+        # 対象が複数いる場合は断定せず、候補だけ返す（呼び出し側が事後観測で確定させる）
+        return weather_type_note, candidates
 
     def _latest_move_effect_hint(self, classifier) -> str | None:
         """直近の技ログエントリの効果テキストをRAGで取得する（2026-08-14新設）。
@@ -4515,6 +4694,10 @@ class Pipeline:
         累計最頻のNGパターンと判明したための対策。`_latest_move_type_hint`と同じ
         「直近の技ログ1件だけを見る」設計だが、こちらは変化技（型ヒントでは除外する
         対象）にこそ意味がある情報のため独立して評価する。
+
+        DBのeffectがNULL（PokeAPIキャッシュに日本語flavor_textが無い技）の場合、
+        `_CHARGE_MOVE_NOTES`にあれば代わりにそちらを使う（2026-08-20新設・
+        エレクトロビームの溜め技誤実況対策。詳細は`_CHARGE_MOVE_NOTES`のコメント参照）。
         """
         move_log = getattr(self, "_move_log", None)
         if not move_log:
@@ -4523,7 +4706,7 @@ class Pipeline:
         if not m:
             return None
         move_name = m.group(2)
-        effect = classifier.get_move_effect(move_name)
+        effect = classifier.get_move_effect(move_name) or _CHARGE_MOVE_NOTES.get(move_name)
         if not effect:
             return None
         return f"{move_name}: {effect}"
@@ -4586,9 +4769,13 @@ class Pipeline:
         on_field_o = [p for p in self._battle_tracker._opponent if p.on_field and not p.fainted]
         lines = _matchup_lines(on_field_p, on_field_o) + _matchup_lines(on_field_o, on_field_p)
 
-        move_hint = self._latest_move_type_hint(classifier, on_field_p, on_field_o)
+        move_hint, move_candidates = self._latest_move_type_hint(classifier, on_field_p, on_field_o)
         if move_hint:
             lines = [move_hint] + lines
+        # 対象が複数いて即断定を見送った場合の候補（2026-08-20）。呼び出し側が
+        # battle_context["_type_hint_candidates"] に積んで、事後観測で対象確定後に
+        # 正しい1件を選び直せるようにする
+        self._last_type_hint_candidates = move_candidates
 
         return " / ".join(lines[:4]) if lines else None
 
@@ -5103,6 +5290,35 @@ class Pipeline:
 
         return " / ".join(lines) if lines else None
 
+    def _refresh_condition_hint(self, battle_context: dict) -> None:
+        """`battle_context`内の天候/壁/トリックルーム/おいかぜ関連フィールドを
+        `self._battle_tracker`の現在のgame_turnで再計算し、`condition_hint`を
+        作り直す（2026-08-20新設）。
+
+        これらのフィールドは`BattleStateTracker.to_context()`呼び出し時点の
+        `game_turn`で計算されて`battle_context`に固定される。faint統合による
+        game_turn繰り上げ（気絶→交代がそのターンの終了処理より後に起きるため、
+        次のturn_startを待たずにここで繰り上げる）は`battle_context`構築の
+        *後*に発生するため、繰り上げ前の古い残りターン数がそのまま実況に
+        使われてしまっていた（renders/2026-08-18_22-24-52の実機検証で発覚:
+        ジャラランガの気絶→おいかぜ失効→ゲンガー交代の順で実ゲームは進んで
+        いたのに、交代の実況は失効前の「おいかぜあと1ターン」のままだった）。
+        game_turnを繰り上げた直後にこれを呼んで、`battle_context`をその場で
+        更新する。
+        """
+        fresh_ctx = self._battle_tracker.to_context()
+        for key in ("turn", "weather", "weather_turns_left", "weather_is_ability",
+                    "screens", "trick_room_turns_left", "tailwind"):
+            if key in fresh_ctx:
+                battle_context[key] = fresh_ctx[key]
+            else:
+                battle_context.pop(key, None)
+        refreshed = self._compute_condition_hint(battle_context)
+        if refreshed:
+            battle_context["condition_hint"] = refreshed
+        else:
+            battle_context.pop("condition_hint", None)
+
     def _track_new_faints(
         self,
         prev_fainted: tuple[set[str], set[str]],
@@ -5230,6 +5446,15 @@ class Pipeline:
             return
         if not self._battle_active:
             return
+        # 保留中のfaintがあれば先にフラッシュする（2026-08-20修正: move_singleは
+        # _process_eventを経由しない別経路のため、move_usedのような統合処理が
+        # 無く保留faintを放置していた。放置すると気絶より後のこの技実況が先に
+        # 実況されてしまう＝時系列が乱れる。実機renders/2026-08-18_22-24-52で
+        # 発覚——エルフーンの気絶が確定した直後なのに、メタグロスの技実況が
+        # 気絶実況より先に出てしまっていた）。
+        if getattr(self, "_pending_faint_state", None) is not None:
+            log.info("[faintフラッシュ] move_single検知 → 先に保留faintを送信（時系列維持）")
+            self._flush_pending_faint()
         game_state = _build_game_state(
             ocr_results, BattleState(), "move_single", BattleState(),
             self._classifier, ability_msg=getattr(self, "_last_ability_msg", {}))
@@ -5239,6 +5464,8 @@ class Pipeline:
         type_hint = self._compute_type_hint()
         if type_hint:
             battle_context["type_hint"] = type_hint
+        if getattr(self, "_last_type_hint_candidates", None):
+            battle_context["_type_hint_candidates"] = self._last_type_hint_candidates
         if getattr(self, "_classifier", None) is not None:
             move_effect_hint = self._latest_move_effect_hint(self._classifier)
             if move_effect_hint:

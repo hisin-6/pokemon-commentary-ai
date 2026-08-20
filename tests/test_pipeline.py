@@ -326,6 +326,52 @@ class TestMoveTargetHint:
     def test_no_data_returns_negative_hint(self):
         assert "観測されていない" in self._pipe()._compute_move_target_hint(10.0, 20.0)
 
+    def test_fainted_pokemon_vanishing_from_panel_detected_as_drop(self):
+        """2026-08-20バグ修正: 気絶したポケモンはHP0%表示ではなくパネルから
+        エントリごと消えるため、従来のHP差分ループでは検出できず「観測されて
+        いない」扱いになっていた（実機renders/2026-08-18_22-24-52で発覚——
+        気絶するほどの大ダメージなのに対象不明扱い）。最終的に本当に気絶して
+        いた（fainted_names）場合はHP0への低下として補完する。"""
+        pipe = self._pipe()
+        pipe._battle_tracker = BattleStateTracker()
+        pipe._battle_tracker._player.append(
+            FieldPokemon(name="メタグロス", on_field=True, fainted=True))
+        pipe._panel_state_history = [
+            (183.0, self._state(player=[("メタグロス", 8.0, None), ("コノヨザル", 100.0, None)])),
+            (191.3, self._state(player=[("コノヨザル", 100.0, None)])),  # メタグロス消滅＝気絶
+        ]
+        hint = pipe._compute_move_target_hint(186.3, 199.2)
+        assert "メタグロス（自分側）のHPが8%→0%に減少" in hint
+
+    def test_switched_out_alive_pokemon_not_treated_as_drop(self):
+        """生きたまま控えに下がった場合はfainted_namesに含まれないため、
+        気絶消滅補完の誤爆対象にならない（＝従来通り観測ゼロ扱い）。"""
+        pipe = self._pipe()
+        pipe._battle_tracker = BattleStateTracker()
+        pipe._battle_tracker._player.append(
+            FieldPokemon(name="メタグロス", on_field=False, fainted=False))  # 控えに下がっただけ
+        pipe._panel_state_history = [
+            (183.0, self._state(player=[("メタグロス", 80.0, None), ("コノヨザル", 100.0, None)])),
+            (191.3, self._state(player=[("コノヨザル", 100.0, None)])),  # 交代で消えただけ
+        ]
+        hint = pipe._compute_move_target_hint(186.3, 199.2)
+        assert "観測されていない" in hint
+
+    def test_fainted_pokemon_reappearing_later_not_treated_as_drop(self):
+        """窓の後で再登場する（＝この時点では気絶していない・別の理由で
+        一時的にパネルから外れただけ）場合は誤爆させない。"""
+        pipe = self._pipe()
+        pipe._battle_tracker = BattleStateTracker()
+        pipe._battle_tracker._player.append(
+            FieldPokemon(name="メタグロス", on_field=True, fainted=True))  # 最終的には気絶
+        pipe._panel_state_history = [
+            (183.0, self._state(player=[("メタグロス", 80.0, None), ("コノヨザル", 100.0, None)])),
+            (191.3, self._state(player=[("コノヨザル", 100.0, None)])),  # 一時的に消える
+            (250.0, self._state(player=[("メタグロス", 30.0, None)])),   # 窓の後に再登場
+        ]
+        hint = pipe._compute_move_target_hint(186.3, 199.2)
+        assert "観測されていない" in hint
+
     def test_miss_evidence(self):
         """実機2026-08-14_20-52-59の実例: オーバーヒートが外れたのに命中した体で
         誤実況していた（#7）。命中失敗メッセージから「外れた」ヒントを返す。"""
@@ -766,6 +812,14 @@ class TestGlitchCommentary:
         ) == "指示書を読みすぎちゃった"
         assert _detect_glitch_cause("**性格・口調の確認:** 元気で甘えん坊") == "指示書を読みすぎちゃった"
         assert _detect_glitch_cause("**実況時の重要ルール:**") == "指示書を読みすぎちゃった"
+
+    def test_instruction_echo_keywords_new_phrasing(self):
+        """2026-08-20発見（renders/2026-08-18_22-24-52・battle_start #1）:
+        2026-08-04対策後も「了解いたしました」（活用違い）「スタンバイ完了」等の
+        新しい言い回しでは既存キーワードに完全一致せずすり抜けた再発事故の安全網。"""
+        assert _detect_glitch_cause(
+            "了解いたしました。ポケモン対戦実況AIとしてスタンバイ完了です。"
+        ) == "指示書を読みすぎちゃった"
 
     def test_normal_commentary_not_detected(self):
         assert _detect_glitch_cause("ガブリアスのじしんが炸裂！大ダメージ！") is None
@@ -1856,6 +1910,50 @@ class TestComputeConditionHint:
         assert "ドドゲザンの素早さが1段階下がっている" in hint
 
 
+class TestRefreshConditionHint:
+    """_refresh_condition_hint: faint統合によるgame_turn繰り上げ後、battle_context
+    の残りターン数を再計算する（2026-08-20新設）。
+
+    実機renders/2026-08-18_22-24-52で発覚したバグの再発防止: おいかぜが
+    ターン6で失効するのに、ジャラランガの気絶→ゲンガー交代の実況は
+    battle_context構築時点＝繰り上げ前の「おいかぜあと1ターン」のまま
+    失効前の情報を使っていた。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._battle_tracker = BattleStateTracker()
+        self.runner._move_log = []
+
+    def test_tailwind_hint_dropped_after_turn_bump_past_duration(self):
+        tracker = self.runner._battle_tracker
+        tracker.game_turn = 3
+        tracker._tailwind_start_turn["player"] = 3  # T3使用・4ターン有効=T3〜T6
+        battle_context = tracker.to_context()
+        assert battle_context.get("tailwind", {}).get("player") == 4
+        stale_hint = self.runner._compute_condition_hint(battle_context)
+        battle_context["condition_hint"] = stale_hint
+        assert "自分側におい風（あと4ターン" in stale_hint
+
+        # T6の気絶統合でgame_turnが7へ繰り上がる（呼び出し元が繰り上げ済みの状態で
+        # _refresh_condition_hintを呼ぶ）＝おいかぜは既に失効しているはず
+        tracker.game_turn = 7
+        self.runner._refresh_condition_hint(battle_context)
+        assert "tailwind" not in battle_context
+        assert "おい風" not in (battle_context.get("condition_hint") or "")
+
+    def test_tailwind_hint_updated_to_new_remaining_turns(self):
+        tracker = self.runner._battle_tracker
+        tracker.game_turn = 3
+        tracker._tailwind_start_turn["player"] = 3
+        battle_context = tracker.to_context()
+        battle_context["condition_hint"] = self.runner._compute_condition_hint(battle_context)
+
+        tracker.game_turn = 5  # まだ有効（T3〜T6）だが残りターン数は変わる
+        self.runner._refresh_condition_hint(battle_context)
+        assert battle_context["tailwind"]["player"] == 2
+        assert "自分側におい風（あと2ターン" in battle_context["condition_hint"]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BattleMessageParser（同名ミラー戦のサイド誤帰属の回帰ガード）
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2721,6 +2819,18 @@ class TestFaintInferredDispatch:
             self.runner, [("player", "ブリジュラス")], None, {"event_type": "switch"}, {})
         self.runner._dispatch_commentary.assert_called_once()
 
+    def test_suppressed_at_default_window_for_46_7sec_gap(self):
+        """2026-08-20バグ修正: 実機renders/2026-08-18_22-24-52で46.7秒の間隔
+        （ペリッパー452.5s直接faint→battle_end499.2sの合成「両方」バンドル）でも
+        旧デフォルト（25秒）では抑制されず二重実況になっていた。デフォルト値を
+        60秒に拡大したことで、この間隔でも抑制されることを確認する。"""
+        self.runner._last_faint_event_seen_time = self.runner._video_now - 46.7
+        self.runner._FAINT_CATCHUP_SUPPRESS_SEC = 60.0  # コンストラクタのデフォルト値
+        Pipeline._dispatch_faint_inferred(
+            self.runner, [("player", "ペリッパー"), ("player", "ブリジュラス")], None,
+            {"event_type": "battle_end"}, {})
+        self.runner._dispatch_commentary.assert_not_called()
+
 
 class TestResetBattleState:
     """_reset_battle_state: battle_start／遅延起動共通のリセット処理。
@@ -3014,6 +3124,68 @@ class TestComputeTypeHint:
         assert "実際に使った" not in hint
         assert "メタグロスのはがね技はイワークにバツグン" in hint
 
+    def test_ambiguous_multi_defender_guess_withheld(self):
+        """2026-08-20バグ修正: 防御側が2体以上いる場合、対象を見ずに最初に見つかった
+        非等倍の1体を「実際に使った」と断定していたバグの再発防止。
+
+        実機renders/2026-08-18_22-24-52で発覚——ねっぷう（ほのお）がブリジュラス
+        （はがね/ドラゴン・等倍）に当たったのに、場にいた別のペリッパー
+        （みず/ひこう・いまひとつ）を「実際に使った」対象として誤断定していた。
+        対象が確定できない間は断定を見送り、候補だけ`_last_type_hint_candidates`
+        に保持して`_generate_posthoc_commentary`側の事後対象確定に委ねる。"""
+        self._add("opponent", "コータス", ["ほのお", "いわ"])
+        self._add("player", "ペリッパー", ["みず", "ひこう"])   # ほのお技はいまひとつ
+        self._add("player", "ブリジュラス", ["はがね", "ドラゴン"])  # ほのお技は等倍
+        self.runner._move_log = ["T6:コータスのねっぷう"]
+        self._move_types["ねっぷう"] = "ほのお"
+        hint = self.runner._compute_type_hint()
+        assert "実際に使った" not in (hint or "")
+        assert "ペリッパー" in self.runner._last_type_hint_candidates
+        assert "ブリジュラス" not in self.runner._last_type_hint_candidates
+
+    def test_single_defender_still_decided_immediately(self):
+        """対象が1体のみ（シングル相当）なら曖昧さが無いので従来通り即断定する
+        （ダブル対策が既存のシングル挙動を壊していないことの確認）。"""
+        self._add("opponent", "コータス", ["ほのお", "いわ"])
+        self._add("player", "ペリッパー", ["みず", "ひこう"])
+        self.runner._move_log = ["T6:コータスのねっぷう"]
+        self._move_types["ねっぷう"] = "ほのお"
+        hint = self.runner._compute_type_hint()
+        assert "（実際に使った）コータスのねっぷうはペリッパーにいまひとつ" in hint
+        assert self.runner._last_type_hint_candidates == {}
+
+
+class TestInferPrimaryTargetName:
+    """_infer_primary_target_name: type_hintの対象確定（2026-08-20新設）。
+    技直後のHP減少観測から最も減った対象を推定し、`_latest_move_type_hint`が
+    候補だけ返した場合（ダブルバトル等）に正しい候補を選び直すために使う。"""
+
+    def _pipe(self):
+        pipe = Pipeline.__new__(Pipeline)
+        pipe._panel_state_history = []
+        return pipe
+
+    @staticmethod
+    def _state(player=(), opponent=()):
+        def side(entries):
+            return [{"name": n, "hp_pct": hp, "hp_text": "", "status": st}
+                    for (n, hp, st) in entries]
+        return {"turn": 1, "player": side(player), "opponent": side(opponent),
+                "alive_player": 0, "alive_opponent": 0}
+
+    def test_picks_largest_drop_among_multiple_candidates(self):
+        """実機の実例: ねっぷうがブリジュラス(100%→64%)に当たった一方、同時に
+        場にいたペリッパーはHP変化なし→ブリジュラスを対象と正しく特定できる。"""
+        pipe = self._pipe()
+        pipe._panel_state_history = [
+            (391.7, self._state(player=[("ブリジュラス", 100.0, None), ("ペリッパー", 52.0, None)])),
+            (403.5, self._state(player=[("ブリジュラス", 64.0, None), ("ペリッパー", 52.0, None)])),
+        ]
+        assert pipe._infer_primary_target_name(396.1, 410.8) == "ブリジュラス"
+
+    def test_no_observation_returns_none(self):
+        assert self._pipe()._infer_primary_target_name(10.0, 20.0) is None
+
 
 class TestLatestMoveEffectHint:
     """_latest_move_effect_hint: 技効果ヒントRAG新設（2026-08-14）。パス1検証で
@@ -3055,6 +3227,28 @@ class TestLatestMoveEffectHint:
     def test_malformed_entry_returns_none(self):
         self.runner._move_log = ["これは形式に合わない文字列"]
         assert self.runner._latest_move_effect_hint(self.clf) is None
+
+    def test_charge_move_fallback_when_db_effect_missing(self):
+        """2026-08-20バグ修正: エレクトロビームはDBのeffectがNULL（PokeAPI
+        キャッシュに日本語flavor_textが無い）ため、従来はヒントが一切出ず、
+        1ターン目（溜め）なのに「炸裂！」と攻撃済みであるかのように誤実況して
+        いた（実機renders/2026-08-18_22-24-52）。DBが無くても_CHARGE_MOVE_NOTES
+        でフォールバックする。"""
+        self.runner._move_log = ["T4:ブリジュラスのエレクトロビーム"]
+        # self._move_effects に登録しない → get_move_effectがNoneを返す想定（DB実態と一致）
+        hint = self.runner._latest_move_effect_hint(self.clf)
+        assert hint is not None
+        assert "エレクトロビーム" in hint
+        assert "溜め技" in hint
+        assert "あめ状態" in hint
+
+    def test_db_effect_preferred_over_charge_move_fallback(self):
+        """DB側に既に効果テキストがある場合はそちらを優先し、フォールバックの
+        辞書で上書きしない（情報源の重複・食い違いを避ける）。"""
+        self.runner._move_log = ["T1:ブリジュラスのエレクトロビーム"]
+        self._move_effects["エレクトロビーム"] = "DB由来のテキスト。"
+        hint = self.runner._latest_move_effect_hint(self.clf)
+        assert hint == "エレクトロビーム: DB由来のテキスト。"
 
 
 class TestLatestMoveTargetType:
