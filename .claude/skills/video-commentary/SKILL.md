@@ -13,17 +13,28 @@
                      ・states.jsonl（戦況スナップショット）・render_info.json
 パス1.5 [Windows]  scripts/generate_gap_commentary.py
         無言区間を埋めるライブ風フィラーを生成（無言区間ごとに個別にBedrock呼び出し・
-        1試合あたり数円程度。2026-07-22〜: ネタバレ防止のため区間より未来の情報は
-        プロンプトに含めない設計に変更・区間数だけ呼び出し回数が増える）
+        2026-07-22〜: ネタバレ防止のため区間より未来の情報は
+        プロンプトに含めない設計に変更・区間数だけ呼び出し回数が増える。
+        **2026-08-21: 対象閾値を20秒→6秒に下げたため区間数が増え、費用も
+        「1試合あたり数円程度」から目安1本あたり数倍〜10円程度に増加**）
   ↓ fillers.jsonl ＋ wav/fNNNN_filler.wav
+パス1.6 [Windows]  scripts/generate_predictions.py（2026-08-21新設・任意）
+        「予測→回収」実況を生成（自分側/相手側それぞれ最大1件・最大2組。
+        場のコンディションを確立した技＝おいかぜ/壁/天候等を検出時刻とし、
+        試合最後のfaint（無ければbattle_end）で回収する。的中/外れの判定は
+        Python側が最終battle_resultから機械的に確定・LLMには演技だけさせる）
+  ↓ predictions.jsonl ＋ wav/pNNNN_prediction*.wav（対象なしなら空ファイル）
 パス2   [WSL]      scripts/render_commentary_video.py --layout biim
-        枠・字幕・戦況パネル・音声を一発合成（課金なし・何度でもやり直し可）
+        枠・字幕・戦況パネル・音声を一発合成（課金なし・何度でもやり直し可）。
+        fillers.jsonl/predictions.jsonlは両方とも「あれば自動マージ」方式
   ↓ renders/<名前>/<名前>_commentary_biim.mp4
 ```
 
 - 合成のやり直し（パス2）にBedrock/VOICEVOXは不要。レイアウト変更はパス2の再実行だけ
 - フィラーの作り直しはパス1.5の再実行だけ（約1円）。パス1のやり直しが必要なのは
   「解析自体の改善」か「states/timeline形式の変更」のときだけ
+- パス1.6（予測→回収）は任意ステップ。`predictions.jsonl`が無ければパス2は
+  何も変わらず動く（fillers.jsonlと同じ「無ければ何も起きない」自動検出方式）
 
 ## 工程の分担（どこが機械的で、どこに判断が要るか）
 
@@ -31,7 +42,8 @@
 |---|------|---------|------|
 | ① | パス1（解析＋素材） | Windows（要VOICEVOX） | **機械的**（コマンド1つ） |
 | ② | パス1.5（フィラー生成） | Windows（要VOICEVOX・EC2） | **機械的**（コマンド1つ） |
-| ③ | ネタバレ検査 | WSL | **半自動**: `check_spoilers.py`が技名先読みを自動検出（実測されたネタバレの全パターン）。＋タイムラインの目視で勝敗・気絶の先取りを確認 |
+| ②.5 | パス1.6（予測→回収・任意） | Windows（要VOICEVOX・EC2） | **機械的**（コマンド1つ・材料が無ければ0件で正常終了） |
+| ③ | ネタバレ検査 | WSL | **半自動**: `check_spoilers.py`が技名先読みを自動検出（実測されたネタバレの全パターン）。＋タイムラインの目視で勝敗・気絶の先取りを確認。predictions.jsonlも②.5実行時は③の前に生成しておき、回収文が未来情報を含んでいないか目視確認に含めること（当落判定自体はPython側の確定事実だが、③のスクリプト対応状況は実装時に要確認） |
 | ④ | パス2（合成） | WSL | **機械的**（コマンド1つ） |
 | ⑤ | 仕上げ確認 | どちらでも | **目視**: フレーム抽出2〜3枚＋通し視聴 |
 
@@ -50,6 +62,30 @@
   フィラーが合わせる設計のため。片方だけ付け忘れてkurepi口調のまま混在した実例あり
   ＝`manifest.jsonl`の実況文に「♪」等が残っていないか要確認）
 
+## 実況の口調（2026-08-21更新: 事実＋意見）
+
+「事実の説明だけの実況」から「事実＋意見」への改善（出力ルールへの追加のみ・コード
+アーキテクチャは無変更）。`kurepi_persona.OUTPUT_RULES_LINES`／`server.py`側の対応箇所に
+「驚き・期待・不安等の感情、次の一手への短い予想を一言添えてよい」というルールを追加した。
+既存の断定禁止ルール（技の対象・タイプ相性・場のコンディション等の事実に関するもの）は
+無変更で、感情・予想はそれとは別枠として明示的に許可している。試合をまたぐ長期の
+「予測→回収」演出は別パス（上記パス1.6・`scripts/generate_predictions.py`）が担当する。
+詳細な設計判断の経緯: `docs/design/prediction-payoff-commentary-idea.md`。
+
+## プロンプトのデバッグログ（2026-08-21新設）
+
+RAGヒント（`move_effect_hint`/`move_target_hint`/`condition_hint`等）が実際にLLMへ
+どう組み込まれたか確認したい時のためのオプション。**当面は付けたままでOK**（不要になったら
+外してよい）。
+
+- パス1（`pipeline.py`）: `--debug-prompts` を付けると、Phi-3ローカルフォールバックに
+  送った実際のプロンプト全文が `logs/pipeline_*.log` に出る（`src.commentary.phi3_client`
+  ロガーだけDEBUGに上げる仕組み・他モジュールのdebugログは混ざらない）
+- パス1.5・パス1本体のBedrock経路（実況の主経路）: `pipeline.py`側のフラグでは出ない。
+  EC2の`server.py`起動環境で環境変数 `DEBUG_PROMPTS=1` を設定して`sudo systemctl restart
+  pokemon-api`（EC2側のログ確認が必要。恒常化するならsystemdユニットに
+  `Environment=DEBUG_PROMPTS=1`を追加）
+
 ## 実行手順
 
 ### パス1（Windows PowerShell）
@@ -57,9 +93,10 @@
 ```
 # ⚠️ 事前に必ず VOICEVOX を起動する（忘れると素材ゼロ・Bedrock代だけ消える）
 # ⚠️ 当面 --persona neutral を付ける（上記「persona」参照）
+# ⚠️ 当面 --debug-prompts も付ける（下記「プロンプトのデバッグログ」参照）
 venv\Scripts\python.exe src/pipeline.py --input "D:\ゲーム録画\<動画>.mp4" ^
   --end-model runs/detect/train_end_screen2/weights/best.pt ^
-  --ec2-url http://<EC2のIP>:5000 --conf 0.3 --render-out renders/<動画名> --persona neutral
+  --ec2-url http://<EC2のIP>:5000 --conf 0.3 --render-out renders/<動画名> --persona neutral --debug-prompts
 ```
 
 （`--model`＝状態異常YOLO・`--ball-model`＝ボール数YOLOは2026-07-15より未指定がデフォルト。
@@ -86,6 +123,20 @@ venv\Scripts\python.exe scripts\generate_gap_commentary.py renders\<動画名> -
 ⚠️ dry-runは**ファイルに書き込まない**。「実行した」と思ってもfillers.jsonlの
 タイムスタンプが古いままなら、それはdry-runだった可能性が高い。
 ⚠️ Bedrock生成は毎回ガチャ。dry-runで見た文面と本実行の文面は別物になる。
+
+### パス1.6（予測→回収・Windows・VOICEVOX起動必須・任意・2026-08-21新設）
+
+```
+# まず --dry-run で予測・回収の文面を確認（VOICEVOX不要・predictions.jsonlは書かれない）
+venv\Scripts\python.exe scripts\generate_predictions.py renders\<動画名> --ec2-url http://<EC2のIP>:5000 --persona neutral --dry-run
+# 文面OKなら --dry-run を外して本実行
+venv\Scripts\python.exe scripts\generate_predictions.py renders\<動画名> --ec2-url http://<EC2のIP>:5000 --persona neutral
+```
+
+- 材料（場のコンディションを確立した技）が無い試合は「予測ポイントなし」で0件のまま
+  正常終了する（空の`predictions.jsonl`が書かれる）。毎回何かが生成されるとは限らない
+- `--persona`はパス1・パス1.5と同じ値にすること
+- 未実行でも`predictions.jsonl`が存在しなければパス2は従来通り動く（省略可能な機能）
 
 ### ネタバレ検査（WSL・パス2の前に必ず実行）
 
@@ -323,8 +374,10 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | `_FILLER_MAX_SHIFT_SEC` | 12 | フィラー配置の最大ずれ（大きくするとネタバレ防御が弱まる） |
 | `_DEFAULT_GAIN` | 1.4 | 実況音量。ゲーム音とのバランスは`--gain`で上書き可 |
 | server.py `_gap_filler_count` | 20秒/件・上限5 | フィラー密度（変更はEC2再デプロイ必要）。18秒/件・上限5→2026-07-30視聴fb「多い」で30秒/件・上限3に減量→「もう少し増やしたい」で25秒/件・上限4に再調整→さらに「あ、あが耳につく・フィラー減らして実況を活かしたい」で40秒/件・上限3に再々調整→**2026-08-15訂正**: 上記「あ、あ」fbは実際には言葉遣い（相槌の書き出し）への指摘で、無言埋め自体の生成頻度を絞る話ではなかったとユーザーから訂正。相槌対策は下記「書き出しバリエーション指示」で別途対応済みのため、無言埋めは20秒/件・上限5へ積極的に戻した |
-| generate_gap_commentary.py `_DEFAULT_MIN_GAP_SEC` | 20秒 | フィラー対象とする最小無言秒数（`--min-gap`で上書き可）。25秒→40秒→**2026-08-15に20秒へ再訂正**（上記と同じ理由） |
-| generate_gap_commentary.py `_INTRO_MIN_GAP_SEC`（新規） | 8秒 | 動画冒頭だけに使う特別な閾値（`compute_gaps`）。開始時挨拶を確実に入れるため、通常の`_DEFAULT_MIN_GAP_SEC`より短い基準で対象化し`is_intro: True`を付ける。server.pyの`_build_script_prompt`が`gap.get("is_intro")`を見て「最初のフィラーは視聴者への挨拶から始めること」を必須指示する（2026-08-15新設・EC2再デプロイ必要） |
+| generate_gap_commentary.py `_DEFAULT_MIN_GAP_SEC` | **6秒**（`--min-gap`で上書き可） | フィラー対象とする最小無言秒数。25秒→40秒→2026-08-15に20秒へ再訂正→**2026-08-21: 実測で動画の39%が無言（5秒以上＝ラジオの放送事故基準）と判明し6秒へ大幅引き下げ**。下記の可変フィラー長とセットで機能する |
+| generate_gap_commentary.py `_INTRO_MIN_GAP_SEC`（新規） | **3秒**（2026-08-21・旧8秒） | 動画冒頭だけに使う特別な閾値（`compute_gaps`）。開始時挨拶を確実に入れるため、通常の`_DEFAULT_MIN_GAP_SEC`より短い基準で対象化し`is_intro: True`を付ける。`_DEFAULT_MIN_GAP_SEC`を6秒へ下げたのに合わせ、冒頭はそれより更に短くした。server.pyの`_build_script_prompt`が`gap.get("is_intro")`を見て「最初のフィラーは視聴者への挨拶から始めること」を必須指示する（2026-08-15新設・EC2再デプロイ必要） |
+| server.py `_build_script_prompt`のフィラー目標文字数（新規・2026-08-21） | 無言区間の長さで可変（<10秒=15〜25文字／10〜20秒=40〜60文字／20秒以上=60〜100文字） | 従来60〜100文字（読み上げ10〜18秒）固定で、5〜19秒の無言区間（実測の最多帯）に収まらず`fit_fillers()`で破棄されていた対策。predictモード（予測→回収）は単発発火なので対象外・常に60〜100文字のまま（EC2再デプロイ必要） |
+| generate_gap_commentary.py の0件区間再試行（新規・2026-08-21） | 1回だけ再試行 | Bedrockが区間を丸ごと0件で返した場合（ガチャ外れ）、`find_empty_gaps()`で検出しその区間だけ`request_fillers()`を再実行する。無言区間の取りこぼしは実害が大きいため、二重生成のコストより取りこぼし防止を優先 |
 | プロンプトの書き出しバリエーション指示 | （新規） | 2026-07-30〜: 「あ、あ」等の相槌の書き出し連発を抑制する指示を`_build_script_prompt`（フィラー用）・`_build_vision_prompt`（実況本編用）の両方に追加済み。片方だけ直しても同じキャラ設定を共有しているためもう片方で再発するので注意 |
 
 パネル下部（y660以降）と画面右下はv2c（アバター）用に空けてある。
@@ -348,9 +401,9 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 
 ## 関連ファイル
 
-- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック/`BattleStateTracker.fainted_names`・`diff_fainted_side`）・`src/api/server.py`（`/api/script`・プロンプト）・`scripts/generate_gap_commentary.py`・`scripts/render_commentary_video.py`・`scripts/generate_thumbnail.py`（サムネイル自動生成）・`scripts/generate_chapters.py`
+- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック/`BattleStateTracker.fainted_names`・`diff_fainted_side`）・`src/api/server.py`（`/api/script`・プロンプト・`_build_script_prompt`のmode="predict"/`_build_payoff_prompt`）・`scripts/generate_gap_commentary.py`・`scripts/generate_predictions.py`（予測→回収・2026-08-21新設）・`scripts/render_commentary_video.py`（`load_predictions`）・`scripts/generate_thumbnail.py`（サムネイル自動生成）・`scripts/generate_chapters.py`
 （YouTubeチャプター自動生成）・`scripts/render_bubble_overlay.py`（プレイヤーの吹き出し・v2d）
 ・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）・`scripts/play_and_animate_avatar.py`（表情連動版wav再生・Windows・改善ロードマップ③）
-- テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_server.py`（TestScript系）・`tests/test_play_and_animate_avatar.py`・`tests/test_render_bubble_overlay.py`・`tests/test_generate_chapters.py`
+- テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_generate_predictions.py`・`tests/test_server.py`（TestScript系・TestBuildScriptPromptPredictMode・TestBuildPayoffPrompt）・`tests/test_play_and_animate_avatar.py`・`tests/test_render_bubble_overlay.py`・`tests/test_generate_chapters.py`
 - 設計: `docs/adr/ADR-009-video-first-commentary.md`・レイアウト原案 `docs/design/frame-mockups/mockup_A_biim.png`
 - 経緯・実測値: `docs/daily/2026-07-14.md`

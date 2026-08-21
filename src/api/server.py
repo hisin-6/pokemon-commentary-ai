@@ -323,6 +323,15 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
         "- 「★ピンチ」はHPが少ないことを示す表示であり、そのポケモンはまだ倒れていない"
         "（気絶した場合はfaintイベントとして別途明示される）。この表示だけを根拠に"
         "「倒れた」「落ちた」「もういない」等の気絶を意味する表現を使わないこと",
+        # 2026-08-21: 「事実の説明だけの実況」から「事実＋意見」への改善
+        # （kurepi_persona.OUTPUT_RULES_LINESと同じ文言で手動同期）。上記の断定禁止
+        # ルール群はあくまで事実（対象・タイプ相性・陣営等）に関するものであり、感情・
+        # 短期予想はその対象外であることを明示する
+        "- 出来事の説明だけで終わらせず、驚き・期待・不安等の感情や、次の一手がどうなりそうか"
+        "という短い予想を一言添えてよい（例:「これで流れが変わるかもしれない」"
+        "「次はどう出てくるだろうか」）。ただし技の対象・タイプ相性・天候や場の状態等、"
+        "上記の事実に関するルールは変わらず厳守すること（感情・予想はあくまで実況者自身の"
+        "見立てとして語り、事実であるかのように断定しないこと）",
         "",
         "【蓄積された戦況（複数ターン分の確定情報）】",
         f"ターン数: {battle_state.get('turn', '不明')}",
@@ -488,20 +497,25 @@ def _gap_filler_count(start: float, end: float) -> int:
 
 
 def _build_script_prompt(gap: dict, events: list, moments: list = None,
-                          persona: str = "kurepi") -> str:
-    """台本パス（ギャップフィラー生成）のプロンプトを組み立てる。
+                          persona: str = "kurepi", mode: str = "filler") -> str:
+    """台本パス（ギャップフィラー生成／予測）のプロンプトを組み立てる。
 
     録画解析済みの実況タイムライン・瞬間ログ（技が画面に映った動画内時刻）
-    のうち、対象の無言区間 ``gap`` の開始時刻より前のものだけを使って
+    のうち、対象の区間 ``gap`` の開始時刻より前のものだけを使って
     プロンプトを組み立てる（ADR-009 台本パス）。
 
-    ⚠️ 呼び出し元は無言区間ごとに1回呼ぶこと（1プロンプト=1区間）。
+    ⚠️ 呼び出し元は区間ごとに1回呼ぶこと（1プロンプト=1区間）。
     未来の情報を「見せた上で使うな」と指示するだけでは指示に従い損ねて
     ネタバレする実例があったため（2026-07-14）、そもそも未来の events/moments
     をプロンプトに含めない構造的対策にしている。
 
     persona: "kurepi"（デフォルト・花圓くれぴ）/"neutral"（3Dモデル一時差し替え
     検証用・2026-08-14）。
+    mode: "filler"（デフォルト・無言区間埋め）/"predict"（2026-08-21新設・
+    「予測→回収」実況の予測側。gap は候補時刻の0秒幅区間 {start: T, end: T} を
+    渡すことでフィラー1件だけ生成させる想定。events/momentsの「gap_start以前だけ
+    見せる」構造的ネタバレ対策はfillerと共通でそのまま効く。回収側は
+    _build_payoff_prompt()を使う）。
     """
     first_event_time = min(float(e.get("time", 0)) for e in events)
     gap_start = float(gap["start"])
@@ -537,9 +551,19 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None,
         "録画された試合に後から実況を吹き込みますが、視聴者には生放送の",
         "ライブ実況に聞こえるようにしてください（後から見返している・録画といった言い方は禁止）。",
         "主要イベントの実況音声はすでに収録済みです。",
-        "イベントとイベントの間の時間も、視聴者を楽しませる実況・雑談として積極的に",
-        "語ってください。「無言を埋めるための最低限の一言」ではなく、内容のあるトーク",
-        "（考察・戦況の掘り下げ・キャラとしての感想等）を心がけること。",
+        *(
+            [
+                "ここでは、ここまでの試合展開を踏まえて、この後の試合の行方について",
+                "実況者らしい短い予想を1つだけ述べてください（当たっても外れても構いません。",
+                "あくまで実況者自身の見立てとして語ること。断定はしないこと）。",
+            ]
+            if mode == "predict"
+            else [
+                "イベントとイベントの間の時間も、視聴者を楽しませる実況・雑談として積極的に",
+                "語ってください。「無言を埋めるための最低限の一言」ではなく、内容のあるトーク",
+                "（考察・戦況の掘り下げ・キャラとしての感想等）を心がけること。",
+            ]
+        ),
         "トレーナー名（画面に映る英数字のIDやハンドルネーム）が情報に含まれていても",
         "実況でそのまま呼ばないこと（動画は公開されるため個人が特定できる名前は伏せる）。"
         "相手プレイヤーを指す時は「相手」「お相手」「対戦相手」等の表現にとどめること。",
@@ -552,7 +576,7 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None,
         *[f"- {commentary}" for _situation, commentary in tone_examples],
         "",
     ]
-    if is_intro:
+    if is_intro and mode == "filler":
         if persona == "neutral":
             # 2026-08-15実機発見: neutralペルソナの「自己紹介・名乗り・キャラ付け禁止」
             # ルールと素朴に併記すると、LLMが挨拶自体まで自重してしまい弱い書き出し
@@ -585,14 +609,27 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None,
         f"- {first_event_time:.0f}秒より前の区間（試合開始前）は、ポケモン名などの具体情報を使わず、",
         "  挨拶・意気込み・観戦ポイントなどの汎用トークにすること",
         "",
-        "【フィラーの内容（バリエーションを持たせる）】",
-        "- 【最優先】直前に画面に映った技（📺印）への反応・実況。区間の開始時刻が📺と",
-        "  ほぼ同じ場合、最初のフィラーは区間開始時刻に置き、その技への反応から始めること",
-        "  （例: 📺200.0秒 ドラゴンクロー → 200.5秒 ガブリアスのドラゴンクローが炸裂！...）",
-        "- 直前の展開の振り返り・戦況の整理（HP・残り頭数）",
-        "- タイプ相性や特性をふまえた考察",
-        "- 次の展開の予想",
-        "",
+        *(
+            [
+                "【予想の内容】",
+                "- 直前までの展開（技・交代・気絶・場の状態等）を踏まえた、この後の試合の",
+                "  行方についての短い予想を1つ述べること（例:「ここでおいかぜを展開したのは"
+                "大きいかもしれない」）",
+                "- タイプ相性や特性をふまえた考察を交えてよい",
+                "",
+            ]
+            if mode == "predict"
+            else [
+                "【フィラーの内容（バリエーションを持たせる）】",
+                "- 【最優先】直前に画面に映った技（📺印）への反応・実況。区間の開始時刻が📺と",
+                "  ほぼ同じ場合、最初のフィラーは区間開始時刻に置き、その技への反応から始めること",
+                "  （例: 📺200.0秒 ドラゴンクロー → 200.5秒 ガブリアスのドラゴンクローが炸裂！...）",
+                "- 直前の展開の振り返り・戦況の整理（HP・残り頭数）",
+                "- タイプ相性や特性をふまえた考察",
+                "- 次の展開の予想",
+                "",
+            ]
+        ),
         "【書き出しのバリエーション】",
         "- 「あ、あ、」のような相槌を毎回の書き出しに使わないこと。フィラーごとに",
         "  書き出し方を変える（相槌なしで内容から直接入る・ポケモン名から入る・",
@@ -601,8 +638,21 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None,
         "【出力形式】",
         "- JSON配列のみを出力すること（前置き・説明文・コードフェンスは書かない）",
         '- 形式: [{"time": 秒数の数値, "text": "実況文"}, ...]',
-        "- text は60〜100文字程度（読み上げ約10〜18秒）",
-        "- time は必ず無言区間の範囲内の数値にすること。各フィラーは20秒以上離すこと",
+        # 2026-08-21新設: 無言区間の長さに応じてフィラーの目標文字数を可変にする
+        # （区間実測で5〜19秒の無言が最多帯と判明したのに、従来は60〜100文字固定＝
+        # 読み上げ10〜18秒だったため短い区間に収まらずfit_fillers()で破棄されていた）。
+        # predictモードは常に単発なのでこの区間長スケーリングは対象外
+        (
+            "- text は60〜100文字程度（読み上げ約10〜18秒）" if mode == "predict"
+            else "- text は15〜25文字程度（読み上げ約3〜5秒・短い間なので手短に）" if (gap_end - gap_start) < 10
+            else "- text は40〜60文字程度（読み上げ約7〜10秒）" if (gap_end - gap_start) < 20
+            else "- text は60〜100文字程度（読み上げ約10〜18秒）"
+        ),
+        (
+            f"- 要素は1件だけにすること。time は {gap_start:.1f} にすること"
+            if mode == "predict"
+            else "- time は必ず無言区間の範囲内の数値にすること。各フィラーは20秒以上離すこと"
+        ),
         "- 鉤括弧（「」）は使わない",
         "- 技の対象（誰に当たったか）がタイムラインから確定できない場合、対象ポケモン名を"
         "勝手に決め打ちしないこと（ダブルバトルでは対象情報が無いことがあるため、"
@@ -644,8 +694,63 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None,
             if parts:
                 lines.append(f"    （戦況: {'・'.join(parts)}）")
 
-    n = _gap_filler_count(gap_start, gap_end)
-    lines.append(f"- ★{gap_start:.1f}秒 〜 {gap_end:.1f}秒 = 無言区間（ここにフィラーを{n}件）")
+    if mode == "predict":
+        lines.append(f"- ★{gap_start:.1f}秒 = ここで実況者としての短い予想を1件")
+    else:
+        n = _gap_filler_count(gap_start, gap_end)
+        lines.append(f"- ★{gap_start:.1f}秒 〜 {gap_end:.1f}秒 = 無言区間（ここにフィラーを{n}件）")
+    return "\n".join(lines)
+
+
+def _build_payoff_prompt(prediction_text: str, hit: bool, outcome_summary: str,
+                          payoff_time: float, persona: str = "kurepi") -> str:
+    """「予測→回収」実況の回収側のプロンプトを組み立てる（2026-08-21新設）。
+
+    的中/外れの判定自体は呼び出し元（scripts/generate_predictions.py）が
+    最終battle_resultから機械的に確定させ、事実として渡す。LLMには演技
+    （実況者らしい反応）だけをさせ、判定自体を推測させない。
+    _build_script_prompt（predict側）と違い、events/momentsのタイムラインは
+    渡さない軽量プロンプト（回収は「さっきの予想はどうだったか」の一言だけで
+    完結するため、ネタバレ対策としての未来情報フィルタも不要）。
+    """
+    if persona == "neutral":
+        intro_lines = [
+            "あなたは、ポケモン対戦実況AIVTuberです。",
+            "テンション高めだが落ち着いた、中立的な実況口調で話してください"
+            "（キャラクターとしての自己紹介・名乗り・一人称のキャラ付けはしないこと）。",
+        ]
+    else:
+        intro_lines = [
+            "あなたは、ポケモン対戦実況AIVTuber「花圓くれぴ（はなまるくれぴ）」です。",
+            "性格は元気で甘えん坊、でもポケモン知識はガチ勢。口調はアイドル・かわいい系",
+            "（語尾に♪を適度に使う・タメ口・テンション高め・かわいい褒め言葉多め）。",
+            "自称は「くれぴ」（ひらがな）。「花圓」という漢字表記は実況文に書かないこと"
+            "（音声合成が正しく読めないため）。",
+        ]
+    result_word = "的中" if hit else "外れ"
+    lines = [
+        *intro_lines,
+        "録画された試合に後から実況を吹き込みますが、視聴者には生放送のライブ実況に"
+        "聞こえるようにしてください（後から見返している・録画といった言い方は禁止）。",
+        "",
+        "【状況】",
+        f"あなたはさっき「{prediction_text}」という予想を口にしていました。",
+        f"その後の展開: {outcome_summary}",
+        f"結果、あなたの予想は{result_word}でした（この判定は確定事実として扱うこと）。",
+        "",
+        "【指示】",
+        f"この結果を受けて、実況者らしく一言で反応してください（{result_word}であることが"
+        "伝わるように。的中なら誇らしげ/嬉しそうに、外れなら驚き・悔しさ・自虐等の中から"
+        "自然な反応を選ぶこと。さっきの予想の内容に軽く触れてよい）。",
+        "- 鉤括弧（「」）は使わない",
+        "- 「了解しました」等、指示への相槌・確認は書かない",
+        "",
+        "【出力形式】",
+        "- JSON配列のみを出力すること（前置き・説明文・コードフェンスは書かない）",
+        '- 形式: [{"time": 秒数の数値, "text": "実況文"}]（要素は1件だけ）',
+        f"- time は {payoff_time:.1f} にすること",
+        "- text は60〜100文字程度（読み上げ約10〜18秒）",
+    ]
     return "\n".join(lines)
 
 
@@ -797,25 +902,47 @@ def vision():
 @app.route("/api/script", methods=["POST"])
 def script():
     """台本パス（ADR-009）: 解析済み実況タイムラインの無言区間1つ分を埋める
-    フィラー実況をテキストのみのBedrock呼び出しで生成する。
+    フィラー実況、または「予測→回収」実況（2026-08-21新設）をテキストのみの
+    Bedrock呼び出しで生成する。
 
-    無言区間ごとに1回呼び出す契約（ネタバレ防止のため、この区間より
-    未来のevents/momentsはプロンプトに含めない構造にしている）。"""
+    無言区間・予測ポイントごとに1回呼び出す契約（ネタバレ防止のため、この
+    時点より未来のevents/momentsはプロンプトに含めない構造にしている）。
+
+    mode（既定"filler"）:
+    - "filler"/"predict": events（gap開始時刻以前だけ使われる）・gap（predictは
+      {start,end}に同じ候補時刻を渡す）が必要。_build_script_prompt を使う
+    - "payoff": prediction_text/hit/outcome_summary/time が必要（events/gap不要）。
+      _build_payoff_prompt を使う（的中/外れ判定は呼び出し元が確定済みの事実として渡す）
+    """
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"success": False, "error": "invalid_json", "message": "リクエストボディがJSONではありません"}), 400
 
-    events: list = data.get("events", [])
-    gap = data.get("gap")
-    moments: list = data.get("moments", [])
+    mode: str = data.get("mode", "filler")
     # 2026-08-14: 3Dモデル一時差し替え検証用（"kurepi"デフォルト/"neutral"）
     persona: str = data.get("persona", "kurepi")
-    if not events:
-        return jsonify({"success": False, "error": "missing_events", "message": "events が必要です"}), 400
-    if not isinstance(gap, dict) or "start" not in gap or "end" not in gap:
-        return jsonify({"success": False, "error": "missing_gap", "message": "gap（start/endを持つオブジェクト）が必要です"}), 400
 
-    prompt_text = _build_script_prompt(gap, events, moments, persona=persona)
+    if mode == "payoff":
+        prediction_text = data.get("prediction_text")
+        hit = data.get("hit")
+        outcome_summary = data.get("outcome_summary")
+        payoff_time = data.get("time")
+        if not prediction_text or hit is None or not outcome_summary or payoff_time is None:
+            return jsonify({
+                "success": False, "error": "missing_payoff_fields",
+                "message": "prediction_text/hit/outcome_summary/time が必要です",
+            }), 400
+        prompt_text = _build_payoff_prompt(
+            prediction_text, bool(hit), outcome_summary, float(payoff_time), persona=persona)
+    else:
+        events: list = data.get("events", [])
+        gap = data.get("gap")
+        moments: list = data.get("moments", [])
+        if not events:
+            return jsonify({"success": False, "error": "missing_events", "message": "events が必要です"}), 400
+        if not isinstance(gap, dict) or "start" not in gap or "end" not in gap:
+            return jsonify({"success": False, "error": "missing_gap", "message": "gap（start/endを持つオブジェクト）が必要です"}), 400
+        prompt_text = _build_script_prompt(gap, events, moments, persona=persona, mode=mode)
     request_body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 4000,

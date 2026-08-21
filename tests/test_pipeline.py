@@ -2819,17 +2819,37 @@ class TestFaintInferredDispatch:
             self.runner, [("player", "ブリジュラス")], None, {"event_type": "switch"}, {})
         self.runner._dispatch_commentary.assert_called_once()
 
-    def test_suppressed_at_default_window_for_46_7sec_gap(self):
-        """2026-08-20バグ修正: 実機renders/2026-08-18_22-24-52で46.7秒の間隔
-        （ペリッパー452.5s直接faint→battle_end499.2sの合成「両方」バンドル）でも
-        旧デフォルト（25秒）では抑制されず二重実況になっていた。デフォルト値を
-        60秒に拡大したことで、この間隔でも抑制されることを確認する。"""
+    def test_non_battle_end_suppressed_at_default_window_for_46_7sec_gap(self):
+        """2026-08-20バグ修正の名残: battle_end以外（switch/move_used等）では
+        46.7秒間隔でも引き続き抑制する（二重実況防止・実機2026-08-14_20-52-59）。
+        battle_end固有の挙動は下記test_battle_end_bypasses_suppression参照。"""
         self.runner._last_faint_event_seen_time = self.runner._video_now - 46.7
         self.runner._FAINT_CATCHUP_SUPPRESS_SEC = 60.0  # コンストラクタのデフォルト値
         Pipeline._dispatch_faint_inferred(
             self.runner, [("player", "ペリッパー"), ("player", "ブリジュラス")], None,
-            {"event_type": "battle_end"}, {})
+            {"event_type": "move_used"}, {}, "move_used")
         self.runner._dispatch_commentary.assert_not_called()
+
+    def test_battle_end_bypasses_suppression_even_within_window(self):
+        """2026-08-21修正: battle_endは抑制窓の対象外にする。
+
+        実機renders/2026-08-18_22-24-52_fixで実際に踏んだ実害: ほろびのうたで
+        ペリッパー(452.5s・直接faint)とブリジュラス(499.2s直前・メッセージ由来だが
+        faintフェーズのレアーム20秒に阻まれてイベント化されず)が数十秒差で
+        相次いで倒れ、battle_end(499.2s)時点でもまだ60秒の猶予が明けていなかった。
+        旧仕様（battle_endも一律抑制）だと一度も実況されていないブリジュラスの
+        気絶ごと丸ごと握りつぶされ、battle_end実況が直近の会話履歴頼みで
+        誤ってペリッパーの名前を再利用してしまった。battle_endはこの後もう
+        気絶を拾い直す機会が無いため、二重実況のリスクより取りこぼし防止を
+        優先し、抑制をかけない。"""
+        self.runner._last_faint_event_seen_time = self.runner._video_now - 46.7
+        self.runner._FAINT_CATCHUP_SUPPRESS_SEC = 60.0  # コンストラクタのデフォルト値
+        Pipeline._dispatch_faint_inferred(
+            self.runner, [("player", "ペリッパー"), ("player", "ブリジュラス")], None,
+            {"event_type": "battle_end"}, {}, "battle_end")
+        self.runner._dispatch_commentary.assert_called_once()
+        sent_state = self.runner._dispatch_commentary.call_args.args[2]
+        assert sent_state["faint_focus"] == "自分のペリッパーとブリジュラス"
 
 
 class TestResetBattleState:

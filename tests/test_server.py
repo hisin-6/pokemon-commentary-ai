@@ -720,7 +720,8 @@ class TestLogEndpoint:
 # /api/script（台本パス・ADR-009）
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from src.api.server import _build_script_prompt, _gap_filler_count, _parse_script_fillers
+from src.api.server import (_build_payoff_prompt, _build_script_prompt, _gap_filler_count,
+                             _parse_script_fillers)
 
 
 def _valid_script_payload(**overrides):
@@ -915,6 +916,95 @@ class TestBuildScriptPrompt:
         assert "ねこだまし＝必ずひるませる" in prompt
         assert "トリックルームパ" in prompt
 
+    def test_short_gap_requests_shorter_filler_text(self):
+        """2026-08-21新設: 10秒未満の無言区間は短いフィラー目標文字数になる
+        （実測で5〜19秒の無言が最多帯なのに従来60〜100文字固定で収まらず破棄されていた対策）。"""
+        payload = _valid_script_payload(gap={"start": 78.0, "end": 85.0})  # 7秒
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "15〜25文字程度" in prompt
+        assert "60〜100文字程度" not in prompt
+
+    def test_medium_gap_requests_medium_filler_text(self):
+        payload = _valid_script_payload(gap={"start": 78.0, "end": 93.0})  # 15秒
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "40〜60文字程度" in prompt
+
+    def test_long_gap_requests_full_length_filler_text(self):
+        payload = _valid_script_payload(gap={"start": 78.0, "end": 131.0})  # 53秒
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "60〜100文字程度" in prompt
+
+    def test_predict_mode_ignores_gap_length_scaling(self):
+        """predictは常に単発発火（0秒幅gap）なので区間長スケーリングの対象外
+        （ガードが無いと0秒幅=最短枠と誤判定され15〜25文字になってしまう）。"""
+        payload = _valid_script_payload(gap={"start": 78.0, "end": 78.0})
+        prompt = _build_script_prompt(payload["gap"], payload["events"], mode="predict")
+        assert "60〜100文字程度" in prompt
+        assert "15〜25文字程度" not in prompt
+
+
+class TestBuildScriptPromptPredictMode:
+    """予測→回収実況の予測側（mode="predict"・2026-08-21新設）。"""
+
+    def test_predict_mode_requests_single_item_at_gap_start(self):
+        payload = _valid_script_payload(gap={"start": 78.0, "end": 78.0})
+        prompt = _build_script_prompt(payload["gap"], payload["events"], mode="predict")
+        assert "★78.0秒 = ここで実況者としての短い予想を1件" in prompt
+        assert "要素は1件だけにすること。time は 78.0 にすること" in prompt
+        assert "無言区間" not in prompt
+
+    def test_predict_mode_still_hides_future_events(self):
+        """既存のネタバレ対策（gap_start以前だけ見せる）はpredictモードでもそのまま効く。"""
+        payload = _valid_script_payload(gap={"start": 78.0, "end": 78.0})
+        prompt = _build_script_prompt(payload["gap"], payload["events"], mode="predict")
+        assert "63.0秒" in prompt          # gap_start以前は見える
+        assert "133.2秒" not in prompt     # gap_startより後は見えない
+        assert "イダイトウが倒れた" not in prompt
+
+    def test_predict_mode_uses_forecast_framing_not_filler_framing(self):
+        payload = _valid_script_payload(gap={"start": 78.0, "end": 78.0})
+        prompt = _build_script_prompt(payload["gap"], payload["events"], mode="predict")
+        assert "実況者らしい短い予想を1つだけ述べてください" in prompt
+        assert "【予想の内容】" in prompt
+        assert "無言を埋めるための最低限の一言" not in prompt
+
+    def test_predict_mode_skips_intro_greeting_block(self):
+        """predictはgap_startで単発発火する想定で動画冒頭専用の挨拶指示は不要。"""
+        payload = _valid_script_payload(gap={"start": 78.0, "end": 78.0, "is_intro": True})
+        prompt = _build_script_prompt(payload["gap"], payload["events"], mode="predict")
+        assert "【最優先・動画冒頭の挨拶】" not in prompt
+
+
+class TestBuildPayoffPrompt:
+    """予測→回収実況の回収側（_build_payoff_prompt・2026-08-21新設）。"""
+
+    def test_hit_states_correct_result(self):
+        prompt = _build_payoff_prompt(
+            "これでおいかぜを活かして押し切るかもしれない", hit=True,
+            outcome_summary="おいかぜの効果もありペリッパーが最後まで押し切った",
+            payoff_time=499.2)
+        assert "結果、あなたの予想は的中でした" in prompt
+        assert "誇らしげ" in prompt
+        assert "これでおいかぜを活かして押し切るかもしれない" in prompt
+
+    def test_miss_states_incorrect_result(self):
+        prompt = _build_payoff_prompt(
+            "これで押し切れそう", hit=False,
+            outcome_summary="ブリジュラスが最後に倒れて逆転負けした",
+            payoff_time=499.2)
+        assert "結果、あなたの予想は外れでした" in prompt
+
+    def test_output_format_single_item_at_payoff_time(self):
+        prompt = _build_payoff_prompt("予想", hit=True, outcome_summary="結果", payoff_time=123.4)
+        assert "time は 123.4 にすること" in prompt
+        assert "要素は1件だけ" in prompt
+
+    def test_persona_neutral_excludes_kurepi(self):
+        prompt = _build_payoff_prompt("予想", hit=True, outcome_summary="結果",
+                                       payoff_time=123.4, persona="neutral")
+        assert "くれぴ" not in prompt
+        assert "花圓" not in prompt
+
 
 class TestGapFillerCount:
 
@@ -1045,3 +1135,76 @@ class TestScriptEndpoint:
             resp = client.post("/api/script", json=_valid_script_payload())
         assert resp.status_code == 502
         assert resp.get_json()["error"] == "bedrock_parse_error"
+
+    def test_predict_mode_successful_call(self, client):
+        """mode="predict"はfillerと同じ応答パイプライン（_parse_script_fillers）を通る。"""
+        mock_response_body = {
+            "content": [{"text": '[{"time": 78.0, "text": "これで流れが変わるかもしれない"}]'}],
+            "usage": {"input_tokens": 500, "output_tokens": 80},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(
+                read=MagicMock(return_value=json.dumps(mock_response_body).encode())
+            )
+        }
+        with patch.object(server_module.bedrock_script, "invoke_model",
+                           return_value=mock_bedrock_response) as mock_invoke:
+            resp = client.post("/api/script", json=_valid_script_payload(
+                mode="predict", gap={"start": 78.0, "end": 78.0}))
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["fillers"] == [{"time": 78.0, "text": "これで流れが変わるかもしれない"}]
+        sent_body = json.loads(mock_invoke.call_args.kwargs["body"])
+        prompt_text = sent_body["messages"][0]["content"][0]["text"]
+        assert "★78.0秒 = ここで実況者としての短い予想を1件" in prompt_text
+
+    def _payoff_payload(self, **overrides):
+        payload = {
+            "mode": "payoff",
+            "prediction_text": "これでおいかぜを活かして押し切るかもしれない",
+            "hit": True,
+            "outcome_summary": "ペリッパーが最後まで押し切った",
+            "time": 499.2,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_payoff_missing_fields_returns_400(self, client):
+        resp = client.post("/api/script", json=self._payoff_payload(prediction_text=None))
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == "missing_payoff_fields"
+
+    def test_payoff_successful_call(self, client):
+        mock_response_body = {
+            "content": [{"text": '[{"time": 499.2, "text": "やったー、予想通り押し切ったね！"}]'}],
+            "usage": {"input_tokens": 200, "output_tokens": 40},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(
+                read=MagicMock(return_value=json.dumps(mock_response_body).encode())
+            )
+        }
+        with patch.object(server_module.bedrock_script, "invoke_model",
+                           return_value=mock_bedrock_response) as mock_invoke:
+            resp = client.post("/api/script", json=self._payoff_payload())
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["fillers"] == [{"time": 499.2, "text": "やったー、予想通り押し切ったね！"}]
+        sent_body = json.loads(mock_invoke.call_args.kwargs["body"])
+        prompt_text = sent_body["messages"][0]["content"][0]["text"]
+        assert "結果、あなたの予想は的中でした" in prompt_text
+
+    def test_payoff_does_not_require_events_or_gap(self, client):
+        """payoffモードはevents/gapが無くても400にならないこと。"""
+        mock_response_body = {
+            "content": [{"text": '[{"time": 499.2, "text": "反応"}]'}],
+            "usage": {},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(
+                read=MagicMock(return_value=json.dumps(mock_response_body).encode())
+            )
+        }
+        with patch.object(server_module.bedrock_script, "invoke_model", return_value=mock_bedrock_response):
+            resp = client.post("/api/script", json=self._payoff_payload())
+        assert resp.status_code == 200

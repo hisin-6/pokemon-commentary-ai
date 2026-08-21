@@ -163,6 +163,29 @@ class TestLoadFillers:
         assert [f["event_time"] for f in fillers] == [50.0, 100.0]
 
 
+def _prediction(event_time, duration=6.0, commentary="予測",
+                event_type="prediction", seq=1):
+    return {"seq": seq, "event_time": event_time, "event_type": event_type,
+            "commentary": commentary, "wav": f"wav/p{seq:04d}_{event_type}.wav",
+            "duration": duration}
+
+
+class TestLoadPredictions:
+    """predictions.jsonl読み込み（2026-08-21新設・fillers.jsonlと同スキーマ）。"""
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert rcv.load_predictions(tmp_path) == []
+
+    def test_sorted_by_event_time(self, tmp_path):
+        lines = [json.dumps(_prediction(400.0, seq=2, event_type="prediction_payoff"),
+                            ensure_ascii=False),
+                 json.dumps(_prediction(100.0, seq=1), ensure_ascii=False)]
+        (tmp_path / "predictions.jsonl").write_text("\n".join(lines) + "\n",
+                                                     encoding="utf-8")
+        predictions = rcv.load_predictions(tmp_path)
+        assert [p["event_time"] for p in predictions] == [100.0, 400.0]
+
+
 class TestResolveVideoPath:
     def test_windows_drive_path_converted_to_wsl(self, tmp_path, monkeypatch):
         """存在しないWindowsパスは /mnt/<drive>/ 形式に変換して探す。"""

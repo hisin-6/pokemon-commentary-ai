@@ -130,6 +130,27 @@ def load_fillers(render_dir: Path) -> list:
     return entries
 
 
+def load_predictions(render_dir: Path) -> list:
+    """predictions.jsonl（予測→回収パスの出力・任意・2026-08-21新設）を読み込む。
+
+    fillers.jsonlと完全に同じスキーマ（scripts/generate_predictions.py参照）なので
+    無ければ空リスト。呼び出し側でfillersと合流させ、fit_fillers()を1回だけ
+    呼んで衝突回避（イベント実況を動かさない・フィラー同士も重ならない）を
+    fillers/predictions両方に統一して効かせる想定。
+    """
+    predictions_path = render_dir / "predictions.jsonl"
+    if not predictions_path.exists():
+        return []
+    entries = []
+    with predictions_path.open(encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    entries.sort(key=lambda e: e["event_time"])
+    return entries
+
+
 def fit_fillers(scheduled: list, fillers: list, gap: float = _DEFAULT_GAP_SEC,
                 max_shift: float = _FILLER_MAX_SHIFT_SEC) -> tuple:
     """イベント実況を動かさずに、フィラーを空き区間へ収まる分だけ配置する。
@@ -770,17 +791,22 @@ def main(argv=None) -> int:
     logger.info("実況 %d件 → デデュープ後 %d件 → スケジュール確定 %d件（遅延超過破棄 %d件）",
                 len(entries), len(kept), len(scheduled), len(dropped))
 
-    # 台本パスのフィラー（あれば）を空き区間へ配置（イベント実況が優先）
+    # 台本パスのフィラー・予測→回収（あれば）を空き区間へ配置（イベント実況が優先）。
+    # 両者は同一スキーマ（scripts/generate_predictions.py参照）なので合流させて
+    # fit_fillers()を1回だけ呼び、衝突回避（フィラー同士も重ならない）を統一する
     fillers = load_fillers(render_dir)
+    predictions = load_predictions(render_dir)
+    all_fillers = fillers + predictions
     placed_fillers = []
     fillers_dropped = []
-    if fillers:
-        fillers_kept, fillers_deduped = dedupe_entries(fillers)
+    if all_fillers:
+        fillers_kept, fillers_deduped = dedupe_entries(all_fillers)
         deduped = deduped + fillers_deduped
         placed_fillers, fillers_dropped = fit_fillers(scheduled, fillers_kept,
                                                       gap=args.gap)
-        logger.info("フィラー %d件 → 配置 %d件（収まらず破棄 %d件）",
-                    len(fillers), len(placed_fillers), len(fillers_dropped))
+        logger.info("フィラー+予測 %d件（フィラー%d件・予測%d件） → 配置 %d件（収まらず破棄 %d件）",
+                    len(all_fillers), len(fillers), len(predictions),
+                    len(placed_fillers), len(fillers_dropped))
 
     final_schedule = sorted(scheduled + placed_fillers, key=lambda e: e["start"])
     _print_schedule(final_schedule, deduped, dropped + fillers_dropped)

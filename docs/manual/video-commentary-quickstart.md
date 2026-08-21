@@ -10,10 +10,15 @@
 **先にVOICEVOXを起動する**（忘れると素材ゼロでBedrock代だけ消える）。
 
 ```powershell
-venv\Scripts\python.exe src/pipeline.py --input "D:\ゲーム録画\<録画ファイル名>.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --ec2-url http://<EC2のIP>:5000 --conf 0.3 --render-out renders/<動画名>
+venv\Scripts\python.exe src/pipeline.py --input "D:\ゲーム録画\<録画ファイル名>.mp4" --end-model runs/detect/train_end_screen2/weights/best.pt --ec2-url http://<EC2のIP>:5000 --conf 0.3 --render-out renders/<動画名> --debug-prompts
 ```
 
 ✅ ログ末尾が `[レンダ] 素材出力完了: N 件`（N≧5くらい）ならOK。0件ならVOICEVOX未起動。
+
+※ `--debug-prompts` は LLM に実際に送ったプロンプト全文を `logs/pipeline_*.log` に出す
+デバッグ用オプション（2026-08-21新設・当面は付けたままでOK）。Phi-3ローカルフォールバック分
+のみカバーし、実況の主経路であるBedrock（EC2側）のプロンプトはこのフラグでは出ない。
+EC2側で見たい場合はサーバー起動環境の環境変数 `DEBUG_PROMPTS=1` を別途設定すること。
 
 ## ② パス1.5: フィラー生成（Windows・VOICEVOXそのまま）
 

@@ -3876,7 +3876,8 @@ class Pipeline:
         # 現行イベントの実況より先にディスパッチし、時系列順（気絶→現行イベント）を保つ
         if inferred_faints:
             self._announced_faints.update(name for _side, name in inferred_faints)
-            self._dispatch_faint_inferred(inferred_faints, frame, game_state, battle_context)
+            self._dispatch_faint_inferred(inferred_faints, frame, game_state, battle_context,
+                                           event_type)
 
         # ── Bedrock Vision（バトル中のみ・対象イベントのみ・EC2 URL が設定されている場合）──
         # _battle_active = False の間（選出画面等）は Bedrock を呼ばない
@@ -5369,6 +5370,7 @@ class Pipeline:
         frame: "np.ndarray | None",
         game_state: dict,
         battle_context: dict,
+        event_type: str = "",
     ) -> None:
         """faintイベントを経ずに気絶が確定した瞬間に、単独のfaint実況イベントを合成する。
 
@@ -5399,7 +5401,17 @@ class Pipeline:
         # 2026-08-14_20-52-59・詳細は_process_event内のコメント参照）。
         # 側の特定まではできないため全体を対象に抑制する（同時多発的な気絶は
         # 元々この関数がまとめて1メッセージに合成するため実害は小さい）。
-        if (self._now() - getattr(self, "_last_faint_event_seen_time", float("-inf"))
+        #
+        # ⚠️battle_endは例外（2026-08-21新設）: このイベントの後にはもう
+        # 気絶を拾い直す機会が無い。ほろびのうた等でペリッパー・ブリジュラスの
+        # ように複数体が数十秒以内に相次いで倒れると、先に倒れた側の本物のfaint
+        # イベントがこの60秒窓を塞いだままbattle_endを迎え、まだ一度も実況して
+        # いない後発の気絶（ブリジュラス）まで巻き込んで丸ごと握りつぶされていた
+        # （実機renders/2026-08-18_22-24-52_fix・battle_endの実況が誤ってペリッパー
+        # の名前を再利用する形で発覚）。battle_endでは二重実況より取りこぼしの
+        # 方が実害が大きいため、ここだけは抑制をかけない。
+        if (event_type != "battle_end"
+                and self._now() - getattr(self, "_last_faint_event_seen_time", float("-inf"))
                 < getattr(self, "_FAINT_CATCHUP_SUPPRESS_SEC", 25.0)):
             log.info("[faint合成抑制] 直近の通常faintイベントと近接のため合成実況を抑制（二重実況防止）: %s",
                       names)

@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 logger = logging.getLogger(__name__)
 
 # この秒数を超える無言区間をフィラーの対象にする
-_DEFAULT_MIN_GAP_SEC = 20.0  # 2026-07-30視聴fb「フィラーが多い」で20→30秒に引き上げ→
+_DEFAULT_MIN_GAP_SEC = 6.0   # 2026-07-30視聴fb「フィラーが多い」で20→30秒に引き上げ→
                              # 「もう少し増やしたい」で25秒に再調整→さらに視聴fb
                              # 「あ、あ、が耳につく・フィラーを減らして実況を活かしたい」で
                              # 40秒に再々調整。**2026-08-15訂正**: 上記「あ、あ、」fbは
@@ -47,10 +47,15 @@ _DEFAULT_MIN_GAP_SEC = 20.0  # 2026-07-30視聴fb「フィラーが多い」で2
                              # 自体の生成頻度を絞る話ではなかったとユーザーから訂正あり。
                              # 相槌対策は別途「書き出しのバリエーション」指示
                              # （下記_build_script_prompt）で対応済みのため、無言埋めは
-                             # 20秒へ積極的に戻す
+                             # 20秒へ積極的に戻す。**2026-08-21再調整**: 実測で動画の39%が
+                             # 無言（ラジオでは5秒以上＝放送事故基準）と判明し、20秒未満
+                             # （実測で最多帯）を取りこぼしていたため6秒へ大幅引き下げ。
+                             # 短い区間向けにフィラーの目標文字数を可変にする対策
+                             # （_build_script_prompt側）とセットで機能する
 # 冒頭（動画開始〜最初のイベント実況）は開始時挨拶を確実に入れたいため、
-# 通常のmin_gapより短い閾値で対象化する（2026-08-15新設）
-_INTRO_MIN_GAP_SEC = 8.0
+# 通常のmin_gapより短い閾値で対象化する（2026-08-15新設）。2026-08-21: 通常閾値を
+# 6秒へ下げたのに合わせ、冒頭はそれより更に短い区間でも対象にする関係を維持する
+_INTRO_MIN_GAP_SEC = 3.0
 # ギャップ端の余白（イベント実況の直前直後にフィラーを密着させない）
 _GAP_MARGIN_SEC = 2.0
 
@@ -87,6 +92,15 @@ def compute_gaps(scheduled: list, video_duration: float = 0.0,
         if gap_end - gap_start >= min_gap:
             gaps.append({"start": round(gap_start, 1), "end": round(gap_end, 1)})
     return gaps
+
+
+def find_empty_gaps(gaps: list, fillers: list) -> list:
+    """フィラーが1件も配置されなかった区間を返す（2026-08-21新設）。
+
+    Bedrockのガチャ外れで区間ごと0件になるケースの再試行対象を特定するために使う。
+    """
+    covered = {f["time"] for f in fillers}
+    return [g for g in gaps if not any(g["start"] <= t <= g["end"] for t in covered)]
 
 
 def clamp_fillers_to_gaps(fillers: list, gaps: list) -> tuple:
@@ -279,6 +293,18 @@ def main(argv=None) -> int:
     # Bedrockでフィラー生成（テキストのみ1回）→ ギャップ範囲へクランプ
     raw_fillers = request_fillers(args.ec2_url, kept, gaps, moments, persona=args.persona)
     fillers, dropped = clamp_fillers_to_gaps(raw_fillers, gaps)
+
+    # 2026-08-21新設: 0件だった区間（Bedrockのガチャ外れ）を1回だけ再試行する。
+    # 無言区間の取りこぼしはそのまま「放送事故」になるため、二重生成のコストより
+    # 取りこぼし防止を優先する（predictions.jsonlのbattle_end例外と同じ考え方）
+    empty_gaps = find_empty_gaps(gaps, fillers)
+    if empty_gaps:
+        logger.info("0件だった区間 %d箇所を再試行", len(empty_gaps))
+        retry_raw = request_fillers(args.ec2_url, kept, empty_gaps, moments, persona=args.persona)
+        retry_fillers, retry_dropped = clamp_fillers_to_gaps(retry_raw, empty_gaps)
+        fillers = sorted(fillers + retry_fillers, key=lambda f: f["time"])
+        dropped = dropped + retry_dropped
+
     for f in dropped:
         logger.warning("ギャップ範囲外のため破棄: t=%.1fs %s", f["time"], f["text"][:30])
     for f in fillers:

@@ -142,6 +142,31 @@ class TestClampFillersToGaps:
         assert [f["text"] for f in kept] == ["先", "後"]
 
 
+class TestFindEmptyGaps:
+    """フィラーが1件も配置されなかった区間の検出（2026-08-21新設・再試行対象の特定用）。"""
+
+    _gaps = [{"start": 0.0, "end": 61.0}, {"start": 78.0, "end": 131.0},
+             {"start": 150.0, "end": 200.0}]
+
+    def test_gap_with_no_filler_is_empty(self):
+        fillers = [{"time": 30.0, "text": "A"}, {"time": 90.0, "text": "B"}]
+        empty = ggc.find_empty_gaps(self._gaps, fillers)
+        assert empty == [{"start": 150.0, "end": 200.0}]
+
+    def test_all_gaps_covered_returns_empty_list(self):
+        fillers = [{"time": 30.0, "text": "A"}, {"time": 90.0, "text": "B"},
+                   {"time": 160.0, "text": "C"}]
+        assert ggc.find_empty_gaps(self._gaps, fillers) == []
+
+    def test_no_fillers_at_all_returns_all_gaps(self):
+        assert ggc.find_empty_gaps(self._gaps, []) == self._gaps
+
+    def test_filler_at_gap_boundary_counts_as_covered(self):
+        fillers = [{"time": 61.0, "text": "端"}]
+        empty = ggc.find_empty_gaps([{"start": 0.0, "end": 61.0}], fillers)
+        assert empty == []
+
+
 class TestRequestFillers:
     """gapごとに1回ずつ /api/script を呼び、結果を集約する（2026-07-22・ネタバレ抑制の根本強化）。"""
 
