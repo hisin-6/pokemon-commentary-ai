@@ -81,7 +81,6 @@ _IDLE_POSE_BONES = ["LeftUpperArm", "RightUpperArm"]
 # event_type → ブレンドシェイプ名（context依存が無いもの）
 _EVENT_EXPRESSION = {
     "battle_start": "Fun",
-    "filler": None,      # 中立のまま（雑談なので実況内容と紐付いた反応はさせない）
 }
 
 # faint_side → 表情（自分が倒れたら哀しい／相手を倒したら嬉しい）
@@ -101,16 +100,27 @@ _BATTLE_RESULT_EXPRESSION = {
 # 推定するシンプルな方式（_GLITCH_CAUSE_KEYWORDS等、このプロジェクトで既に
 # 実績のあるキーワード分類パターンを踏襲）。くれぴのキャラ性質上テキストは
 # 常にポジティブ寄りなので、"心配・苦戦"系の言葉だけを別枠で拾う設計。
+# 2026-08-22: `--persona neutral`運用（2026-08-15〜）でテンション高めの言い回し
+# （「キマってほしいっ！」等）が「決まってほしいところです」のような控えめな
+# 言い回しに変わり、過去形固定の"決まった"等がヒットしなくなっていたため、
+# neutral実例（kurepi_persona.NEUTRAL_TONE_EXAMPLES）に合わせて語幹マッチに
+# 緩めたキーワード（"決まっ"）とneutralで出やすい言葉（チャンス・有利・順調／
+# 劣勢・手痛い・苦しい）を追加。
 _POSITIVE_KEYWORDS = (
-    "バツグン", "急所", "決まった", "炸裂", "やったぁ", "素晴らしい",
-    "ナイス", "無傷", "きっちり", "頑張れ", "いいぞ",
+    "バツグン", "急所", "決まっ", "炸裂", "やったぁ", "素晴らしい",
+    "ナイス", "無傷", "きっちり", "頑張れ", "いいぞ", "チャンス", "有利", "順調",
 )
 _NEGATIVE_KEYWORDS = (
     "ピンチ", "削られ", "いまひとつ", "外れ", "厳しい", "危ない",
-    "食らって", "くらって", "苦戦",
+    "食らって", "くらって", "苦戦", "劣勢", "手痛い", "苦しい",
 )
-# 感情反応を付けるイベント種別（move_used=無印/faint統合先を含む・move_single=技単独反応）
-_SENTIMENT_EVENT_TYPES = {"move_used", "move_single", "switch"}
+# 感情反応を付けるイベント種別（move_used=無印/faint統合先を含む・move_single=技単独反応）。
+# 2026-08-22: fillerも対象に追加（従来は「雑談なので実況内容と紐付いた反応はさせない」
+# 方針で明示的に無反応=Noneだったが、2026-08-21の対象閾値引き下げでフィラーが
+# 発話時間の相当割合を占めるようになり、そこが無反応のままだとポーズの体感頻度が
+# 大きく下がる問題が発生したため方針変更。フィラーの内容も他のイベントと同じ
+# キーワード判定に委ねる）
+_SENTIMENT_EVENT_TYPES = {"move_used", "move_single", "switch", "filler"}
 
 
 def _sentiment_expression(commentary: str) -> str | None:
@@ -138,10 +148,12 @@ def expression_for(event_type: str, context: dict, commentary: str = "") -> str 
     にも乗ってくるため、event_typeを問わずcontextを先に見る（pipeline.py側の
     faint統合バグ修正とセット・詳細はpipeline.pyの該当コメント参照）。
 
-    上記どちらにも該当しない move_used/move_single/switch は、実況テキストの
+    上記どちらにも該当しない move_used/move_single/switch/filler は、実況テキストの
     キーワードから_sentiment_expressionで表情を推定する（技1つ1つに反応させる・
-    2026-08-01改善ロードマップ③続き）。battle_start/filler等は_EVENT_EXPRESSION
-    の明示的な値（Noneも含む）を優先し、テキスト連動の対象にしない。
+    2026-08-01改善ロードマップ③続き。fillerは2026-08-22追加＝雑談扱いで無反応
+    だった従来方針から、キーワード判定に委ねる方針へ変更）。battle_start等
+    _EVENT_EXPRESSIONに明示的な値がある種別はそちらを優先し、テキスト連動の
+    対象にしない。
     """
     if "faint_side" in context:
         side = context.get("faint_side")
@@ -273,9 +285,12 @@ def _pose_for(expression: str, variant: str = "default") -> str | None:
         return None
     return variants.get(variant, variants["default"])
 
-# ポーズ遷移1回あたりの秒数（遷移in→保持→遷移outの3段）
+# ポーズ遷移1回あたりの秒数（遷移in→保持→遷移outの3段。合計は遷移×2+保持）。
+# 2026-08-22: 実機fb「ポーズを取っている時間が短い」を受けて0.6秒→2.0秒に延長
+# （合計1.5秒→2.9秒）。次のイベントとの間隔が短いと重なって見えることがあるので、
+# 詰まって見える場合は_EXPRESSION_HOLD_SEC（表情自体の保持秒数）とのバランスも見直すこと。
 _POSE_TRANSITION_SEC = 0.45
-_POSE_HOLD_SEC = 0.6
+_POSE_HOLD_SEC = 2.0
 
 # ポーズ再生中、そのポーズが使うボーンを常時スウェイ/ランダム仕草から
 # 一時的に除外するための共有集合。マルチスレッドで軽く読み書きするが、

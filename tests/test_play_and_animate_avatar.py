@@ -32,13 +32,16 @@ class TestExpressionFor:
     def test_move_used_with_no_commentary_is_none(self):
         assert paa.expression_for("move_used", {}) is None
 
-    def test_filler_is_neutral_none(self):
+    def test_filler_with_no_commentary_is_none(self):
+        """キーワードにヒットしなければfillerも表情変更なし。"""
         assert paa.expression_for("filler", {}) is None
 
-    def test_filler_ignores_commentary_sentiment(self):
-        """fillerは雑談なので、テキストにポジティブワードがあっても反応しない
-        （_EVENT_EXPRESSIONの明示的なNoneを_SENTIMENT_EVENT_TYPESより優先）。"""
-        assert paa.expression_for("filler", {}, "バツグンだ！決まった！") is None
+    def test_filler_reacts_to_commentary_sentiment(self):
+        """2026-08-22〜: fillerも他イベントと同じくキーワード判定で反応する
+        （閾値引き下げでフィラーが発話時間の大半を占めるようになり、従来の
+        「雑談なので無反応」方針だとポーズの体感頻度が下がりすぎるため変更）。"""
+        assert paa.expression_for("filler", {}, "バツグンだ！決まった！") == "Fun"
+        assert paa.expression_for("filler", {}, "うわ、ピンチかも…削られちゃった") == "Sorrow"
 
     def test_battle_start_ignores_commentary_sentiment(self):
         """battle_startは_EVENT_EXPRESSIONの明示値"Fun"を常に優先する。"""

@@ -15,9 +15,9 @@
 （TestBuildScriptPromptPredictMode・TestBuildPayoffPrompt）・
 `tests/test_render_video.py`（TestLoadPredictions）。
 
-⚠️ EC2側`server.py`の変更はWinSCPデプロイ・`systemctl restart pokemon-api`が
-別途必要（実装時点では未デプロイ）。実際の動画でのpredictions.jsonl生成・
-パス2合成・目視検証はこれから（次回セッション以降）。
+✅EC2デプロイ・git commitともユーザーが2026-08-21同日中に完了。実際の動画での
+predictions.jsonl生成・パス2合成・目視検証は次回の新規録画時にまとめて実施予定
+（過去録画の再実行はしない方針）。
 
 ## 動機
 
@@ -85,6 +85,6 @@ predictions.jsonl として保存 → パス2合成時にfillers/bubblesと同�
 
 ## ステータス
 
-**実装済み**（2026-08-21）。コードはマージ済み・テストも全パス。残タスク:
-EC2デプロイ・実際の動画でのdry-run/本実行検証・SKILL.mdの「パス1.6」手順の
-実機確認（未実施）。
+**実装済み・デプロイ済み**（2026-08-21）。コードはマージ済み・テストも全パス・
+git commit＆EC2デプロイ完了。残タスク: 実際の動画でのdry-run/本実行検証・
+SKILL.mdの「パス1.6」手順の実機確認（次回新規録画時に実施予定）。
