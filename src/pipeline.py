@@ -4518,12 +4518,27 @@ class Pipeline:
                     if ev.get("render_context") is not None:
                         ev["render_context"]["switch_focus"] = switch_focus
                     log.info("[交代ヒント] t=%.1fs %s", ev["event_time"], switch_focus)
-            # faint二重報告ヒント（2026-08-24新設）: この気絶の対象が、既に
+            # faint二重報告ヒント（2026-08-24新設、2026-08-27拡張）: この気絶の対象が、既に
             # move_singleのHP観測で「落ちました」等を先に語っている名前と一致する
-            # 場合、正式なfaintイベント側に「新情報ではない」ことを明示する。
+            # 場合、そのイベント側に「新情報ではない」ことを明示する。
             # 控え欄の「(ひんし)」表記から対象名を拾う（faintイベント自体は
             # 対象名を構造化データとして持たないため、既存の文字列表現を利用）。
-            if ev["event_type"] == "faint" and already_narrated_deaths:
+            #
+            # 2026-08-27拡張（renders/2026-08-26_21-35-16の実機検証で発覚した2件の穴）:
+            # 1. move_usedにもヒントを付与する。従来はfaintイベントのみが対象で、
+            #    move_used側のmove_log/控え欄に残る古い気絶情報をLLMがそのまま
+            #    現在形で語ってしまう抜け道が塞がれていなかった（実例:
+            #    リザードンの気絶を#12/#14で報告済みなのに、350.8sのmove_usedで
+            #    「リザードン、ここで落ちてしまった！」と3回目の初耳実況）。
+            # 2. faintイベントでヒントを付けてもLLMが従わず、108秒後・1.5秒後の
+            #    2回連続で「たった今」「大きなアドバンテージ」等の驚き口調で
+            #    再報告した実例が確認された（同レンダーの#12/#14）。ソフトな指示
+            #    だけでは不十分と判断し、faintイベントについては現在ベンチにいる
+            #    気絶済みポケモン全員が既報告（＝このfaintイベントに新情報が一切
+            #    無い）場合は、ヒントに頼らずBedrock呼び出し自体をスキップして
+            #    再蒸し返しを構造的に防ぐ。一部だけ既報告（新規の気絶が混在）の
+            #    場合は従来どおりヒント付与に留める。
+            if ev["event_type"] in ("faint", "move_used") and already_narrated_deaths:
                 bench_text = " / ".join([
                     (ev.get("battle_context") or {}).get("player_bench", ""),
                     (ev.get("battle_context") or {}).get("opponent_bench", ""),
@@ -4531,11 +4546,18 @@ class Pipeline:
                 fainted_on_bench = set(re.findall(r'([^\s/]+)\(ひんし\)', bench_text))
                 repeat_names = fainted_on_bench & already_narrated_deaths
                 if repeat_names:
+                    if (ev["event_type"] == "faint"
+                            and fainted_on_bench and repeat_names == fainted_on_bench):
+                        # 現在ベンチの気絶済みポケモン全員が既に報告済み＝このfaint
+                        # イベントは新情報ゼロ。生成自体をスキップして再蒸し返しを防ぐ。
+                        log.info("[faint重複スキップ] t=%.1fs %s は全員報告済みのため実況生成をスキップ",
+                                 ev["event_time"], repeat_names)
+                        continue
                     hint = (
                         "、".join(sorted(repeat_names))
-                        + "の気絶は、直前のmove_single実況で既に伝えている"
-                        "（HP観測で気絶をいち早く検出できたため）。今のfaintイベントは"
-                        "画面上の正式な気絶表示（OCR）が遅れて確定しただけで、新情報ではない。"
+                        + "の気絶は、既に別のイベントで伝えている"
+                        "（HP観測や正式な気絶表示が先に伝わっているため）。今のイベントで"
+                        "画面上に表示が残っている・技ログに古い情報が残っているだけで、新情報ではない。"
                         "「たった今起きた」「これは大きなアドバンテージ」のような驚き・速報"
                         "口調で再度報告し直さないこと。触れる場合は一言の確認・整理に留めるか、"
                         "この後の展開（残り数・次の一手の見通し等）に焦点を移すこと"
@@ -4544,7 +4566,7 @@ class Pipeline:
                     ev["game_state"]["faint_repeat_hint"] = hint
                     if ev.get("render_context") is not None:
                         ev["render_context"]["faint_repeat_hint"] = hint
-                    log.info("[faint重複ヒント] t=%.1fs %s", ev["event_time"], repeat_names)
+                    log.info("[faint重複ヒント] t=%.1fs %s (%s)", ev["event_time"], repeat_names, ev["event_type"])
             self._record_situation_snapshot(match_id, ev)
             bedrock_commentary, bedrock_analysis = _call_bedrock_text(
                 self._ec2_url, ev["game_state"], ev["event_type"], history,

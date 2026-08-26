@@ -492,12 +492,13 @@ class TestGeneratePosthocCommentary:
         assert seen_histories[0] == []
         assert seen_histories[1] == ["実況1"]
 
-    def test_faint_repeat_hint_when_move_single_already_narrated_death(self, tmp_path, monkeypatch):
-        """move_singleがHP観測で先に気絶を語っていた場合、後続の正式faintイベントに
-        「新情報ではない」ヒントが注入される（2026-08-24新設・faint二重報告対策。
-        実機2026-08-23_22-15-43のfbで発覚: 187.2sのmove_singleで先に気絶を語ったのに
-        254.1sの正式faintイベントが同じ気絶を「これは大きなアドバンテージ」と初耳の
-        体で再報告していた）。"""
+    def test_faint_skipped_when_all_bench_deaths_already_narrated(self, tmp_path, monkeypatch):
+        """move_singleがHP観測で先に気絶を語っていて、後続の正式faintイベント時点で
+        ベンチの気絶済みポケモンが全員既報告（＝新情報ゼロ）の場合、ヒントに頼らず
+        faintイベントの実況生成自体をスキップする（2026-08-24新設のヒント方式では
+        LLMがヒントに従わず再報告する実例が実機renders/2026-08-26_21-35-16で複数件
+        確認されたため、2026-08-27に強化。元々のヒント方式導入の契機だった実機
+        2026-08-23_22-15-43も同種の「67秒後に初耳の体で再報告」バグだった）。"""
         p = self._make_pipeline(tmp_path)
 
         def _state(name, hp_pct):
@@ -530,8 +531,96 @@ class TestGeneratePosthocCommentary:
 
         p._generate_posthoc_commentary()
 
+        # faintイベントはBedrockを呼ばれずスキップされ、move_single分の1件のみ生成される
+        assert [et for et, _ in seen_game_states] == ["move_single"]
+        lines = (tmp_path / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+
+    def test_faint_repeat_hint_when_death_mixed_with_new_faint(self, tmp_path, monkeypatch):
+        """ベンチの気絶済みポケモンの一部だけが既報告（残りは新規）の場合は、
+        スキップせずヒント付与に留める（新情報を握りつぶさないための回帰ガード）。"""
+        p = self._make_pipeline(tmp_path)
+
+        def _state(name, hp_pct):
+            return {"player": [], "opponent": [{"name": name, "hp_pct": hp_pct, "status": None}]}
+
+        p._panel_state_history = [
+            (185.0, _state("オオニューラ", 68.0)),
+            (190.0, _state("オオニューラ", 0.0)),
+        ]
+        p._protect_history = []
+        p._miss_history = []
+        p._flinch_history = []
+        p._pending_render_events = [
+            {"event_time": 187.2, "event_type": "move_single",
+             "game_state": {"ocr_text": ""}, "battle_context": {}, "move_log": [],
+             "render_context": None},
+            {"event_time": 254.1, "event_type": "faint",
+             "game_state": {"ocr_text": ""},
+             # オオニューラは既報告・ルガルガンは今回のfaintで初出（新情報あり）
+             "battle_context": {"player_bench": "なし",
+                                 "opponent_bench": "オオニューラ(ひんし) / ルガルガン(ひんし)"},
+             "move_log": [], "render_context": None},
+        ]
+        seen_game_states = []
+
+        def fake_call(ec2_url, game_state, event_type, history, battle_context,
+                      classifier, move_log, **kwargs):
+            seen_game_states.append((event_type, dict(game_state)))
+            return (f"実況{len(seen_game_states)}", "a")
+
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", fake_call)
+
+        p._generate_posthoc_commentary()
+
         faint_call = next(gs for et, gs in seen_game_states if et == "faint")
         assert "オオニューラ" in faint_call.get("faint_repeat_hint", "")
+        assert "ルガルガン" not in faint_call.get("faint_repeat_hint", "")
+
+    def test_faint_repeat_hint_also_applied_to_move_used(self, tmp_path, monkeypatch):
+        """faint_repeat_hintはmove_usedイベントにも付与される（2026-08-27拡張）。
+        従来はfaintイベントのみが対象で、move_used側のmove_log/控え欄に残る古い
+        気絶情報をLLMが現在形で語ってしまう抜け道が塞がれていなかった
+        （実機renders/2026-08-26_21-35-16の350.8s: リザードンの気絶を既に2回
+        報告済みなのに「リザードン、ここで落ちてしまった！」と3回目の初耳実況）。
+        move_usedは気絶以外の情報も扱うイベントのため、全既報告でもスキップは
+        せずヒント付与に留める。"""
+        p = self._make_pipeline(tmp_path)
+
+        def _state(name, hp_pct):
+            return {"player": [], "opponent": [{"name": name, "hp_pct": hp_pct, "status": None}]}
+
+        p._panel_state_history = [
+            (185.0, _state("オオニューラ", 68.0)),
+            (190.0, _state("オオニューラ", 0.0)),
+        ]
+        p._protect_history = []
+        p._miss_history = []
+        p._flinch_history = []
+        p._pending_render_events = [
+            {"event_time": 187.2, "event_type": "move_single",
+             "game_state": {"ocr_text": ""}, "battle_context": {}, "move_log": [],
+             "render_context": None},
+            {"event_time": 254.1, "event_type": "move_used",
+             "game_state": {"ocr_text": ""},
+             "battle_context": {"player_bench": "なし", "opponent_bench": "オオニューラ(ひんし)"},
+             "move_log": [], "render_context": None},
+        ]
+        seen_game_states = []
+
+        def fake_call(ec2_url, game_state, event_type, history, battle_context,
+                      classifier, move_log, **kwargs):
+            seen_game_states.append((event_type, dict(game_state)))
+            return (f"実況{len(seen_game_states)}", "a")
+
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", fake_call)
+
+        p._generate_posthoc_commentary()
+
+        # スキップはされず、move_usedとして実況生成される
+        assert [et for et, _ in seen_game_states] == ["move_single", "move_used"]
+        move_used_call = next(gs for et, gs in seen_game_states if et == "move_used")
+        assert "オオニューラ" in move_used_call.get("faint_repeat_hint", "")
 
     def test_no_faint_repeat_hint_for_unrelated_faint(self, tmp_path, monkeypatch):
         """move_singleで先に語られていない気絶には faint_repeat_hint を付けない
