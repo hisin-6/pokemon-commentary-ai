@@ -7,6 +7,10 @@
 ## 全体像（3パス構成）
 
 ```
+パス0   [Windows]  scripts/team_preview_gui.py（任意・2026-08-24新設・パス1より前！）
+        「対戦準備中」画面（両陣営6匹・スプライトのみでテキスト名は無い）を
+        ユーザーが目視して手入力し、選出前チームプレビューを保存する
+  ↓ renders/<名前>/team_preview.json
 パス1   [Windows]  src/pipeline.py --render-out
         動画を解析し実況素材を出力（Bedrock代 約10〜15円/本・約20分/6分動画）
   ↓ renders/<名前>/ … manifest.jsonl（イベント実況+WAV）・timeline.jsonl（技の瞬間ログ）
@@ -19,11 +23,14 @@
         「1試合あたり数円程度」から目安1本あたり数倍〜10円程度に増加**）
   ↓ fillers.jsonl ＋ wav/fNNNN_filler.wav
 パス1.6 [Windows]  scripts/generate_predictions.py（2026-08-21新設・任意）
-        「予測→回収」実況を生成（自分側/相手側それぞれ最大1件・最大2組。
-        場のコンディションを確立した技＝おいかぜ/壁/天候等を検出時刻とし、
-        試合最後のfaint（無ければbattle_end）で回収する。的中/外れの判定は
-        Python側が最終battle_resultから機械的に確定・LLMには演技だけさせる）
-  ↓ predictions.jsonl ＋ wav/pNNNN_prediction*.wav（対象なしなら空ファイル）
+        「予測→回収」実況を生成。2系統が独立して動く:
+        ①条件系（自分側/相手側それぞれ最大1件・最大2組。場のコンディションを
+          確立した技＝おいかぜ/壁/天候等を検出時刻とし、試合最後のfaint
+          （無ければbattle_end）で回収）
+        ②選出予想（2026-08-24新設・パス0でteam_preview.jsonがある試合のみ。
+          相手のリード[先頭2匹]を試合開始直前に予想し、battle_startで回収）
+        的中/外れの判定はどちらもPython側が機械的に確定・LLMには演技だけさせる
+  ↓ predictions.jsonl ＋ wav/pNNNN_*.wav（対象なしなら空ファイル）
 パス2   [WSL]      scripts/render_commentary_video.py --layout biim
         枠・字幕・戦況パネル・音声を一発合成（課金なし・何度でもやり直し可）。
         fillers.jsonl/predictions.jsonlは両方とも「あれば自動マージ」方式
@@ -35,6 +42,10 @@
   「解析自体の改善」か「states/timeline形式の変更」のときだけ
 - パス1.6（予測→回収）は任意ステップ。`predictions.jsonl`が無ければパス2は
   何も変わらず動く（fillers.jsonlと同じ「無ければ何も起きない」自動検出方式）
+- パス0（選出前チームプレビュー）も任意ステップだが、**他の任意ステップと違い
+  パス1より必ず先に実行する必要がある**（`team_preview.json`はパス1起動直後の
+  `Pipeline.__init__`で1回だけ読み込まれる。パス1実行後に置いても・パス1実行中に
+  置いても反映されない）
 
 ## 工程の分担（どこが機械的で、どこに判断が要るか）
 
@@ -88,6 +99,29 @@ RAGヒント（`move_effect_hint`/`move_target_hint`/`condition_hint`等）が�
 
 ## 実行手順
 
+### パス0（Windows・任意・2026-08-24新設・必ずパス1より前に実行）
+
+```
+venv\Scripts\python.exe scripts\team_preview_gui.py --render-dir renders\<動画名>
+```
+
+- 「対戦準備中」画面（自分・相手それぞれ6匹の構築がスプライトで表示される画面。
+  テキスト名は無いのでOCRでは自動取得できない）を録画から目視し、自分・相手それぞれ
+  6匹（種族名のみ・持ち物や特性はこの画面には出ないので入力不要）をGUIに入力して保存する
+- 自分の構築は同じ構築を繰り返し使うことが多いので、「プリセット」欄で名前を付けて保存し
+  次回以降はドロップダウンから一括読込できる
+- 保存すると `renders/<動画名>/team_preview.json` ができる。**この後にパス1を実行**すると
+  実況プロンプトに「選出前チームプレビュー」として自動で注入される
+  （`_build_vision_prompt`/`_build_script_prompt`両方・持ち物/特性/技構成は不明なので
+  断定しないよう指示付き）
+- 相手の構築を入力しておくと、パス1.6（`generate_predictions.py`）が
+  「選出予想→battle_startで回収」も自動生成するようになる（2026-08-24新設。
+  下記パス1.6を参照）
+- ⚠️ WSLには`tkinter`が入っていないため起動確認はWindows側でのみ可能（`pose_tuner_gui.py`と同じ制約）
+- パス1の「同じ--render-outへの再実行で前回素材をクリア」対象に`team_preview.json`は
+  **含まれない**ため、パス1を何度再実行してもteam_preview.jsonは消えない
+  （試行錯誤しながらパス1をやり直しても入力し直す必要はない）
+
 ### パス1（Windows PowerShell）
 
 ```
@@ -135,6 +169,9 @@ venv\Scripts\python.exe scripts\generate_predictions.py renders\<動画名> --ec
 
 - 材料（場のコンディションを確立した技）が無い試合は「予測ポイントなし」で0件のまま
   正常終了する（空の`predictions.jsonl`が書かれる）。毎回何かが生成されるとは限らない
+- **選出予想（2026-08-24新設）**: パス0で`team_preview.json`（相手の構築）を保存済みなら、
+  条件系予測とは無関係に「相手のリード予想→battle_startで回収」も自動生成される
+  （相手の構築が無ければこちらは0件のまま・条件系予測には影響しない）
 - `--persona`はパス1・パス1.5と同じ値にすること
 - 未実行でも`predictions.jsonl`が存在しなければパス2は従来通り動く（省略可能な機能）
 
@@ -362,6 +399,7 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 | 気絶イベントの実況未検出（トラッカーは把握しているのに実況されない） | 「たおれた」メッセージやHP0を正しく検出しているのに、faint実況が生成されない（実機2026-08-14_20-46-44で4件: ライチュウ/メタグロス/コノヨザル/ペリッパー。ミロカロスだけ実況された） | **2026-08-15に恒久対策済み**。原因は4系統の複合: ①faintイベント時に`_track_new_faints`が現在の全気絶を「実況済み」登録→未実況の気絶が封印（ライチュウ）②保留faint（move_used統合待ち）が75秒タイムアウト前のturn_startで持ち越され、次ターンのmove_usedに統合されて47秒遅れ＋交代と混同（メタグロス=#14の混乱実況）③連続faintで保留が上書き消滅（コノヨザル）④battle_end時に保留が未フラッシュのまま消滅（ペリッパー）。対策: 実況済み登録をdiff限定化＋turn_start/battle_end/新faint検知時に保留を必ずフラッシュ（event_time=検知時刻なので配置は正確）＋合成faintを自分側にも拡張（従来は相手側のみ）。pipeline.py側のみ=EC2デプロイ不要（faint_focus文言の微修正のみserver.py） |
 | move_singleの技の対象（方向）誤認 | 「インファイトがオオニューラへ！」等、実際と違うポケモンを対象として実況する（実機2026-08-14_20-46-44で7件・最頻NG） | **2026-08-15に恒久対策済み（後付け生成モードのみ）**: move_singleは技テキスト検出の瞬間に発火するが、対象の証拠（HP減少・状態異常メッセージ・まもる成功）は数秒〜20秒後に出るため、LLMが場のポケモンから対象を推測して外していた。後付け生成時に「技の直後〜次イベントまでの観測」（`_panel_state_history`のHP/状態異常差分＋`_protect_history`のまもる成功メッセージ）から対象を逆引きし、`move_target_hint`としてプロンプト注入する（観測に厳密に従う指示付き・観測ゼロなら従来の「断定しない」安全策に委ねる）。**server.py変更を含むためEC2再デプロイが必要**。manifest.jsonlのcontextに`move_target_hint`が出ていれば動作している。実データドライランでNG7件中3件を確実修正・残りは断定回避へ倒れることを確認済み。**2026-08-16追加**: 上記は「技の直後の事後観測」のみに頼っており、つるぎのまい等の自分対象の変化技・範囲技（相手全体対象）は観測が原理的に薄い/存在しないため誤爆が残っていた。`moves`テーブルに`target`列（PokeAPI由来・`fetch_move_targets`でbackfill）を追加し、「技そのものの対象範囲」（自分自身/相手全体/自分の場等）という事後観測と独立した事実を`move_range_hint`として`_dispatch_move_commentary`/`_process_event`の両方でbattle_contextに配線→`_compute_move_target_hint`が観測より最優先で合流させる。単体対象（相手単体等）は既存の断定回避指示と同義のためあえて文言を足さない。manifest.jsonlのcontextに`move_range_hint`が出ていれば配線されている（プロンプト自体は`move_target_hint`に統合済みなのでserver.py/phi3_client.py側の新規キーは無し・文言修正のみでEC2再デプロイ必要） |
 | 降参で終わった試合のbattle_end実況が気絶・全滅を捏造 | 「〜が落ちた、これで全滅です」等、実際は降参なのに倒れた描写で締める（実機2026-08-14_20-46-44で実発生）。battle_resultも未検出になりがち | **2026-08-15に恒久対策済み**: battle_endの発火経路は「YOLO終了画面」「フェーズ遷移（`_END_KW`の「降参が選ばれ」）」の2つあり、降参のWIN/LOSE待機（2026-08-14実装）はYOLO経路のみ対応でフェーズ遷移経路が先に即発行していた。フェーズ遷移経路にも同じ待機を追加し、`_battle_surrendered`フラグを新設してプロンプト（server.py/phi3両方）に「降参による決着・倒れた描写をしない」を注入する。**server.py変更を含むためEC2再デプロイが必要**。manifest.jsonlのcontextに`battle_surrendered: true`が出ていれば動作している |
+| パス0（team_preview_gui.py）をパス1の後に実行してしまう | `team_preview.json`を保存してもプロンプトに一切反映されない | `_team_preview_hint`はパス1起動直後（`Pipeline.__init__`）で1回だけ読み込む設計のため、**パス1より必ず先に**保存する必要がある。既にパス1を実行済みでも、パス0→パス1の順で撮り直せばよい（team_preview.jsonは再実行でクリアされないので、パス0だけ先にやってからパス1を再実行すれば反映される） |
 
 ## レイアウト調整ポイント（scripts/render_commentary_video.py の定数）
 
@@ -401,9 +439,11 @@ fillers.jsonl を直接編集してパス2を再実行する（音声再合成�
 
 ## 関連ファイル
 
-- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック/`BattleStateTracker.fainted_names`・`diff_fainted_side`）・`src/api/server.py`（`/api/script`・プロンプト・`_build_script_prompt`のmode="predict"/`_build_payoff_prompt`）・`scripts/generate_gap_commentary.py`・`scripts/generate_predictions.py`（予測→回収・2026-08-21新設）・`scripts/render_commentary_video.py`（`load_predictions`）・`scripts/generate_thumbnail.py`（サムネイル自動生成）・`scripts/generate_chapters.py`
+- 実装: `src/output/render_sink.py`（パス1素材出力）・`src/pipeline.py`（`_record_panel_state`/`_render_context`/瞬間ログフック/`BattleStateTracker.fainted_names`・`diff_fainted_side`/`_load_team_preview_hint`）・`src/api/server.py`（`/api/script`・プロンプト・`_build_script_prompt`のmode="predict"/`_build_payoff_prompt`）・`scripts/generate_gap_commentary.py`・`scripts/generate_predictions.py`（予測→回収・2026-08-21新設）・`scripts/render_commentary_video.py`（`load_predictions`）・`scripts/generate_thumbnail.py`（サムネイル自動生成）・`scripts/generate_chapters.py`
 （YouTubeチャプター自動生成）・`scripts/render_bubble_overlay.py`（プレイヤーの吹き出し・v2d）
 ・`scripts/play_commentary_track.bat`（アバター録画用wav再生・Windows）・`scripts/play_and_animate_avatar.py`（表情連動版wav再生・Windows・改善ロードマップ③）
-- テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_generate_predictions.py`・`tests/test_server.py`（TestScript系・TestBuildScriptPromptPredictMode・TestBuildPayoffPrompt）・`tests/test_play_and_animate_avatar.py`・`tests/test_render_bubble_overlay.py`・`tests/test_generate_chapters.py`
+・`scripts/team_preview_gui.py`（選出前チームプレビュー入力GUI・パス0・2026-08-24新設）
+・`src/pokedb/team_preview.py`（保存/読込/整形ロジック・自分の構築プリセット）
+- テスト: `tests/test_render_sink.py`・`tests/test_render_video.py`・`tests/test_gap_commentary.py`・`tests/test_generate_predictions.py`・`tests/test_server.py`（TestScript系・TestBuildScriptPromptPredictMode・TestBuildPayoffPrompt）・`tests/test_play_and_animate_avatar.py`・`tests/test_render_bubble_overlay.py`・`tests/test_generate_chapters.py`・`tests/test_team_preview.py`
 - 設計: `docs/adr/ADR-009-video-first-commentary.md`・レイアウト原案 `docs/design/frame-mockups/mockup_A_biim.png`
 - 経緯・実測値: `docs/daily/2026-07-14.md`

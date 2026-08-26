@@ -6,10 +6,20 @@ generate_predictions.py（予測→回収パス・2026-08-21新設）の単体�
   - find_decisive_event         回収アンカー（最後のfaint/battle_end）の検出
   - determine_battle_result     最終battle_resultの取得
   - judge_hit                   予測の的中/外れ判定
+  - find_selection_prediction_candidate  選出予想の予測ポイント検出（2026-08-24新設）
+  - find_battle_start_event              選出予想の回収アンカー検出（2026-08-24新設）
+  - judge_selection_hit                  選出予想の的中/外れ判定（2026-08-24新設）
 """
 
 import importlib.util
+import sys
 from pathlib import Path
+
+_ROOT = str(Path(__file__).parent.parent)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from src.pokedb.team_preview import save_team_preview
 
 # scripts/ はパッケージではないためファイルパスから直接ロードする
 _SCRIPT = Path(__file__).parent.parent / "scripts" / "generate_predictions.py"
@@ -134,3 +144,88 @@ class TestJudgeHit:
 
     def test_opponent_prediction_misses_on_player_win(self):
         assert gp.judge_hit("opponent", "勝ち") is False
+
+
+class TestFindSelectionPredictionCandidate:
+    """選出予想の予測ポイント検出（2026-08-24新設）。"""
+
+    def test_returns_candidate_when_team_preview_present(self, tmp_path):
+        save_team_preview(tmp_path, ["コノヨザル"], ["リザードン", "オオニューラ"])
+        entries = [_event(46.5, event_type="battle_start")]
+        candidate = gp.find_selection_prediction_candidate(tmp_path, entries)
+        assert candidate is not None
+        assert candidate["opponent_team"] == ["リザードン", "オオニューラ"]
+        assert "リザードン" in candidate["hint"]
+
+    def test_time_stays_before_first_event(self, tmp_path):
+        """短い試合（最初のイベントが早い）でも予測時刻はそれより前に収まる。"""
+        save_team_preview(tmp_path, [], ["リザードン"])
+        entries = [_event(1.0, event_type="battle_start")]
+        candidate = gp.find_selection_prediction_candidate(tmp_path, entries)
+        assert 0.0 <= candidate["time"] < 1.0
+
+    def test_none_without_team_preview_file(self, tmp_path):
+        entries = [_event(46.5, event_type="battle_start")]
+        assert gp.find_selection_prediction_candidate(tmp_path, entries) is None
+
+    def test_none_when_opponent_team_empty(self, tmp_path):
+        """自分の構築しか入力されていない（相手が未入力）場合は予想しない。"""
+        save_team_preview(tmp_path, ["コノヨザル"], [])
+        entries = [_event(46.5, event_type="battle_start")]
+        assert gp.find_selection_prediction_candidate(tmp_path, entries) is None
+
+    def test_none_when_no_entries(self, tmp_path):
+        save_team_preview(tmp_path, [], ["リザードン"])
+        assert gp.find_selection_prediction_candidate(tmp_path, []) is None
+
+
+class TestFindBattleStartEvent:
+    def test_finds_earliest_battle_start(self):
+        entries = [
+            _event(50.0, event_type="move_used"),
+            _event(46.5, event_type="battle_start", commentary="開幕"),
+        ]
+        result = gp.find_battle_start_event(entries)
+        assert result["event_time"] == 46.5
+
+    def test_none_when_absent(self):
+        entries = [_event(50.0, event_type="move_used")]
+        assert gp.find_battle_start_event(entries) is None
+
+
+class TestExtractFieldNames:
+    def test_extracts_names_with_hp_and_moves(self):
+        s = "場: ペリッパー HP:167/167 技=[ぼうふう] / ラグラージ / 控え: コノヨザル"
+        assert gp._extract_field_names(s) == ["ペリッパー", "ラグラージ"]
+
+    def test_extracts_names_with_status(self):
+        s = "場: コノヨザル(まひ) / ガオガエン"
+        assert gp._extract_field_names(s) == ["コノヨザル", "ガオガエン"]
+
+    def test_empty_for_unknown_placeholder(self):
+        assert gp._extract_field_names("情報収集中") == []
+
+    def test_empty_for_empty_string(self):
+        assert gp._extract_field_names("") == []
+
+
+class TestJudgeSelectionHit:
+    def test_hit_when_predicted_name_in_actual_leads(self):
+        entry = {"context": {"opponent": "場: リザードン HP:100% / オオニューラ"}}
+        hit, leads = gp.judge_selection_hit(
+            "リザードンとガブリアスが来ると予想！", ["リザードン", "オオニューラ", "ガブリアス"], entry)
+        assert hit is True
+        assert leads == ["リザードン", "オオニューラ"]
+
+    def test_miss_when_no_predicted_name_matches(self):
+        entry = {"context": {"opponent": "場: リザードン / オオニューラ"}}
+        hit, leads = gp.judge_selection_hit(
+            "ガブリアスが来そう", ["リザードン", "オオニューラ", "ガブリアス"], entry)
+        assert hit is False
+        assert leads == ["リザードン", "オオニューラ"]
+
+    def test_miss_when_actual_leads_unavailable(self):
+        entry = {"context": {"opponent": "情報収集中"}}
+        hit, leads = gp.judge_selection_hit("リザードンが来そう", ["リザードン"], entry)
+        assert hit is False
+        assert leads == []

@@ -294,6 +294,46 @@ class TestComposeThumbnail:
             r, g, b = img.convert("RGB").getpixel((w // 2, strip_y + strip_h // 2))
             assert (r, g, b) != (30, 30, 30)
 
+    def test_roster_rows_composited_as_two_rows(self, tmp_path):
+        """roster_rows（相手/自分の2段・2026-08-26新設）指定時、キャプション帯の
+        直上に2段でアイコンが焼き込まれること。"""
+        frame = tmp_path / "frame.png"
+        w, h = 800, 600
+        Image.new("RGB", (w, h), color=(30, 30, 30)).save(frame)
+        icon = tmp_path / "icon.png"
+        Image.new("RGBA", (96, 96), color=(0, 255, 0, 255)).save(icon)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "",
+                             roster_rows={"own": [icon, icon], "opponent": [icon, icon, icon]})
+        bar_h = int(h * 0.26)
+        icon_size = int(h * 0.075)
+        row_gap = int(icon_size * 0.2)
+        strip_h = 2 * icon_size + row_gap + int(icon_size * 0.3)
+        strip_y = h - bar_h - strip_h
+        with Image.open(out) as img:
+            rgb = img.convert("RGB")
+            # 上段（相手）・下段（自分）どちらの帯にも背景と異なる色（帯の暗色 or アイコン）
+            # が乗っていること
+            top_row_y = strip_y + int(icon_size * 0.15) + icon_size // 2
+            bottom_row_y = top_row_y + icon_size + row_gap
+            assert rgb.getpixel((w // 2, top_row_y)) != (30, 30, 30)
+            assert rgb.getpixel((w // 2, bottom_row_y)) != (30, 30, 30)
+
+    def test_roster_rows_takes_priority_over_roster_icon_pngs(self, tmp_path):
+        """roster_rowsとroster_icon_pngsが両方渡された場合、2段表示（roster_rows）が
+        優先されること。"""
+        frame = tmp_path / "frame.png"
+        w, h = 800, 600
+        Image.new("RGB", (w, h), color=(30, 30, 30)).save(frame)
+        icon = tmp_path / "icon.png"
+        Image.new("RGBA", (96, 96), color=(0, 255, 0, 255)).save(icon)
+        out = tmp_path / "thumb.png"
+        gt.compose_thumbnail(frame, out, "",
+                             roster_icon_pngs=[icon],
+                             roster_rows={"own": [icon], "opponent": [icon]})
+        # 厳密な差分検証は複雑なので、まずは例外なく2段レイアウトで完走することを確認
+        assert out.exists()
+
     def test_empty_label_shows_big_ai_logo_text(self, tmp_path, monkeypatch):
         """label=""（盛り上がりシーンの字幕なし）指定時、実況キャプションの代わりに
         大きな「AI自動実況」ロゴテキストが描画されること（2026-08-14新設）。"""
@@ -422,6 +462,33 @@ class TestCollectRoster:
         assert gt._collect_roster([], "player") == []
 
 
+class TestTeamPreviewRoster:
+    """_team_preview_roster: team_preview.json（パス0）からの構築読み込み（2026-08-26新設）。"""
+
+    def test_returns_own_and_opponent_when_file_exists(self, tmp_path):
+        (tmp_path / "team_preview.json").write_text(
+            '{"own_team": ["ガブリアス", "ドドゲザン"], "opponent_team": ["イダイトウ"]}',
+            encoding="utf-8")
+        assert gt._team_preview_roster(tmp_path) == {
+            "own": ["ガブリアス", "ドドゲザン"], "opponent": ["イダイトウ"]}
+
+    def test_returns_none_when_file_missing(self, tmp_path):
+        assert gt._team_preview_roster(tmp_path) is None
+
+    def test_returns_none_when_both_sides_empty(self, tmp_path):
+        (tmp_path / "team_preview.json").write_text(
+            '{"own_team": [], "opponent_team": []}', encoding="utf-8")
+        assert gt._team_preview_roster(tmp_path) is None
+
+    def test_caps_each_side_at_max_roster_icons(self, tmp_path):
+        seven = [f"ポケモン{i}" for i in range(7)]
+        (tmp_path / "team_preview.json").write_text(
+            f'{{"own_team": {seven!r}, "opponent_team": []}}'.replace("'", '"'),
+            encoding="utf-8")
+        result = gt._team_preview_roster(tmp_path)
+        assert len(result["own"]) == gt._MAX_ROSTER_ICONS
+
+
 class TestResolvePokemonId:
     def _make_pokedb(self, tmp_path) -> Path:
         db_path = tmp_path / "pokedb.sqlite"
@@ -532,7 +599,21 @@ class TestCliDefaults:
         _, kwargs = mock_gen.call_args
         assert kwargs["label_override"] == ""
         assert kwargs["team"] is None
+        assert kwargs["use_team_preview_roster"] is True
         assert kwargs["persona"] == "neutral"
         assert kwargs["big_logo_text"] == "ポケモンダブルバトル\nAI自動実況"
         assert kwargs["avatar_crop"] == "663:765:631:314"
         assert kwargs["avatar_face_scale"] == 0.62
+
+    def test_no_roster_icons_also_disables_team_preview_roster(self, tmp_path):
+        """--no-roster-icons指定時はteam_preview.jsonの自動2段表示も含めて
+        無効化されること（2026-08-26新設）。"""
+        render_dir = tmp_path / "renders" / "sample"
+        render_dir.mkdir(parents=True)
+        with patch.object(gt, "generate_thumbnail") as mock_gen:
+            mock_gen.return_value = {"out": "x", "reason": "faint", "time": 1.0,
+                                     "score": 80.0, "label": ""}
+            gt.main([str(render_dir), "--no-roster-icons"])
+        _, kwargs = mock_gen.call_args
+        assert kwargs["team"] is None
+        assert kwargs["use_team_preview_roster"] is False

@@ -59,6 +59,7 @@ from src.output.render_sink import RenderSink
 from src.output.voicevox_client import VoicevoxClient
 from src.pokedb.classifier import CATEGORY_POKEMON, PokeClassifier
 from src.pokedb.mega_forms import get_mega_types
+from src.pokedb.team_preview import format_team_preview_hint, load_team_preview
 from src.pokedb.type_chart import describe_matchup
 
 
@@ -3053,6 +3054,12 @@ class Pipeline:
             })
             log.info("[レンダ] 素材出力モード: %s（実況音声は再生せず保存）",
                      self._render_sink.out_dir)
+        # 選出前チームプレビュー（2026-08-24新設）: team_preview_gui.pyで事前に
+        # 保存された<render_out>/team_preview.jsonがあれば読み込む。「対戦準備中」
+        # 画面はスプライトのみでテキスト名が無くOCRで自動取得できないため、
+        # ユーザーがGUIで手入力したものを試合開始前にここで拾う。動画全体で
+        # 一定の情報（試合中に変化しない）なので毎イベントで再計算はしない。
+        self._team_preview_hint: str = self._load_team_preview_hint(self._render_sink)
         # 動画モード＋素材出力時のみ: 実況生成をスキャン完了後に後付けで行う（ADR-009追記）。
         # ライブモードは即時Bedrock Vision経路を維持するため対象外。
         self._posthoc_mode: bool = self._render_sink is not None and video_path is not None
@@ -3064,6 +3071,11 @@ class Pipeline:
         self._panel_state_history: list[tuple[float, dict]] = []  # (動画内時刻, to_panel_state())
         self._protect_history: list[tuple[float, str, str]] = []  # (動画内時刻, "自分側"/"相手側", 名前)
         self._miss_history: list[float] = []  # 命中失敗（外れた）を検出した動画内時刻（2026-08-16）
+        # ひるみ（フリンチ）発生の観測履歴（2026-08-24・技の対象/結果ヒント用）。
+        # まもる成功・命中失敗と同じ構造。ねこだまし等のフリンチ技を使っても
+        # 実際にひるんだかどうかを観測する経路が無く、LLMが安全側でひるみへの
+        # 言及を避けていた（実機2026-08-23_22-15-43のfbで発覚）ための対策。
+        self._flinch_history: list[tuple[float, str, str]] = []  # (動画内時刻, "自分側"/"相手側", 名前)
         # 交代ヒント用の繰り出し履歴（2026-08-15・switch/move_used実況のタイミングずれ対策）。
         # _recent_sendoutsは60秒トリム＋試合毎クリアがあるため後付け生成では使えず、
         # 全動画分を保持する専用の履歴を別に持つ
@@ -3112,6 +3124,21 @@ class Pipeline:
             self._classifier = None
 
         log.info("=== 初期化完了 ===")
+
+    @staticmethod
+    def _load_team_preview_hint(render_sink: "RenderSink | None") -> str:
+        """render_sinkの出力先からteam_preview.jsonを読み込みプロンプト用ヒント
+        文字列を返す（2026-08-24新設）。render_sinkが無い/ファイルが無ければ空文字。
+        """
+        if render_sink is None:
+            return ""
+        preview = load_team_preview(render_sink.out_dir)
+        if not preview:
+            return ""
+        hint = format_team_preview_hint(preview)
+        if hint:
+            log.info("[選出前チームプレビュー] %s", hint)
+        return hint
 
     def _now(self) -> float:
         """BattlePhaseClassifier 用の時計。
@@ -3412,6 +3439,7 @@ class Pipeline:
                         self._update_move_effectiveness(ocr_results)
                         self._update_protect_history(ocr_results)
                         self._update_miss_history(ocr_results)
+                        self._update_flinch_history(ocr_results)
                         self._update_battle_conditions(ocr_results)
                         self._update_mega_evolution(ocr_results)
                         self._update_switch_out(ocr_results)
@@ -3630,6 +3658,7 @@ class Pipeline:
                         self._update_move_effectiveness(dense_results)
                         self._update_protect_history(dense_results)
                         self._update_miss_history(dense_results)
+                        self._update_flinch_history(dense_results)
                         self._update_battle_conditions(dense_results)
                         self._update_mega_evolution(dense_results)
 
@@ -3833,6 +3862,8 @@ class Pipeline:
                     log.info("[気絶確定ヒント] event_type=%s %s", event_type, game_state["faint_focus"])
 
         battle_context = self._battle_tracker.to_context()
+        if getattr(self, "_team_preview_hint", ""):
+            battle_context["team_preview_hint"] = self._team_preview_hint
         type_hint = self._compute_type_hint()
         if type_hint:
             battle_context["type_hint"] = type_hint
@@ -4161,6 +4192,15 @@ class Pipeline:
     # ほぼ同時（実機2026-08-14_20-46-44: ブリジュラス繰り出しとmove_used #14が同秒）
     # のため少し広めに取る
     _SENDOUT_HINT_LOOKBACK = {"switch": 3.0, "move_used": 5.0}
+    # 交代ヒントの前方窓の上限（2026-08-24追加）。共通の_TARGET_HINT_MAX_WINDOW_SEC
+    # （20秒・次イベントが無い場合の上限）をそのまま流用していたが、switchイベントは
+    # 「交代選択画面」の時点で発火する＝この時点ではまだ本人は場に出ていないため、
+    # 次イベントまでが20秒近く空くターンでは「20秒近く先の繰り出し」まで拾って
+    # 「たった今登場」と断定させてしまっていた（実機2026-08-23_22-15-43のfbで発覚：
+    # 交代選択(160.4s)〜次イベント(183.4s)の23秒窓で164s付近ではまだ未登場だった
+    # ラグラージを「登場です」と実況）。switchは短め（10秒）に絞り、move_usedは
+    # 従来通り（繰り出しメッセージがイベント検知とほぼ同時のため実害が薄い）。
+    _SENDOUT_HINT_FORWARD_CAP = {"switch": 10.0, "move_used": _TARGET_HINT_MAX_WINDOW_SEC}
 
     @staticmethod
     def _move_target_window_end(events: list[dict], index: int) -> float:
@@ -4301,6 +4341,11 @@ class Pipeline:
         (_label, name), _hp = max(drops.items(), key=lambda kv: kv[1][0] - kv[1][1])
         return name
 
+    # move_target_hintの文中から「HPが○○%→0%に減少」した名前を抜き出す
+    # （2026-08-24新設・faint二重報告対策）。_compute_move_target_hintが返す
+    # 文字列フォーマット（f"{name}（{label}）のHPが{base}%→{low}%に減少"）に依存する。
+    _HP_ZERO_HINT_RE = re.compile(r'([^（\s]+)（(?:自分側|相手側)）のHPが[\d.]+%→0%に減少')
+
     def _compute_move_target_hint(self, start: float, end: float,
                                    move_range: str | None = None) -> str:
         """観測窓 (start, end] のHP減少・状態異常付与・まもる成功・命中失敗から、
@@ -4334,6 +4379,10 @@ class Pipeline:
             if start < t <= end:
                 hints.append("この技は外れた（対象に命中していない＝ダメージ・効果なし）")
                 break
+        # ひるみ発生（この技がフリンチを引き起こした証拠・2026-08-24）
+        for t, side, name in getattr(self, "_flinch_history", []):
+            if start < t <= end:
+                hints.append(f"{name}（{side}）はひるんで技が出せなかった＝この技はひるみを引き起こした")
         # HP減少・状態異常付与（パネル状態履歴の差分）
         drops = self._hp_drop_observations(start, end)
         if drops is not None:
@@ -4408,6 +4457,13 @@ class Pipeline:
                 log.warning(f"戦況ウェアハウス クリアエラー: {e}")
 
         history: list[str] = []
+        # move_singleのmove_target_hintで「HPが○○%→0%に減少」と既に伝えた名前の集合
+        # （2026-08-24新設・faint二重報告対策）。move_singleはHPバーの連続監視で
+        # 気絶をいち早く検出できるが、正式なfaintイベント（OCRの「0/xxx」テキスト
+        # 検出）は画面にその表示が出るまで発火が遅れることがあり（実機
+        # 2026-08-23_22-15-43で最大67秒差を確認）、両者が連携していないと後から来た
+        # faintイベントが「初耳」の体で同じ気絶をもう一度報告してしまう。
+        already_narrated_deaths: set[str] = set()
         for i, ev in enumerate(self._pending_render_events):
             # 技の対象ヒント（2026-08-15）: 技の直後の観測から対象を逆引きして注入
             if ev["event_type"] == "move_single":
@@ -4423,6 +4479,8 @@ class Pipeline:
                         # manifest.jsonlで実機確認できるようにする（他ヒントと同パターン）
                         ev["render_context"]["move_target_hint"] = target_hint
                     log.info("[対象ヒント] t=%.1fs %s", ev["event_time"], target_hint)
+                    already_narrated_deaths.update(
+                        self._HP_ZERO_HINT_RE.findall(target_hint))
                 # タイプ相性ヒントの対象確定（2026-08-20新設）: ダブルバトル等で対象が
                 # 複数いて即断定を見送っていた場合、技の直後の観測（上と同じ手段）で
                 # 実際の対象を確定させ、候補の中から正しい1件に差し替える。対象が
@@ -4447,7 +4505,10 @@ class Pipeline:
             # 交代ヒント（2026-08-15）: 発火後（switch=交代選択画面・move_used=ターン冒頭）に
             # 出る繰り出しメッセージから「実際に誰が出てきたか」を逆引きして注入
             if ev["event_type"] in ("switch", "move_used"):
-                window_end = self._move_target_window_end(self._pending_render_events, i)
+                window_end = min(
+                    self._move_target_window_end(self._pending_render_events, i),
+                    ev["event_time"] + self._SENDOUT_HINT_FORWARD_CAP[ev["event_type"]],
+                )
                 lookback = self._SENDOUT_HINT_LOOKBACK[ev["event_type"]]
                 switch_focus = self._compute_switch_focus(
                     ev["event_time"] - lookback, window_end)
@@ -4457,6 +4518,33 @@ class Pipeline:
                     if ev.get("render_context") is not None:
                         ev["render_context"]["switch_focus"] = switch_focus
                     log.info("[交代ヒント] t=%.1fs %s", ev["event_time"], switch_focus)
+            # faint二重報告ヒント（2026-08-24新設）: この気絶の対象が、既に
+            # move_singleのHP観測で「落ちました」等を先に語っている名前と一致する
+            # 場合、正式なfaintイベント側に「新情報ではない」ことを明示する。
+            # 控え欄の「(ひんし)」表記から対象名を拾う（faintイベント自体は
+            # 対象名を構造化データとして持たないため、既存の文字列表現を利用）。
+            if ev["event_type"] == "faint" and already_narrated_deaths:
+                bench_text = " / ".join([
+                    (ev.get("battle_context") or {}).get("player_bench", ""),
+                    (ev.get("battle_context") or {}).get("opponent_bench", ""),
+                ])
+                fainted_on_bench = set(re.findall(r'([^\s/]+)\(ひんし\)', bench_text))
+                repeat_names = fainted_on_bench & already_narrated_deaths
+                if repeat_names:
+                    hint = (
+                        "、".join(sorted(repeat_names))
+                        + "の気絶は、直前のmove_single実況で既に伝えている"
+                        "（HP観測で気絶をいち早く検出できたため）。今のfaintイベントは"
+                        "画面上の正式な気絶表示（OCR）が遅れて確定しただけで、新情報ではない。"
+                        "「たった今起きた」「これは大きなアドバンテージ」のような驚き・速報"
+                        "口調で再度報告し直さないこと。触れる場合は一言の確認・整理に留めるか、"
+                        "この後の展開（残り数・次の一手の見通し等）に焦点を移すこと"
+                    )
+                    ev["game_state"] = dict(ev["game_state"])
+                    ev["game_state"]["faint_repeat_hint"] = hint
+                    if ev.get("render_context") is not None:
+                        ev["render_context"]["faint_repeat_hint"] = hint
+                    log.info("[faint重複ヒント] t=%.1fs %s", ev["event_time"], repeat_names)
             self._record_situation_snapshot(match_id, ev)
             bedrock_commentary, bedrock_analysis = _call_bedrock_text(
                 self._ec2_url, ev["game_state"], ev["event_type"], history,
@@ -4816,6 +4904,10 @@ class Pipeline:
                 ctx["move_range_hint"] = battle_context["move_range_hint"]
             if "condition_hint" in battle_context:
                 ctx["condition_hint"] = battle_context["condition_hint"]
+            if "team_preview_hint" in battle_context:
+                # 選出前チームプレビュー（2026-08-24）用: 台本パス（_build_script_prompt）
+                # がイベントのcontext経由で拾えるようにする
+                ctx["team_preview_hint"] = battle_context["team_preview_hint"]
         return ctx
 
     def _speak_async(self, commentary: str, event_type: str = "unknown",
@@ -5152,6 +5244,39 @@ class Pipeline:
         history.append(self._now())
         log.info("[技が外れた] t=%.1fs", self._now())
 
+    # 「(名前)は ひるんで 攻撃できなかった！」のひるみメッセージ。まもる成功
+    # （_PROTECT_MSG_RE）と同じ間隔許容（OCR断片混入対策）。
+    _FLINCH_MSG_RE = re.compile(r"([ァ-ヴー]{2,})は.{0,12}ひるんで")
+    _FLINCH_DEDUP_SEC = 3.0  # 同一メッセージの複数フレームOCR対策（_PROTECT_DEDUP_SECと同じ理由）
+
+    def _update_flinch_history(self, ocr_results: list[dict]) -> None:
+        """「Xはひるんで攻撃できなかった」（ひるみ発生）を検出し、時刻・陣営・名前を
+        記録する（2026-08-24・技の対象ヒント用）。まもる成功（_update_protect_history）
+        と同じ構造。ねこだまし等のフリンチ技を使っても実際にひるんだかどうかを観測する
+        経路が無く、LLMが安全側でひるみへの言及を避けていた（実機2026-08-23_22-15-43の
+        fbで発覚: ねこだましの直後、ひるみが起きたかどうかに一切触れなかった）ための対策。
+        """
+        classifier = getattr(self, "_classifier", None)
+        if classifier is None:
+            return
+        joined = "".join(r.get("text", "") for r in ocr_results).replace(" ", "")
+        m = self._FLINCH_MSG_RE.search(joined)
+        if not m:
+            return
+        result = classifier.classify(m.group(1))
+        if not (result and result.category == CATEGORY_POKEMON and result.score >= 80):
+            return
+        name = result.canonical_ja
+        # 陣営は名前の直前の「あいて相手の」プレフィックスで判定する（_update_protect_historyと同じ）
+        prefix = joined[max(0, m.start() - 8):m.start()]
+        side = "相手側" if ("相手" in prefix or "あいて" in prefix) else "自分側"
+        history = self._flinch_history
+        if history and history[-1][1:] == (side, name) \
+                and self._now() - history[-1][0] < self._FLINCH_DEDUP_SEC:
+            return
+        history.append((self._now(), side, name))
+        log.info("[ひるみ検出] %s %s (t=%.1fs)", side, name, self._now())
+
     @staticmethod
     def _msg_roi_texts(ocr_results: list[dict]) -> list[str]:
         """メッセージボックスROI（`BattleMessageParser`と同じ領域）内のOCRテキストだけを返す。
@@ -5473,6 +5598,8 @@ class Pipeline:
         side_prefix = f"{side}の" if side else ""
         game_state["move_focus"] = f"{side_prefix}{pokemon_name}の{move_name}"
         battle_context = self._battle_tracker.to_context()
+        if getattr(self, "_team_preview_hint", ""):
+            battle_context["team_preview_hint"] = self._team_preview_hint
         type_hint = self._compute_type_hint()
         if type_hint:
             battle_context["type_hint"] = type_hint
@@ -5677,11 +5804,31 @@ class Pipeline:
             entry = f"T{turn_label}:{pokemon_name}の{move_name}"
             # 同ターン・同技の重複を除外（OCR誤読による使用者名違いの重複登録を防ぐ）
             # 例: T7:プテラのいわなだれ が登録済みの場合、T7:プーラのいわなだれ は登録しない
-            # ⚠️ ダブルバトルで同一ターンに2匹が同じ技を使う場合も除外される
-            if any(
-                e.startswith(f"T{turn_label}:") and e.endswith(f"の{move_name}")
-                for e in self._move_log
-            ):
+            # ダブルバトルで同一ターンに2匹が異なるポケモンとして場に出ている場合は
+            # 使用者名も突き合わせ、実在の別ポケモンによる正当な同時使用は除外しない
+            # （2026-08-24修正・従来はターン+技名だけで判定しており、ダブルスで2匹が
+            # 同じ技を使うケースが丸ごと消えていた。実機2026-08-23_22-15-43のfbで発覚:
+            # コノヨザルのれいとうパンチ登録後、同ターンのラグラージのれいとうパンチが
+            # 無条件でスキップされ無実況になっていた）。
+            on_field_names = (
+                {p.name for p in self._battle_tracker._player if p.on_field and not p.fainted}
+                | {p.name for p in self._battle_tracker._opponent if p.on_field and not p.fainted}
+            )
+            is_duplicate = False
+            for e in self._move_log:
+                if not (e.startswith(f"T{turn_label}:") and e.endswith(f"の{move_name}")):
+                    continue
+                m = self._MOVE_LOG_ENTRY_RE.match(e)
+                existing_user = m.group(1) if m else None
+                if existing_user == pokemon_name:
+                    is_duplicate = True  # 完全一致＝同一登録の再検出
+                    break
+                if (pokemon_name in on_field_names and existing_user in on_field_names
+                        and existing_user != pokemon_name):
+                    continue  # 場にいる別々の実在ポケモンによる正当な同時使用
+                is_duplicate = True  # 使用者名がロスターと一致しない＝OCR誤読の疑い
+                break
+            if is_duplicate:
                 log.debug("[技ログ] 同ターン同技の重複スキップ: %s", entry)
                 return False
             if entry not in self._move_log[-3:]:

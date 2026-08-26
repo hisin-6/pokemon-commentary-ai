@@ -13,8 +13,14 @@ predictions.jsonl があれば fillers.jsonl と同様に自動でマージす�
 （LLMには判定させず、演技だけをさせる。詳細:
 docs/design/prediction-payoff-commentary-idea.md）。
 
-battle_result が確定していない試合（降参・OCR未検出等）では予測は生成しない
-（0件も正常な結果として許容する）。
+battle_result が確定していない試合（降参・OCR未検出等）では上記の「条件系予測」は
+生成しない（0件も正常な結果として許容する）。
+
+**選出予想（2026-08-24新設）**: render_dir に `team_preview.json`
+（`scripts/team_preview_gui.py`が事前に保存・パス0）があり相手の構築が判明していれば、
+上記の条件系予測とは独立に「相手のリード（先頭2匹）予想→battle_startで回収」も
+生成する。的中判定は予測文中に出てきた相手構築の種族名と実際のリードの一致で
+機械的に判定する。
 
 使い方:
     python scripts/generate_predictions.py renders/16-14-39 --ec2-url http://<EC2>:5000
@@ -26,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -37,8 +44,16 @@ from render_commentary_video import load_manifest  # noqa: E402
 
 # プロジェクトルート（src.* のインポート用）
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from src.pokedb.team_preview import format_team_preview_hint, load_team_preview  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+# 選出予想の予測ポイント時刻の上限（秒）。試合開始（battle_start）より必ず前に
+# 収まるよう、最初のイベント時刻の半分か2.0秒の小さい方を使う。
+_SELECTION_PREDICT_TIME_CAP = 2.0
+# 場のポケモン表示（"場: A HP:.. 技=[..] / B / 控え: ..."形式）から名前だけを
+# 抜き出す（_format_pokemonが名前の直後にHP/状態異常/技を付与するため）
+_FIELD_NAME_RE = re.compile(r'^([^\s(]+)')
 
 
 def find_prediction_candidates(entries: list) -> list:
@@ -108,6 +123,95 @@ def judge_hit(side: str, battle_result: str) -> bool:
     if side == "player":
         return battle_result == "勝ち"
     return battle_result == "負け"
+
+
+def find_selection_prediction_candidate(render_dir: Path, entries: list) -> dict | None:
+    """選出予想の予測ポイントを返す（2026-08-24新設）。
+
+    render_dir配下にteam_preview.json（`team_preview_gui.py`が事前に保存・パス0）が
+    あり、相手の構築が1匹以上判明していれば候補を返す。無ければNone
+    （0件も正常な結果として許容する＝team_preview.json未作成の試合では単に
+    この予測は生成しない）。
+
+    予測ポイントの時刻は、必ずbattle_start（最初のイベント）より前に収まるよう
+    最初のイベント時刻の半分か`_SELECTION_PREDICT_TIME_CAP`の小さい方を使う。
+    """
+    preview = load_team_preview(render_dir)
+    if not preview or not preview.get("opponent_team"):
+        return None
+    if not entries:
+        return None
+    first_event_time = min(e["event_time"] for e in entries)
+    predict_time = min(_SELECTION_PREDICT_TIME_CAP, first_event_time / 2)
+    return {
+        "time": max(0.0, predict_time),
+        "opponent_team": preview["opponent_team"],
+        "hint": format_team_preview_hint(preview),
+    }
+
+
+def find_battle_start_event(entries: list) -> dict | None:
+    """選出予想の回収アンカー（battle_startイベント）を返す。無ければNone。"""
+    starts = [e for e in entries if e.get("event_type") == "battle_start"]
+    return min(starts, key=lambda e: e["event_time"]) if starts else None
+
+
+def _extract_field_names(field_bench_str: str) -> list[str]:
+    """context['player']/['opponent']（"場: A HP:.. 技=[..] / B / 控え: ..."形式・
+    `BattleStateTracker._format_pokemon`由来）から、場にいるポケモン名だけを
+    抜き出す（選出予想の的中判定用）。形式が想定と異なる場合は空リスト。
+    """
+    if not field_bench_str or "情報収集中" in field_bench_str:
+        return []
+    field_part = field_bench_str.split(" / 控え: ", 1)[0]
+    if field_part.startswith("場: "):
+        field_part = field_part[len("場: "):]
+    names = []
+    for token in field_part.split(" / "):
+        m = _FIELD_NAME_RE.match(token.strip())
+        if m:
+            names.append(m.group(1))
+    return names
+
+
+def judge_selection_hit(prediction_text: str, opponent_team: list[str],
+                        battle_start_entry: dict) -> tuple[bool, list[str]]:
+    """選出予想の的中判定（2026-08-24新設）。
+
+    予測文中に登場した相手構築の種族名と、battle_startで実際に場に出た
+    ポケモン名を突き合わせ、1匹でも一致すれば的中とする（LLMの自己申告に
+    頼らず、Python側で機械的に判定する既存方針を踏襲）。
+
+    戻り値: (的中したか, 実際のリード名のリスト)
+    """
+    actual_leads = _extract_field_names(
+        (battle_start_entry.get("context") or {}).get("opponent", ""))
+    predicted_names = [name for name in opponent_team if name in prediction_text]
+    hit = bool(set(predicted_names) & set(actual_leads))
+    return hit, actual_leads
+
+
+def request_selection_prediction(ec2_url: str, team_preview_hint: str, predict_time: float,
+                                  persona: str = "kurepi", timeout: float = 120.0) -> str | None:
+    """EC2 /api/script（mode=predict_selection）を呼び、選出予想文を1件生成する。"""
+    payload = {
+        "mode": "predict_selection",
+        "team_preview_hint": team_preview_hint,
+        "time": predict_time,
+        "persona": persona,
+    }
+    resp = requests.post(f"{ec2_url.rstrip('/')}/api/script", json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success"):
+        raise RuntimeError(
+            f"/api/script(predict_selection) 失敗: {data.get('error')} {data.get('message')}")
+    fillers = data.get("fillers") or []
+    if not fillers:
+        logger.warning("選出予想生成: t=%.1fs で0件応答", predict_time)
+        return None
+    logger.info("選出予想生成 t=%.1fs: %s", predict_time, fillers[0]["text"][:40])
+    return fillers[0]["text"]
 
 
 def _events_payload(entries: list) -> list:
@@ -224,41 +328,67 @@ def main(argv=None) -> int:
         return 1
 
     entries = load_manifest(render_dir)
+    items = []  # 各予測系統が成功したぶんの{time,text,event_type}をここへ集約
 
+    # ── 条件系予測（場のコンディション・2026-08-21）──────────────────────
     candidates = find_prediction_candidates(entries)
     decisive = find_decisive_event(entries)
     battle_result = determine_battle_result(entries)
 
     if not candidates:
-        logger.info("予測ポイント（場のコンディションを確立したmove_single）なし。予測生成は不要")
+        logger.info("予測ポイント（場のコンディションを確立したmove_single）なし。条件系予測は不要")
     if decisive is None:
-        logger.info("回収アンカー（faint/battle_end）なし。予測生成は不要")
+        logger.info("回収アンカー（faint/battle_end）なし。条件系予測は不要")
     if battle_result is None:
-        logger.info("battle_result 未確定（降参・OCR未検出等）。予測生成は不要")
+        logger.info("battle_result 未確定（降参・OCR未検出等）。条件系予測は不要")
 
-    if not candidates or decisive is None or battle_result is None:
-        if not args.dry_run:
-            (render_dir / "predictions.jsonl").write_text("", encoding="utf-8")
-        return 0
+    if candidates and decisive is not None and battle_result is not None:
+        events_payload = _events_payload(entries)
+        for c in candidates:
+            prediction_text = request_prediction(args.ec2_url, events_payload, c,
+                                                 persona=args.persona)
+            if not prediction_text:
+                continue
+            hit = judge_hit(c["side"], battle_result)
+            outcome_summary = decisive.get("commentary", "")
+            payoff_text = request_payoff(args.ec2_url, prediction_text, hit, outcome_summary,
+                                         decisive["event_time"], persona=args.persona)
+            if not payoff_text:
+                continue
+            items.append({"time": c["time"], "text": prediction_text, "event_type": "prediction"})
+            items.append({"time": decisive["event_time"], "text": payoff_text,
+                          "event_type": "prediction_payoff"})
+            print(f"  {c['time']:>7.1f}s [予測/{c['side']}]  {prediction_text}")
+            print(f"  {decisive['event_time']:>7.1f}s [回収/的中={hit}]  {payoff_text}")
 
-    events_payload = _events_payload(entries)
-    items = []  # request_predictionが成功した候補ぶんの{time,text,event_type}
-    for c in candidates:
-        prediction_text = request_prediction(args.ec2_url, events_payload, c,
-                                             persona=args.persona)
-        if not prediction_text:
-            continue
-        hit = judge_hit(c["side"], battle_result)
-        outcome_summary = decisive.get("commentary", "")
-        payoff_text = request_payoff(args.ec2_url, prediction_text, hit, outcome_summary,
-                                     decisive["event_time"], persona=args.persona)
-        if not payoff_text:
-            continue
-        items.append({"time": c["time"], "text": prediction_text, "event_type": "prediction"})
-        items.append({"time": decisive["event_time"], "text": payoff_text,
-                      "event_type": "prediction_payoff"})
-        print(f"  {c['time']:>7.1f}s [予測/{c['side']}]  {prediction_text}")
-        print(f"  {decisive['event_time']:>7.1f}s [回収/的中={hit}]  {payoff_text}")
+    # ── 選出予想（2026-08-24新設）── 条件系予測とは独立に成否判定する ──────
+    selection = find_selection_prediction_candidate(render_dir, entries)
+    battle_start = find_battle_start_event(entries)
+    if selection is None:
+        logger.info("team_preview.json（相手の構築）なし。選出予想は不要")
+    elif battle_start is None:
+        logger.info("battle_startイベントなし。選出予想の回収先が無いため不要")
+    else:
+        prediction_text = request_selection_prediction(
+            args.ec2_url, selection["hint"], selection["time"], persona=args.persona)
+        if prediction_text:
+            hit, actual_leads = judge_selection_hit(
+                prediction_text, selection["opponent_team"], battle_start)
+            outcome_summary = (
+                f"実際に場に出てきたのは{'、'.join(actual_leads)}でした" if actual_leads
+                else "実際の選出が画面から確認できませんでした")
+            payoff_text = request_payoff(
+                args.ec2_url, prediction_text, hit, outcome_summary,
+                battle_start["event_time"], persona=args.persona)
+            if payoff_text:
+                items.append({"time": selection["time"], "text": prediction_text,
+                              "event_type": "selection_prediction"})
+                items.append({"time": battle_start["event_time"], "text": payoff_text,
+                              "event_type": "selection_prediction_payoff"})
+                print(f"  {selection['time']:>7.1f}s [選出予想]  {prediction_text}")
+                print(f"  {battle_start['event_time']:>7.1f}s [選出回収/的中={hit}]  {payoff_text}")
+
+    items.sort(key=lambda item: item["time"])
 
     if args.dry_run:
         logger.info("dry-run のためここまで（predictions.jsonl 未更新）")

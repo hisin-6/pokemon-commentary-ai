@@ -47,6 +47,10 @@ from render_commentary_video import (  # noqa: E402
     resolve_video_path,
 )
 
+# パス0（選出前チームプレビュー）保存分の読み込み（2026-08-26新設: サムネへの構築反映）
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from src.pokedb.team_preview import load_team_preview  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 # イベント種別ごとの「盛り上がり」スコア（KOがHP急変より優先されるよう上限を分離）。
@@ -232,6 +236,24 @@ def _collect_roster(states: list, side: str) -> list[str]:
     return names
 
 
+def _team_preview_roster(render_dir: Path) -> dict[str, list[str]] | None:
+    """render_dir配下にteam_preview.json（パス0で保存した選出前構築）があれば
+    {"own": [...], "opponent": [...]}（各最大_MAX_ROSTER_ICONS匹）を返す。
+
+    2026-08-26新設: `_collect_roster`（states.jsonlベース・試合中に実際に
+    映ったポケモンのみが対象で、選出6匹全部は拾えない）と違い、team_preview.json
+    があれば選出前の6匹全部を正確に反映できる。どちらの陣営も空ならNone。
+    """
+    data = load_team_preview(render_dir)
+    if not data:
+        return None
+    own = list(data.get("own_team") or [])[:_MAX_ROSTER_ICONS]
+    opponent = list(data.get("opponent_team") or [])[:_MAX_ROSTER_ICONS]
+    if not own and not opponent:
+        return None
+    return {"own": own, "opponent": opponent}
+
+
 def _resolve_pokemon_id(name_ja: str, pokedb_path: Path = _POKEDB_PATH) -> int | None:
     """pokedb.sqlite（PokeAPI由来の図鑑DB）で和名からPokeAPIの図鑑番号を引く。"""
     if not pokedb_path.exists():
@@ -295,6 +317,7 @@ def _wrap_to_lines(draw, text: str, font, max_width: float, max_lines: int = _LA
 def compose_thumbnail(frame_png: Path, out_png: Path, label: str,
                       avatar_face_png: Path | None = None,
                       roster_icon_pngs: list[Path] | None = None,
+                      roster_rows: dict[str, list[Path]] | None = None,
                       character_name: str = _CHARACTER_NAME,
                       big_logo_text: str = "AI自動実況",
                       avatar_face_scale: float = _AVATAR_FACE_SCALE_DEFAULT) -> None:
@@ -303,6 +326,9 @@ def compose_thumbnail(frame_png: Path, out_png: Path, label: str,
     avatar_face_png / roster_icon_pngs を渡すと、右上にアバターの顔・キャプション帯の
     直上に構築アイコン列も焼き込む（AIVTuberサムネ刷新・2026-08-04）。どちらも省略時は
     従来通りゲーム画面＋テキスト帯＋AI実況バッジのみのシンプル版になる。
+    roster_rows: {"own": [...], "opponent": [...]} を渡すと、相手/自分の並びを
+    2段で焼き込む（2026-08-26新設・team_preview.jsonがある試合向け）。
+    roster_icon_pngs と両方渡された場合はroster_rows（2段）を優先する。
     character_name: バッジ下に焼き込むキャラ名（既定=花圓くれぴ・persona="neutral"時は
     呼び出し側から_CHARACTER_NAME_NEUTRALを渡すこと）。
     big_logo_text: label=""（盛り上がりシーンの字幕なし）時に代わりに表示する大きな
@@ -406,7 +432,45 @@ def compose_thumbnail(frame_png: Path, out_png: Path, label: str,
         composed.alpha_composite(face, (fx, fy))
 
     # ── 構築アイコン（キャプション帯のすぐ上に横並び）───────────────────────
-    if roster_icon_pngs:
+    # roster_rows（相手/自分の2段・team_preview.json由来）を roster_icon_pngs
+    # （1段・states.jsonl実測由来）より優先する。
+    rows = [(rl, icons) for rl, icons in
+            (("相手", (roster_rows or {}).get("opponent") or []),
+             ("自分", (roster_rows or {}).get("own") or []))
+            if icons] if roster_rows else []
+
+    if rows:
+        icon_size = int(h * 0.075)
+        row_gap = int(icon_size * 0.2)
+        label_font_size = int(icon_size * 0.4)
+        label_font = ImageFont.truetype(font_path, size=label_font_size) if font_path else font
+        label_w = int(icon_size * 1.15)
+        row_h = icon_size
+        strip_h = len(rows) * row_h + (len(rows) - 1) * row_gap + int(icon_size * 0.3)
+        strip_y = h - bar_h - strip_h
+
+        strip_overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ImageDraw.Draw(strip_overlay).rectangle(
+            [0, strip_y, w, strip_y + strip_h], fill=(10, 12, 20, 160))
+        composed = Image.alpha_composite(composed, strip_overlay)
+        composed_draw = ImageDraw.Draw(composed)
+
+        row_y = strip_y + int(icon_size * 0.15)
+        gap = int(icon_size * 0.2)
+        for row_label, icons in rows:
+            composed_draw.text((pad_x, row_y + int(icon_size * 0.2)), row_label,
+                               font=label_font, fill=(255, 255, 255, 255),
+                               stroke_width=2, stroke_fill=(0, 0, 0, 255))
+            icon_x = pad_x + label_w
+            for icon_path in icons:
+                try:
+                    icon = Image.open(icon_path).convert("RGBA").resize((icon_size, icon_size))
+                except Exception:
+                    continue
+                composed.alpha_composite(icon, (icon_x, row_y))
+                icon_x += icon_size + gap
+            row_y += row_h + row_gap
+    elif roster_icon_pngs:
         icon_size = int(h * 0.09)
         strip_h = int(icon_size * 1.3)
         strip_y = h - bar_h - strip_h
@@ -436,6 +500,7 @@ def generate_thumbnail(render_dir: Path, video: Path = None, out: Path = None,
                        hp_swing_threshold: float = _DEFAULT_HP_SWING_THRESHOLD,
                        allow_result_spoiler: bool = False,
                        team: str | None = "player",
+                       use_team_preview_roster: bool = True,
                        avatar_video: Path = None,
                        avatar_time: float = None,
                        avatar_offset: float = 0.0,
@@ -445,7 +510,13 @@ def generate_thumbnail(render_dir: Path, video: Path = None, out: Path = None,
                        persona: str = "kurepi",
                        big_logo_text: str = "AI自動実況",
                        avatar_face_scale: float = _AVATAR_FACE_SCALE_DEFAULT) -> dict:
-    """サムネイル生成の一連の流れ。戻り値は選ばれた瞬間の情報。"""
+    """サムネイル生成の一連の流れ。戻り値は選ばれた瞬間の情報。
+
+    use_team_preview_roster: team_preview.json（パス0）があれば相手/自分の並びを
+    2段で自動的に焼き込む（2026-08-26新設）。teamパラメータより優先する
+    （--team明示指定時も含む）。False（--no-roster-icons指定時）ならこの自動
+    判定自体を無効化し、team引数のみに従う。
+    """
     manifest = load_manifest(render_dir)
     states = load_states(render_dir)
 
@@ -485,7 +556,17 @@ def generate_thumbnail(render_dir: Path, video: Path = None, out: Path = None,
                 logger.warning("アバター顔の抜き出しに失敗（顔なしで続行）: %s", exc)
 
         roster_icon_pngs = None
-        if team:
+        roster_rows = None
+        team_preview = _team_preview_roster(render_dir) if use_team_preview_roster else None
+        if team_preview:
+            own_icons = [p for p in (fetch_pokemon_icon(name, icon_cache_dir, pokedb_path)
+                                     for name in team_preview["own"]) if p is not None]
+            opponent_icons = [p for p in (fetch_pokemon_icon(name, icon_cache_dir, pokedb_path)
+                                          for name in team_preview["opponent"]) if p is not None]
+            if own_icons or opponent_icons:
+                roster_rows = {"own": own_icons, "opponent": opponent_icons}
+
+        if not roster_rows and team:
             roster_names = _collect_roster(states, team)[:_MAX_ROSTER_ICONS]
             icons = [p for p in (fetch_pokemon_icon(name, icon_cache_dir, pokedb_path)
                                  for name in roster_names) if p is not None]
@@ -495,6 +576,7 @@ def generate_thumbnail(render_dir: Path, video: Path = None, out: Path = None,
         compose_thumbnail(frame_png, out, moment["label"],
                           avatar_face_png=avatar_face_png,
                           roster_icon_pngs=roster_icon_pngs,
+                          roster_rows=roster_rows,
                           character_name=character_name,
                           big_logo_text=big_logo_text,
                           avatar_face_scale=avatar_face_scale)
@@ -520,9 +602,12 @@ def main(argv=None) -> int:
                         help="battle_end（試合結果）も候補に含める（既定は結果ネタバレ防止のため除外）")
     parser.add_argument("--team", choices=["player", "opponent"], default=None,
                         help="構築アイコンに使う陣営（既定: 焼き込まない。2026-08-15確定運用で"
-                             "アイコン無しがデフォルトに変更。表示したい時だけ指定する）")
+                             "アイコン無しがデフォルトに変更。表示したい時だけ指定する。"
+                             "team_preview.jsonがある試合ではこの指定より自動2段表示が"
+                             "優先される＝2026-08-26新設、下記--no-roster-icons参照）")
     parser.add_argument("--no-roster-icons", action="store_true",
-                        help="（後方互換のため残置・--team未指定なら元々アイコンは出ない）")
+                        help="構築アイコンを一切焼き込まない（team_preview.jsonがある試合での"
+                             "自動2段表示も含めて無効化する）")
     parser.add_argument("--avatar-video", help="v2cアバター録画のパス（指定時は右上に顔を焼き込む）")
     parser.add_argument("--avatar-time", type=float,
                         help="アバター顔の抜き出し時刻・秒（省略時はサムネ選択時刻+avatar-offset）")
@@ -549,6 +634,7 @@ def main(argv=None) -> int:
         hp_swing_threshold=args.hp_swing_threshold,
         allow_result_spoiler=args.allow_result_spoiler,
         team=None if args.no_roster_icons else args.team,
+        use_team_preview_roster=not args.no_roster_icons,
         avatar_video=Path(args.avatar_video) if args.avatar_video else None,
         avatar_time=args.avatar_time,
         avatar_offset=args.avatar_offset,

@@ -492,6 +492,78 @@ class TestGeneratePosthocCommentary:
         assert seen_histories[0] == []
         assert seen_histories[1] == ["実況1"]
 
+    def test_faint_repeat_hint_when_move_single_already_narrated_death(self, tmp_path, monkeypatch):
+        """move_singleがHP観測で先に気絶を語っていた場合、後続の正式faintイベントに
+        「新情報ではない」ヒントが注入される（2026-08-24新設・faint二重報告対策。
+        実機2026-08-23_22-15-43のfbで発覚: 187.2sのmove_singleで先に気絶を語ったのに
+        254.1sの正式faintイベントが同じ気絶を「これは大きなアドバンテージ」と初耳の
+        体で再報告していた）。"""
+        p = self._make_pipeline(tmp_path)
+
+        def _state(name, hp_pct):
+            return {"player": [], "opponent": [{"name": name, "hp_pct": hp_pct, "status": None}]}
+
+        p._panel_state_history = [
+            (185.0, _state("オオニューラ", 68.0)),
+            (190.0, _state("オオニューラ", 0.0)),
+        ]
+        p._protect_history = []
+        p._miss_history = []
+        p._flinch_history = []
+        p._pending_render_events = [
+            {"event_time": 187.2, "event_type": "move_single",
+             "game_state": {"ocr_text": ""}, "battle_context": {}, "move_log": [],
+             "render_context": None},
+            {"event_time": 254.1, "event_type": "faint",
+             "game_state": {"ocr_text": ""},
+             "battle_context": {"player_bench": "なし", "opponent_bench": "オオニューラ(ひんし)"},
+             "move_log": [], "render_context": None},
+        ]
+        seen_game_states = []
+
+        def fake_call(ec2_url, game_state, event_type, history, battle_context,
+                      classifier, move_log, **kwargs):
+            seen_game_states.append((event_type, dict(game_state)))
+            return (f"実況{len(seen_game_states)}", "a")
+
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", fake_call)
+
+        p._generate_posthoc_commentary()
+
+        faint_call = next(gs for et, gs in seen_game_states if et == "faint")
+        assert "オオニューラ" in faint_call.get("faint_repeat_hint", "")
+
+    def test_no_faint_repeat_hint_for_unrelated_faint(self, tmp_path, monkeypatch):
+        """move_singleで先に語られていない気絶には faint_repeat_hint を付けない
+        （通常ケースの回帰ガード）。"""
+        p = self._make_pipeline(tmp_path)
+        p._panel_state_history = []
+        p._protect_history = []
+        p._miss_history = []
+        p._flinch_history = []
+        p._pending_render_events = [
+            {"event_time": 187.2, "event_type": "move_single",
+             "game_state": {"ocr_text": ""}, "battle_context": {}, "move_log": [],
+             "render_context": None},
+            {"event_time": 254.1, "event_type": "faint",
+             "game_state": {"ocr_text": ""},
+             "battle_context": {"player_bench": "なし", "opponent_bench": "オオニューラ(ひんし)"},
+             "move_log": [], "render_context": None},
+        ]
+        seen_game_states = []
+
+        def fake_call(ec2_url, game_state, event_type, history, battle_context,
+                      classifier, move_log, **kwargs):
+            seen_game_states.append((event_type, dict(game_state)))
+            return (f"実況{len(seen_game_states)}", "a")
+
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", fake_call)
+
+        p._generate_posthoc_commentary()
+
+        faint_call = next(gs for et, gs in seen_game_states if et == "faint")
+        assert "faint_repeat_hint" not in faint_call
+
     def test_falls_back_to_phi3_on_bedrock_failure(self, tmp_path, monkeypatch):
         p = self._make_pipeline(tmp_path)
         p._pending_render_events = [

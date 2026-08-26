@@ -539,6 +539,63 @@ class TestUpdateMissHistory:
         assert pipe._miss_history == [179.9]
 
 
+class TestUpdateFlinchHistory:
+    """「Xはひるんで攻撃できなかった」メッセージの捕捉（2026-08-24新設・
+    技の対象ヒント用）。TestUpdateProtectHistoryと同じ構造。"""
+
+    def _pipe(self, name="ガオガエン", score=95):
+        pipe = Pipeline.__new__(Pipeline)
+        pipe._flinch_history = []
+        pipe._video_now = 81.0
+        result = MagicMock()
+        result.category = "pokemon"
+        result.score = score
+        result.canonical_ja = name
+        clf = MagicMock()
+        clf.classify.return_value = result
+        pipe._classifier = clf
+        return pipe
+
+    @staticmethod
+    def _ocr(texts):
+        return [{"text": t} for t in texts]
+
+    def test_detects_flinch_phrase(self):
+        pipe = self._pipe()
+        pipe._update_flinch_history(self._ocr(["ガオガエンは", "ひるんで", "攻撃できなかった!"]))
+        assert pipe._flinch_history == [(81.0, "自分側", "ガオガエン")]
+
+    def test_opponent_side_with_prefix(self):
+        pipe = self._pipe(name="オオニューラ")
+        pipe._update_flinch_history(self._ocr(
+            ["相手の", "オオニューラは", "ひるんで", "攻撃できなかった!"]))
+        assert pipe._flinch_history == [(81.0, "相手側", "オオニューラ")]
+
+    def test_no_message_no_record(self):
+        pipe = self._pipe()
+        pipe._update_flinch_history(self._ocr(["ガオガエンの", "ねこだまし!"]))
+        assert pipe._flinch_history == []
+
+    def test_dedupe_within_window(self):
+        pipe = self._pipe()
+        ocr = self._ocr(["ガオガエンは", "ひるんで", "攻撃できなかった!"])
+        pipe._update_flinch_history(ocr)
+        pipe._video_now = 82.5
+        pipe._update_flinch_history(ocr)
+        assert len(pipe._flinch_history) == 1
+
+    def test_flinch_fed_into_move_target_hint(self):
+        """_compute_move_target_hintがひるみ観測を対象ヒントに組み込む
+        （実機2026-08-23_22-15-43のfb「ガオガエンのひるみに言及がない」対策）。"""
+        pipe = Pipeline.__new__(Pipeline)
+        pipe._panel_state_history = []
+        pipe._protect_history = []
+        pipe._miss_history = []
+        pipe._flinch_history = [(81.0, "自分側", "ガオガエン")]
+        hint = pipe._compute_move_target_hint(80.5, 94.5)
+        assert "ガオガエン（自分側）はひるんで技が出せなかった＝この技はひるみを引き起こした" in hint
+
+
 class TestComputeSwitchFocus:
     """交代ヒント（2026-08-15・switch/move_used実況のタイミングずれ対策）。"""
 
@@ -546,6 +603,15 @@ class TestComputeSwitchFocus:
         pipe = Pipeline.__new__(Pipeline)
         pipe._sendout_history = []
         return pipe
+
+    def test_forward_window_cap_is_tight_for_switch(self):
+        """switchイベントは交代選択画面（＝まだ本人は場に出ていない）の時点で発火する
+        ため、前方観測窓は move_used より短く絞る必要がある（2026-08-24新設）。
+        実機2026-08-23_22-15-43で共通の20秒上限（_TARGET_HINT_MAX_WINDOW_SEC）を
+        流用していたところ、23秒先の繰り出しまで「たった今登場」と拾ってしまった。"""
+        assert Pipeline._SENDOUT_HINT_FORWARD_CAP["switch"] <= 10.0
+        assert (Pipeline._SENDOUT_HINT_FORWARD_CAP["move_used"]
+                == Pipeline._TARGET_HINT_MAX_WINDOW_SEC)
 
     def test_sendout_after_switch_event_detected(self):
         """実機の実例(#18): switchイベント(291.7s)は交代選択画面で発火し、
@@ -2542,6 +2608,19 @@ class TestMoveSingleDispatch:
         assert attempt_bedrock is True
         assert kwargs["event_time"] == 123.0
 
+    def test_team_preview_hint_propagated_to_battle_context(self):
+        """2026-08-24: move_single専用のdispatch経路でも選出前チームプレビュー
+        ヒントがbattle_contextに配線されること（move_effect_hintと同じ2箇所目の
+        注入経路の回帰ガード）。"""
+        self.runner._battle_tracker._player.append(FieldPokemon(name="ガブリアス", on_field=True))
+        self._set_classifier(moves={"じしん"}, pokemon={"ガブリアス": "ガブリアス"})
+        self.runner._team_preview_hint = "自分の構築（選出前・種族のみ）: ガブリアス"
+        events = [_ocr("ガブリアスの", y_center=800.0), _ocr("じしん!", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
+
+        _, _, _, battle_context, _, _ = self.runner._dispatch_commentary.call_args.args
+        assert battle_context.get("team_preview_hint") == "自分の構築（選出前・種族のみ）: ガブリアス"
+
     def test_move_effect_hint_propagated_to_battle_context(self):
         """2026-08-14: move_single専用のdispatch経路（_process_eventを経由しない）でも
         技効果ヒントRAGがbattle_contextに配線されること（type_hintと同じ2箇所目の
@@ -2590,6 +2669,41 @@ class TestMoveSingleDispatch:
         Pipeline._update_move_log(self.runner, events, is_main_ocr=True)
 
         assert self.runner._move_log == ["T0:ガブリアスのじしん"]
+        self.runner._dispatch_commentary.assert_called_once()
+
+    def test_same_turn_same_move_different_pokemon_both_registered(self):
+        """ダブルバトルで2匹が同ターンに同じ技を使った場合、両方とも技ログに登録され
+        実況もそれぞれディスパッチされる（2026-08-24修正・従来はターン+技名だけで
+        重複判定しており、2匹目の使用が無条件でスキップされ無実況になっていた。
+        実機2026-08-23_22-15-43のfbで発覚: コノヨザルのれいとうパンチ登録後、
+        同ターンのラグラージのれいとうパンチが消えていた）。"""
+        self.runner._battle_tracker._player.append(FieldPokemon(name="コノヨザル", on_field=True))
+        self.runner._battle_tracker._player.append(FieldPokemon(name="ラグラージ", on_field=True))
+        self._set_classifier(moves={"れいとうパンチ"},
+                              pokemon={"コノヨザル": "コノヨザル", "ラグラージ": "ラグラージ"})
+        events1 = [_ocr("コノヨザルの", y_center=800.0), _ocr("れいとうパンチ!", y_center=800.0)]
+        events2 = [_ocr("ラグラージの", y_center=800.0), _ocr("れいとうパンチ!", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events1, is_main_ocr=True)
+        Pipeline._update_move_log(self.runner, events2, is_main_ocr=True)
+
+        assert self.runner._move_log == [
+            "T0:コノヨザルのれいとうパンチ", "T0:ラグラージのれいとうパンチ"]
+        assert self.runner._dispatch_commentary.call_count == 2
+
+    def test_same_turn_same_move_unresolved_name_still_deduped(self):
+        """使用者名が場のロスターと一致しない（OCR誤読の疑い）場合は従来通り重複として
+        スキップする（例: T7:プテラのいわなだれ登録済みの場合のT7:プーラのいわなだれ、
+        という元々の重複除外ロジックの意図を壊さないための回帰ガード）。"""
+        self.runner._battle_tracker._opponent.append(FieldPokemon(name="プテラ", on_field=True))
+        self._set_classifier(moves={"いわなだれ"}, pokemon={"プテラ": "プテラ"})
+        events1 = [_ocr("あいて", y_center=800.0), _ocr("相手の", y_center=800.0),
+                   _ocr("プテラの", y_center=800.0), _ocr("いわなだれ!", y_center=800.0)]
+        events2 = [_ocr("あいて", y_center=800.0), _ocr("相手の", y_center=800.0),
+                   _ocr("プーラの", y_center=800.0), _ocr("いわなだれ!", y_center=800.0)]
+        Pipeline._update_move_log(self.runner, events1, is_main_ocr=True)
+        Pipeline._update_move_log(self.runner, events2, is_main_ocr=True)
+
+        assert self.runner._move_log == ["T0:プテラのいわなだれ"]
         self.runner._dispatch_commentary.assert_called_once()
 
     def test_partial_pipeline_without_ec2_url_does_not_raise(self):
@@ -3474,6 +3588,30 @@ class TestRecordSituationSnapshot:
             self.runner._record_situation_snapshot("match1", {"event_type": "move_used"})
 
 
+class TestLoadTeamPreviewHint:
+    """Pipeline._load_team_preview_hint（2026-08-24新設）: team_preview_gui.pyが
+    保存した<render_out>/team_preview.jsonをパス1起動時に読み込む。"""
+
+    def test_no_render_sink_returns_empty(self):
+        assert Pipeline._load_team_preview_hint(None) == ""
+
+    def test_no_file_returns_empty(self, tmp_path):
+        sink = MagicMock()
+        sink.out_dir = tmp_path
+        assert Pipeline._load_team_preview_hint(sink) == ""
+
+    def test_file_present_returns_formatted_hint(self, tmp_path):
+        import json
+        (tmp_path / "team_preview.json").write_text(
+            json.dumps({"own_team": ["コノヨザル"], "opponent_team": ["リザードン"]}),
+            encoding="utf-8")
+        sink = MagicMock()
+        sink.out_dir = tmp_path
+        hint = Pipeline._load_team_preview_hint(sink)
+        assert "コノヨザル" in hint
+        assert "リザードン" in hint
+
+
 class TestRenderContextFaintSide:
     """_render_context: 改善ロードマップ③（表情連動）用の faint_side 伝播。
     manifest.jsonl の context.faint_side に「自分/相手どちらが倒れたか」を
@@ -3529,6 +3667,17 @@ class TestRenderContextFaintSide:
     def test_returns_none_without_render_sink(self):
         self.runner._render_sink = None
         assert self.runner._render_context({"faint_side": "player"}) is None
+
+    def test_team_preview_hint_included_when_present(self):
+        """選出前チームプレビュー（2026-08-24）: 台本パス（_build_script_prompt）が
+        イベントのcontext経由で拾えるようmanifest.jsonlに伝播する。"""
+        ctx = self.runner._render_context(
+            {"turn": 3, "team_preview_hint": "自分の構築（選出前・種族のみ）: コノヨザル"})
+        assert ctx["team_preview_hint"] == "自分の構築（選出前・種族のみ）: コノヨザル"
+
+    def test_team_preview_hint_omitted_when_absent(self):
+        ctx = self.runner._render_context({"turn": 3})
+        assert "team_preview_hint" not in ctx
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

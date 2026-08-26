@@ -182,10 +182,14 @@ class TestBuildVisionPrompt:
 
     def test_switch_focus_overrides_event_hint(self):
         """交代ヒント（2026-08-15）: switchイベントは交代選択画面で発火するため、
-        実際に繰り出されたポケモンをevent_hintで直接指示する。"""
+        実際に繰り出されたポケモンをevent_hintで直接指示する。
+        2026-08-24更新: switchはまだ登場前の段階のため、断定形（「登場です」）
+        ではなく進行中・見込みのニュアンスで語らせるよう文言を変更した
+        （実機2026-08-23_22-15-43のfbで、選出中を「登場です」と断定していたため）。"""
         prompt = _build_vision_prompt(
             self._context("switch", switch_focus="自分のペリッパー"), [], self._battle_state())
-        assert "実際に繰り出されたのは「自分のペリッパー」" in prompt
+        assert "この後「自分のペリッパー」が" in prompt
+        assert "まだ画面に登場していない" in prompt
         assert "それより前の交代を今起きたかのように語らないこと" in prompt
 
     def test_switch_without_focus_keeps_generic_hint(self):
@@ -295,6 +299,22 @@ class TestBuildVisionPrompt:
     def test_type_hint_omitted_when_absent(self):
         prompt = _build_vision_prompt(self._context(), [], self._battle_state())
         assert "タイプ相性ヒント" not in prompt
+
+    def test_team_preview_hint_included_when_present(self):
+        """2026-08-24新設: 選出前チームプレビュー（GUIでユーザーが手入力）が
+        battle_state.team_preview_hint経由で渡された場合、プロンプトに含める。
+        持ち物・特性・技構成は不明な旨のガードレールも入る。"""
+        prompt = _build_vision_prompt(
+            self._context(), [],
+            self._battle_state(team_preview_hint=(
+                "自分の構築（選出前・種族のみ）: コノヨザル ／ "
+                "相手の構築（選出前・種族のみ）: リザードン")))
+        assert "コノヨザル" in prompt and "リザードン" in prompt
+        assert "持ち物・特性・技構成は" in prompt
+
+    def test_team_preview_hint_omitted_when_absent(self):
+        prompt = _build_vision_prompt(self._context(), [], self._battle_state())
+        assert "選出前チームプレビュー" not in prompt
 
     def test_condition_hint_included_when_present(self):
         """2026-08-04: 天候/壁/速度操作ヒント（Cicero型アーキテクチャ）が
@@ -720,8 +740,9 @@ class TestLogEndpoint:
 # /api/script（台本パス・ADR-009）
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from src.api.server import (_build_payoff_prompt, _build_script_prompt, _gap_filler_count,
-                             _parse_script_fillers)
+from src.api.server import (_build_payoff_prompt, _build_script_prompt,
+                             _build_selection_prediction_prompt, _count_alive,
+                             _gap_filler_count, _parse_script_fillers)
 
 
 def _valid_script_payload(**overrides):
@@ -736,6 +757,35 @@ def _valid_script_payload(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+class TestCountAlive:
+    """生存数の確定計算（2026-08-24新設・フィラー生存数ヒント用）。
+    実機2026-08-23_22-15-43で「(気絶済みの)オオニューラを倒して数的優位を
+    取り戻した」という誤り（実際は双方まだ3体ずつ）が発生したための対策。"""
+
+    def test_field_only_no_bench(self):
+        assert _count_alive("場: イダイトウ") == 1
+
+    def test_field_and_alive_bench(self):
+        assert _count_alive(
+            "場: ペリッパー HP:167/167 / ラグラージ / 控え: コノヨザル") == 3
+
+    def test_fainted_bench_member_excluded(self):
+        """(ひんし)付きの控えは生存数に含めない（実機2026-08-23_22-15-43の
+        再現ケース: 場2匹+控え1匹生存+控え1匹気絶=生存3）。"""
+        assert _count_alive(
+            "場: ペリッパー HP:167/167 / ラグラージ / 控え: コノヨザル / ガオガエン(ひんし)"
+        ) == 3
+
+    def test_bench_none(self):
+        assert _count_alive("場: リザードン / 控え: なし") == 1
+
+    def test_unknown_format_returns_none(self):
+        assert _count_alive("情報収集中") is None
+
+    def test_empty_returns_none(self):
+        assert _count_alive("") is None
 
 
 class TestBuildScriptPrompt:
@@ -787,6 +837,40 @@ class TestBuildScriptPrompt:
         prompt = _build_script_prompt(payload["gap"], payload["events"])
         assert "イダイトウのだくりゅう" in prompt
         assert "T0" in prompt
+
+    def test_team_preview_hint_rendered_from_event_context(self):
+        """2026-08-24新設: どれか1件のイベントcontextにteam_preview_hintがあれば
+        （試合中一定の情報なので）タイムライン先頭で1回だけ提示し、ガードレールも
+        添える。"""
+        payload = _valid_script_payload(events=[
+            {"time": 63.0, "event_type": "battle_start", "commentary": "開幕だ！",
+             "context": {"turn": 0, "player": "場: イダイトウ", "opponent": "場: リザードン",
+                         "team_preview_hint": (
+                             "自分の構築（選出前・種族のみ）: コノヨザル ／ "
+                             "相手の構築（選出前・種族のみ）: リザードン")}},
+        ])
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "コノヨザル" in prompt and "リザードン" in prompt
+        assert "持ち物・特性・技構成は" in prompt
+
+    def test_team_preview_hint_omitted_when_absent(self):
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "選出前チームプレビュー" not in prompt
+
+    def test_alive_count_rendered_and_trusted_over_freeform_counting(self):
+        """タイムライン項目に生存数（確定）が付記され、それを唯一の根拠にする
+        よう指示される（2026-08-24新設・実機2026-08-23_22-15-43のfb「気絶済みの
+        ポケモンを倒して数的優位を取り戻したと誤って言及」対策）。"""
+        payload = _valid_script_payload(events=[
+            {"time": 63.0, "event_type": "battle_start", "commentary": "開幕だ！",
+             "context": {"turn": 3,
+                         "player": "場: ペリッパー / ラグラージ / 控え: コノヨザル",
+                         "opponent": "場: リザードン / 控え: ガブリアス / オオニューラ(ひんし)"}},
+        ])
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "生存数（確定）=自分3体/相手2体" in prompt
+        assert "生存数（確定）" in prompt and "唯一正確な情報" in prompt
 
     def test_pre_battle_generic_talk_rule_uses_first_event_time(self):
         """最初のイベント時刻より前は汎用トークにする指示が入る。"""
@@ -1006,6 +1090,31 @@ class TestBuildPayoffPrompt:
         assert "花圓" not in prompt
 
 
+class TestBuildSelectionPredictionPrompt:
+    """選出予想実況の予測側（_build_selection_prediction_prompt・2026-08-24新設）。"""
+
+    def test_includes_team_preview_hint(self):
+        prompt = _build_selection_prediction_prompt(
+            "相手の構築（選出前・種族のみ）: リザードン / オオニューラ / ガブリアス",
+            predict_time=1.5)
+        assert "リザードン" in prompt and "オオニューラ" in prompt and "ガブリアス" in prompt
+
+    def test_instructs_species_only_no_item_ability_moveset_guessing(self):
+        prompt = _build_selection_prediction_prompt("相手の構築: リザードン", predict_time=1.5)
+        assert "持ち物・特性・技構成はこのプレビューには含まれず不明" in prompt
+
+    def test_output_format_single_item_at_predict_time(self):
+        prompt = _build_selection_prediction_prompt("相手の構築: リザードン", predict_time=1.5)
+        assert "time は 1.5 にすること" in prompt
+        assert "要素は1件だけ" in prompt
+
+    def test_persona_neutral_excludes_kurepi(self):
+        prompt = _build_selection_prediction_prompt(
+            "相手の構築: リザードン", predict_time=1.5, persona="neutral")
+        assert "くれぴ" not in prompt
+        assert "花圓" not in prompt
+
+
 class TestGapFillerCount:
 
     def test_scales_with_gap_length(self):
@@ -1207,4 +1316,52 @@ class TestScriptEndpoint:
         }
         with patch.object(server_module.bedrock_script, "invoke_model", return_value=mock_bedrock_response):
             resp = client.post("/api/script", json=self._payoff_payload())
+        assert resp.status_code == 200
+
+    def _selection_payload(self, **overrides):
+        payload = {
+            "mode": "predict_selection",
+            "team_preview_hint": "相手の構築（選出前・種族のみ）: リザードン / オオニューラ",
+            "time": 1.5,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_selection_missing_fields_returns_400(self, client):
+        resp = client.post("/api/script", json=self._selection_payload(team_preview_hint=None))
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == "missing_selection_fields"
+
+    def test_selection_successful_call(self, client):
+        mock_response_body = {
+            "content": [{"text": '[{"time": 1.5, "text": "リザードンとオオニューラが来るかも！"}]'}],
+            "usage": {"input_tokens": 200, "output_tokens": 40},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(
+                read=MagicMock(return_value=json.dumps(mock_response_body).encode())
+            )
+        }
+        with patch.object(server_module.bedrock_script, "invoke_model",
+                           return_value=mock_bedrock_response) as mock_invoke:
+            resp = client.post("/api/script", json=self._selection_payload())
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["fillers"] == [{"time": 1.5, "text": "リザードンとオオニューラが来るかも！"}]
+        sent_body = json.loads(mock_invoke.call_args.kwargs["body"])
+        prompt_text = sent_body["messages"][0]["content"][0]["text"]
+        assert "リザードン" in prompt_text and "オオニューラ" in prompt_text
+
+    def test_selection_does_not_require_events_or_gap(self, client):
+        mock_response_body = {
+            "content": [{"text": '[{"time": 1.5, "text": "予想"}]'}],
+            "usage": {},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(
+                read=MagicMock(return_value=json.dumps(mock_response_body).encode())
+            )
+        }
+        with patch.object(server_module.bedrock_script, "invoke_model", return_value=mock_bedrock_response):
+            resp = client.post("/api/script", json=self._selection_payload())
         assert resp.status_code == 200

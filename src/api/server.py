@@ -161,6 +161,31 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _count_alive(field_bench_str: str) -> int | None:
+    """manifestのcontext['player']/['opponent']（"場: A / B / 控え: C / D(ひんし)"形式）
+    から生存数を数える（2026-08-24新設・フィラー生存数ヒント用）。
+
+    台本パス（_build_script_prompt）のタイムラインはこれまで実況文の羅列のみで、
+    生存数はLLMが文章から自力で数える必要があった。実機2026-08-23_22-15-43で
+    「(気絶した)オオニューラを倒して数的優位を取り戻した」という誤り（実際は双方
+    まだ3体ずつで互角）が発生したため、Python側で確定数を計算して明示する。
+    形式が想定と異なる（「情報収集中」等）場合は数えず None を返す。
+    """
+    if not field_bench_str or "情報収集中" in field_bench_str:
+        return None
+    if " / 控え: " in field_bench_str:
+        field_part, bench_part = field_bench_str.split(" / 控え: ", 1)
+    else:
+        field_part, bench_part = field_bench_str, "なし"
+    if field_part.startswith("場: "):
+        field_part = field_part[len("場: "):]
+    field_names = [s for s in field_part.split(" / ") if s.strip()]
+    alive = len(field_names)
+    if bench_part.strip() != "なし":
+        alive += sum(1 for s in bench_part.split(" / ") if s.strip() and "(ひんし)" not in s)
+    return alive
+
+
 def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
                           has_image: bool = True) -> str:
     """Bedrock に送るプロンプトを組み立てる。
@@ -191,11 +216,19 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
     elif event_type == "switch" and context.get("switch_focus"):
         # 交代ヒント（2026-08-15）: switchイベントは交代選択画面の時点で発火するため、
         # 実際に繰り出されたポケモンをパイプライン側で確定させて直接指示する
-        # （これが無いとLLMが直前の別の交代を今起きたかのように実況する）
+        # （これが無いとLLMが直前の別の交代を今起きたかのように実況する）。
+        # ⚠️2026-08-24追記: switchイベント自体は「交代を選んだ瞬間」の発火であり、
+        # switch_focusが指すポケモンの実際の登場（繰り出し演出）はこの少し後に起きる
+        # ＝この瞬間はまだ画面に出ていない。「登場です」のような完了・断定形で語ると
+        # 実況が先取りしてしまう（実機2026-08-23_22-15-43のfbで発覚：まだ選出中の
+        # 段階で「ラグラージの登場です！」と断定していた）。
         event_hint = (
-            f"ポケモンの交代・繰り出しの場面。実際に繰り出されたのは「{context.get('switch_focus', '')}」"
-            "（画面の繰り出しメッセージから確定・信頼度高）。この繰り出しだけを実況し、"
-            "それより前の交代を今起きたかのように語らないこと"
+            f"ポケモンの交代を選んだ場面。この後「{context.get('switch_focus', '')}」が"
+            "場に出てくることが画面の繰り出しメッセージから確定している（信頼度高）が、"
+            "この瞬間はまだ交代を選んだ・入れ替えを決めた段階で、そのポケモンはまだ"
+            "画面に登場していない。「〜の登場です！」等の完了・断定形ではなく、"
+            "「〜に交代するようです」「〜を選んだ模様」等、進行中・見込みのニュアンスで"
+            "実況すること。それより前の交代を今起きたかのように語らないこと"
         )
     else:
         event_hint = {
@@ -342,6 +375,15 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
         f"ターン推移: {battle_state.get('turn_history', 'なし')}",
         f"直近のイベント履歴: {battle_state.get('event_log', 'なし')}",
     ]
+    team_preview_hint = battle_state.get("team_preview_hint")
+    if team_preview_hint:
+        lines += [
+            f"選出前チームプレビュー（ユーザー確認済み・信頼度高）: {team_preview_hint}",
+            "※ 持ち物・特性・技構成はこのプレビューには含まれず不明。種族名以外を",
+            "推測・断定しないこと。まだ場に出ていない種族に触れる場合は「後続に控えている」"
+            "「見せている」等、控えめな言い方に留め、既に登場した情報と同列の確定事実として",
+            "語らないこと",
+        ]
     type_hint = battle_state.get("type_hint")
     if type_hint:
         lines += [
@@ -424,6 +466,8 @@ def _build_vision_prompt(context: dict, history: list[str], battle_state: dict,
         lines.append(
             f"直前に起きた気絶の時点の戦況（この直後に下記の技が使われた）: {context['faint_context']}"
         )
+    if context.get("faint_repeat_hint"):
+        lines.append(f"※ {context['faint_repeat_hint']}")
     rag_info: list = context.get("rag_pokemon_info", [])
     if rag_info:
         lines += [
@@ -660,7 +704,28 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None,
         "- 直前ターンでまもる等の防御が成功したかどうかがタイムラインにない場合、攻撃が"
         "命中してダメージが入ったかのように断定しないこと（逆に、まもるを使っていないのに"
         "使った体で実況することも禁止）",
+        "- 「生存数（確定）」が付記されているタイムライン項目があれば、それが自分/相手の"
+        "残り匹数の唯一正確な情報。「数的有利/不利」「数で上回った」等に言及する場合は"
+        "必ずこの数値だけを根拠にすること（実況文中の気絶描写から自分で数え直したり、"
+        "一部の気絶だけを見て有利不利を推測しないこと）",
         "",
+    ]
+    # 選出前チームプレビュー（2026-08-24新設）: 試合中は変化しない情報なので、
+    # イベントのcontextから1件見つかれば十分（どのイベントにも同じ値が入っている）
+    team_preview_hint = next(
+        (e.get("context", {}).get("team_preview_hint") for e in events
+         if e.get("context", {}).get("team_preview_hint")),
+        None,
+    )
+    if team_preview_hint:
+        lines += [
+            f"【選出前チームプレビュー（ユーザー確認済み・信頼度高）】{team_preview_hint}",
+            "※ 持ち物・特性・技構成はこのプレビューには含まれず不明。種族名以外を",
+            "推測・断定しないこと。まだ場に出ていない種族に触れる場合は「後続に控えている」"
+            "「見せている」等、控えめな言い方に留めること",
+            "",
+        ]
+    lines += [
         "【タイムライン（時刻順・ここまでに起きた出来事のみ。📺は画面に技が映った瞬間）】",
         "※ 収録済み実況と重複しない内容にすること。",
     ]
@@ -689,6 +754,10 @@ def _build_script_prompt(gap: dict, events: list, moments: list = None,
                 parts.append(f"自分={ctx['player']}")
             if ctx.get("opponent"):
                 parts.append(f"相手={ctx['opponent']}")
+            alive_p = _count_alive(ctx.get("player", ""))
+            alive_o = _count_alive(ctx.get("opponent", ""))
+            if alive_p is not None and alive_o is not None:
+                parts.append(f"生存数（確定）=自分{alive_p}体/相手{alive_o}体")
             if ctx.get("move_log"):
                 parts.append(f"技ログ={' / '.join(ctx['move_log'])}")
             if parts:
@@ -749,6 +818,59 @@ def _build_payoff_prompt(prediction_text: str, hit: bool, outcome_summary: str,
         "- JSON配列のみを出力すること（前置き・説明文・コードフェンスは書かない）",
         '- 形式: [{"time": 秒数の数値, "text": "実況文"}]（要素は1件だけ）',
         f"- time は {payoff_time:.1f} にすること",
+        "- text は60〜100文字程度（読み上げ約10〜18秒）",
+    ]
+    return "\n".join(lines)
+
+
+def _build_selection_prediction_prompt(team_preview_hint: str, predict_time: float,
+                                        persona: str = "kurepi") -> str:
+    """「選出予想」実況の予測側プロンプトを組み立てる（2026-08-24新設）。
+
+    選出前チームプレビュー（`team_preview_gui.py`でユーザーが手入力・
+    [[project_team_preview_feature]]）の相手6匹の構築から、実際に場に出てくる
+    2匹（リード）を予想させる。battle_start（試合開始）より前・タイムラインが
+    まだ存在しない時点で呼ばれるため、_build_script_prompt（mode=predict、
+    直前までの展開を踏まえた予想）とは前提が異なる軽量な専用プロンプト
+    （_build_payoff_prompt と同様、events/momentsのタイムラインは渡さない）。
+    """
+    if persona == "neutral":
+        intro_lines = [
+            "あなたは、ポケモン対戦実況AIVTuberです。",
+            "テンション高めだが落ち着いた、中立的な実況口調で話してください"
+            "（キャラクターとしての自己紹介・名乗り・一人称のキャラ付けはしないこと）。",
+        ]
+    else:
+        intro_lines = [
+            "あなたは、ポケモン対戦実況AIVTuber「花圓くれぴ（はなまるくれぴ）」です。",
+            "性格は元気で甘えん坊、でもポケモン知識はガチ勢。口調はアイドル・かわいい系",
+            "（語尾に♪を適度に使う・タメ口・テンション高め・かわいい褒め言葉多め）。",
+            "自称は「くれぴ」（ひらがな）。「花圓」という漢字表記は実況文に書かないこと"
+            "（音声合成が正しく読めないため）。",
+        ]
+    lines = [
+        *intro_lines,
+        "録画された試合に後から実況を吹き込みますが、視聴者には生放送のライブ実況に"
+        "聞こえるようにしてください（後から見返している・録画といった言い方は禁止）。",
+        "",
+        "【状況】",
+        f"試合開始前、選出前チームプレビューが判明しています: {team_preview_hint}",
+        "",
+        "【指示】",
+        "相手が実際にどの2匹を先頭（リード）に出してくるか、実況者らしく短く予想してください"
+        "（当たっても外れても構いません。あくまで実況者自身の見立てとして語ること。"
+        "断定はしないこと）。",
+        "- 予想する2匹は、上記の相手の構築に実際に含まれる種族名から具体的に名指しすること"
+        "（推測の理由を一言添えてよい）",
+        "- 持ち物・特性・技構成はこのプレビューには含まれず不明。それらを踏まえた推測は"
+        "書かないこと（純粋に「どの2匹が場に出てくるか」だけを予想する）",
+        "- 鉤括弧（「」）は使わない",
+        "- 「了解しました」等、指示への相槌・確認は書かない",
+        "",
+        "【出力形式】",
+        "- JSON配列のみを出力すること（前置き・説明文・コードフェンスは書かない）",
+        '- 形式: [{"time": 秒数の数値, "text": "実況文"}]（要素は1件だけ）',
+        f"- time は {predict_time:.1f} にすること",
         "- text は60〜100文字程度（読み上げ約10〜18秒）",
     ]
     return "\n".join(lines)
@@ -913,6 +1035,9 @@ def script():
       {start,end}に同じ候補時刻を渡す）が必要。_build_script_prompt を使う
     - "payoff": prediction_text/hit/outcome_summary/time が必要（events/gap不要）。
       _build_payoff_prompt を使う（的中/外れ判定は呼び出し元が確定済みの事実として渡す）
+    - "predict_selection"（2026-08-24新設・選出予想）: team_preview_hint/time が必要
+      （events/gap不要）。_build_selection_prediction_prompt を使う。回収側は既存の
+      "payoff"をそのまま流用する（scripts/generate_predictions.py参照）
     """
     data = request.get_json(silent=True)
     if not data:
@@ -934,6 +1059,16 @@ def script():
             }), 400
         prompt_text = _build_payoff_prompt(
             prediction_text, bool(hit), outcome_summary, float(payoff_time), persona=persona)
+    elif mode == "predict_selection":
+        team_preview_hint = data.get("team_preview_hint")
+        predict_time = data.get("time")
+        if not team_preview_hint or predict_time is None:
+            return jsonify({
+                "success": False, "error": "missing_selection_fields",
+                "message": "team_preview_hint/time が必要です",
+            }), 400
+        prompt_text = _build_selection_prediction_prompt(
+            team_preview_hint, float(predict_time), persona=persona)
     else:
         events: list = data.get("events", [])
         gap = data.get("gap")
