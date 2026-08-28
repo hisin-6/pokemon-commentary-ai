@@ -2835,7 +2835,7 @@ def _build_bedrock_context(
         "rag_pokemon_info":         rag_info,
         "detected_moves":           " / ".join(move_log) if move_log else "なし",
         "faint_context":            game_state.get("faint_context", ""),  # 直前のfaint情報（統合時のみ）
-        "faint_focus":              game_state.get("faint_focus", ""),  # ボール数推定で確定した気絶の対象（合成faintのみ）
+        "faint_focus":              game_state.get("faint_focus", ""),  # 気絶の対象（ボール数推定確定＝合成faint／2026-08-28〜fainted_names()のdiff確定＝通常faintの両方で使う）
         "battle_result":            game_state.get("battle_result", ""),  # 勝敗（battle_endのみ・"勝ち"/"負け"）
         "battle_surrendered":       bool(game_state.get("battle_surrendered", False)),  # 降参による決着（battle_endのみ）
         "move_focus":               game_state.get("move_focus", ""),  # 実況対象の1技（move_singleのみ）
@@ -3832,6 +3832,11 @@ class Pipeline:
         inferred_faints: list[str] = []
         if self._battle_active:
             prev_fainted = self._battle_tracker.fainted_names()
+            # 2026-08-28新設: 「curr_fainted - prev_fainted」（直前イベントとの差分）ではなく
+            # 「curr_fainted - pre_announced_faints」（生涯の実況済み累積との差分）を
+            # faintイベント用に別途使うため、_track_new_faintsが_announced_faintsを
+            # 更新する前の状態をここで退避する（下記コメント参照）。
+            pre_announced_faints = set(self._announced_faints)
             self._battle_tracker.update(game_state, event_type)
             curr_fainted = self._battle_tracker.fainted_names()
             if event_type == "faint":
@@ -3846,20 +3851,44 @@ class Pipeline:
             # 処理時に初めてペリッパー・ブリジュラス両方の確定が同時に起きた際、
             # 会話履歴の直近の名前（47秒前に既に実況済みのペリッパー）をそのまま
             # 踏襲し、実際に試合を終わらせたブリジュラスの名前が一切出てこなかった。
-            # 直接のfaintイベントはOCRの「たおれた」テキストから既に正しく対象を
-            # 特定できているため対象外（過剰な上書きを避ける）。
-            if event_type != "faint":
+            #
+            # 2026-08-28修正（1回目・不十分だった）: 従来は直接のfaintイベント
+            # （event_type=="faint"）を対象外にしていた（OCRの「たおれた」テキストから
+            # 既に正しく対象を特定できている前提）。実機2026-08-28_21-52-34のターン1で
+            # 反証: 自分側の場に2匹（ガブリアス・リザードン）が同時に相手の範囲技を受け、
+            # 実際に落ちたのはリザードンなのにLLMが「ガブリアスが落ちてしまいました」と
+            # 誤った種族名で実況した。そこでfaintイベントにも同じcurr_fainted-prev_fainted
+            # 方式でfaint_focusを注入したが、これは効果ゼロだった——ログに
+            # [気絶確定ヒント]が一度も出力されず、パス1を再実行しても同じ誤りが再発した。
+            #
+            # 2026-08-28修正（2回目・原因判明）: _track_new_faintsのdocstringが
+            # 明記する通り、「たおれた」メッセージ由来の気絶確定は_process_eventの
+            # 呼び出しの合間＝フレーム処理中に起きる。そのためprev_fainted
+            # （このイベント処理の冒頭で読んだfainted_names()）には、直前のフレーム
+            # 処理で既に確定していたリザードンの気絶が最初から含まれてしまっており、
+            # curr_fainted - prev_fainted は常に空集合になっていた（1回目の修正が
+            # 効かなかった直接の原因）。faintイベントについては
+            # curr_fainted - pre_announced_faints（このPipelineインスタンスが生涯で
+            # 実況済みとして登録した名前の累積集合との差分）を使う。こちらは
+            # フレーム処理中に確定した分も正しく「まだ実況していない新情報」として
+            # 拾える（_track_new_faintsが「現在の気絶−実況済み」方式を採用している
+            # のと同じ理由）。非faintイベントは従来の実績があるためprev_fainted方式のまま
+            # 変更しない（挙動を不必要に変えるリスクを避ける）。
+            if event_type == "faint":
+                new_player = sorted(curr_fainted[0] - pre_announced_faints)
+                new_opponent = sorted(curr_fainted[1] - pre_announced_faints)
+            else:
                 new_player = sorted(curr_fainted[0] - prev_fainted[0])
                 new_opponent = sorted(curr_fainted[1] - prev_fainted[1])
-                if new_player or new_opponent:
-                    parts = []
-                    if new_player:
-                        parts.append("自分の" + "と".join(new_player))
-                    if new_opponent:
-                        parts.append("相手の" + "と".join(new_opponent))
-                    game_state = dict(game_state)
-                    game_state["faint_focus"] = "と".join(parts)
-                    log.info("[気絶確定ヒント] event_type=%s %s", event_type, game_state["faint_focus"])
+            if new_player or new_opponent:
+                parts = []
+                if new_player:
+                    parts.append("自分の" + "と".join(new_player))
+                if new_opponent:
+                    parts.append("相手の" + "と".join(new_opponent))
+                game_state = dict(game_state)
+                game_state["faint_focus"] = "と".join(parts)
+                log.info("[気絶確定ヒント] event_type=%s %s", event_type, game_state["faint_focus"])
 
         battle_context = self._battle_tracker.to_context()
         if getattr(self, "_team_preview_hint", ""):
@@ -4175,6 +4204,28 @@ class Pipeline:
         if not (self._ec2_url and self._battle_active):
             return
 
+        # 2026-08-28新設: 保留開始時点（_process_event内のfaint_focus計算）では
+        # 「トラッカー内部のひんしフラグがまだ確定していないことがある」（上のコメント
+        # 参照）ため、_process_event側の計算が空振りすることがある。実機
+        # 2026-08-28_21-52-34で実証: 「リザードンは たおれた!」のメッセージ確定は
+        # faint保留開始（フェーズ遷移検知）の22秒後に届いており、_process_eventの
+        # 計算タイミングでは間に合っていなかった。フラッシュはこの保留の後（数秒〜
+        # 数十秒後）に起きるため、その時点のトラッカー最新状態で確定した気絶を
+        # 改めてfaint_focusとして注入し直す（保留開始時点の計算より確定精度が高い）。
+        curr_fainted = self._battle_tracker.fainted_names()
+        new_player = sorted(curr_fainted[0] - self._announced_faints)
+        new_opponent = sorted(curr_fainted[1] - self._announced_faints)
+        if new_player or new_opponent:
+            parts = []
+            if new_player:
+                parts.append("自分の" + "と".join(new_player))
+            if new_opponent:
+                parts.append("相手の" + "と".join(new_opponent))
+            game_state = dict(game_state)
+            game_state["faint_focus"] = "と".join(parts)
+            self._announced_faints |= set(new_player) | set(new_opponent)
+            log.info("[気絶確定ヒント][flush] %s", game_state["faint_focus"])
+
         # event_time は faint 検知時点の動画内時刻（保留中に動画が進んでいるため
         # 現在時刻ではなく保留開始時刻を使う）
         self._dispatch_commentary(
@@ -4230,6 +4281,10 @@ class Pipeline:
         "相手の場":   "この技は相手側の場全体が対象（撒き菱等の設置技）で、特定のポケモンを対象にしていない",
         "場全体":     "この技は場全体が対象（天候等）で、特定のポケモンを対象にしていない",
     }
+    # 単体対象の技（move.target由来）: 「どちらに当たったか」は断定しないが、
+    # 「2体以上に同時に当たった」ことは技の仕様上あり得ない、という制約には使う
+    # （2026-08-27新設・_compute_move_target_hintの単体化ロジック参照）。
+    _SINGLE_OPPONENT_TARGET_VALUES = {"相手単体", "相手のランダム1体"}
 
     @staticmethod
     def _snap_panel_state(state: dict) -> dict:
@@ -4370,23 +4425,52 @@ class Pipeline:
         range_text = self._MOVE_RANGE_HINT_TEXT.get(move_range) if move_range else None
         if range_text:
             hints.append(range_text)
+
+        protect_hits = [(side, name) for t, side, name in getattr(self, "_protect_history", [])
+                         if start < t <= end]
+        flinch_hits = [(side, name) for t, side, name in getattr(self, "_flinch_history", [])
+                        if start < t <= end]
+        drops = self._hp_drop_observations(start, end)
+        drops_found = dict(drops) if drops is not None else {}
+
+        # 単体対象技の複数体誤爆対策（2026-08-27新設）: 「相手単体」等の技なのに、
+        # まもる／ひるみ／HP減少（観測ノイズ含む）が複数のポケモンにまたがって
+        # 観測されると、単体技が「両方に着弾」したかのような誤実況を招く
+        # （実機renders/2026-08-26_21-35-16: おはかまいり（相手単体）使用時、
+        # やけどの毎ターンダメージがたまたま同じ観測窓に入ったガブリアスと、
+        # 実際に技を防いだイダイトウの両方がHP減少・まもる成立として拾われ、
+        # 「イダイトウは守りきりましたがガブリアスは大きくダメージ」と両方に
+        # 言及する範囲技的な誤実況になっていた）。単体対象と分かっている場合は、
+        # 最も確度の高い1件（まもる／ひるみ＝技の直接的な結果 ＞ HP減少量が
+        # 最大のもの＝技と無関係なやけど等のノイズを除外）だけを残す。
+        implicated = set(protect_hits) | set(flinch_hits) | set(drops_found.keys())
+        if move_range in self._SINGLE_OPPONENT_TARGET_VALUES and len(implicated) > 1:
+            if protect_hits:
+                keep = protect_hits[0]
+            elif flinch_hits:
+                keep = flinch_hits[0]
+            else:
+                keep, _ = max(drops_found.items(), key=lambda kv: kv[1][0] - kv[1][1])
+            log.info("[対象ヒント単体化] t=%.1fs 単体対象技のため %s 以外の観測(%s)を除外",
+                      start, keep, implicated - {keep})
+            protect_hits = [h for h in protect_hits if h == keep]
+            flinch_hits = [h for h in flinch_hits if h == keep]
+            drops_found = {k: v for k, v in drops_found.items() if k == keep}
+
         # まもる成功（この技が防がれた証拠・最優先で提示）
-        for t, side, name in getattr(self, "_protect_history", []):
-            if start < t <= end:
-                hints.append(f"{name}（{side}）は攻撃から身を守った＝この技は防がれた")
+        for side, name in protect_hits:
+            hints.append(f"{name}（{side}）は攻撃から身を守った＝この技は防がれた")
         # 命中失敗（この技が外れた証拠・2026-08-16）
         for t in getattr(self, "_miss_history", []):
             if start < t <= end:
                 hints.append("この技は外れた（対象に命中していない＝ダメージ・効果なし）")
                 break
         # ひるみ発生（この技がフリンチを引き起こした証拠・2026-08-24）
-        for t, side, name in getattr(self, "_flinch_history", []):
-            if start < t <= end:
-                hints.append(f"{name}（{side}）はひるんで技が出せなかった＝この技はひるみを引き起こした")
+        for side, name in flinch_hits:
+            hints.append(f"{name}（{side}）はひるんで技が出せなかった＝この技はひるみを引き起こした")
         # HP減少・状態異常付与（パネル状態履歴の差分）
-        drops = self._hp_drop_observations(start, end)
         if drops is not None:
-            for (label, name), (base_hp, low_hp) in drops.items():
+            for (label, name), (base_hp, low_hp) in drops_found.items():
                 hints.append(
                     f"{name}（{label}）のHPが{round(base_hp)}%→{round(low_hp)}%に減少")
             statuses = self._status_change_observations(start, end)
@@ -4481,6 +4565,30 @@ class Pipeline:
                     log.info("[対象ヒント] t=%.1fs %s", ev["event_time"], target_hint)
                     already_narrated_deaths.update(
                         self._HP_ZERO_HINT_RE.findall(target_hint))
+                    # まもる/命中失敗による追加効果の無効化ヒント（2026-08-27新設）:
+                    # move_effect_hintは技の一般的な効果説明（PokeAPI由来の静的テキスト）
+                    # で、「使うと反動で自分の特攻ががくっとさがる」等の追加効果・反動が
+                    # 実際に発生したかどうかは考慮していない。プロンプト側ではこれを
+                    # 「信頼して事実として扱ってよい」と明言しているため、まもる等で
+                    # 技そのものが不発だった場合でも追加効果が起きたかのように誤実況
+                    # される（実機renders/2026-08-26_21-35-16の282.7s: オーバーヒートが
+                    # ドドゲザンにまもるで防がれたのに「相手は特攻が低下してしまい」と
+                    # 反動が発生したかのように実況していた）。技が防がれた/外れたことが
+                    # target_hintで確定した場合、move_effect_hintにその旨を追記して
+                    # 追加効果・反動も発生していないことを明示する。
+                    voided = ("は攻撃から身を守った＝この技は防がれた" in target_hint
+                              or "この技は外れた" in target_hint)
+                    if voided and ev["battle_context"].get("move_effect_hint"):
+                        voided_hint = (
+                            ev["battle_context"]["move_effect_hint"]
+                            + "（ただし今回はまもる/命中失敗によりこの技自体が不発だったため、"
+                            "上記の追加効果・反動・能力変化は発生していない）"
+                        )
+                        ev["battle_context"]["move_effect_hint"] = voided_hint
+                        if ev.get("render_context") is not None:
+                            ev["render_context"]["move_effect_hint"] = voided_hint
+                        log.info("[技効果ヒント無効化] t=%.1fs 技が不発のため追加効果ヒントに注記",
+                                 ev["event_time"])
                 # タイプ相性ヒントの対象確定（2026-08-20新設）: ダブルバトル等で対象が
                 # 複数いて即断定を見送っていた場合、技の直後の観測（上と同じ手段）で
                 # 実際の対象を確定させ、候補の中から正しい1件に差し替える。対象が
@@ -4538,13 +4646,28 @@ class Pipeline:
             #    無い）場合は、ヒントに頼らずBedrock呼び出し自体をスキップして
             #    再蒸し返しを構造的に防ぐ。一部だけ既報告（新規の気絶が混在）の
             #    場合は従来どおりヒント付与に留める。
-            if ev["event_type"] in ("faint", "move_used") and already_narrated_deaths:
+            # 2026-08-28拡張（実機2026-08-28_21-52-34で発覚した2つの穴）:
+            # 1. already_narrated_deaths はmove_singleのHP0%早期検出でしか埋まらず、
+            #    「相手のエルフーンとガブリアスが倒れました」のような通常のfaintイベント
+            #    自身が確定させた対象は登録されていなかった。全員一致以外（一部だけ既報告）
+            #    のケースで判定が緩くなっていたため、faintイベントを1件処理するたびに
+            #    その時点のベンチ全員（fainted_on_bench）を無条件でここに合流させる。
+            # 2. 一部だけ既報告のケースでは「これを言うな」という禁止だけを渡しており、
+            #    実際に新しいのはどれかをLLMに教えていなかった。ソフトな禁止だけでは
+            #    従わない実例（8/26・8/27）に続き、今回はLLMが禁止された名前をそのまま
+            #    再度話してしまった（370.3sでガブリアス/ドドゲザン/メタグロスが「既報告」と
+            #    ヒントされたのに「ドドゲザンが落ちてしまった」と蒸し返し、本当に新しい
+            #    情報だったリザードン/エルフーンには触れず終い）。禁止対象の差集合
+            #    （fainted_on_bench - repeat_names）を「こちらが新情報」として明示的に
+            #    指示することで、選ぶべき対象を積極的に示す
+            if ev["event_type"] in ("faint", "move_used"):
                 bench_text = " / ".join([
                     (ev.get("battle_context") or {}).get("player_bench", ""),
                     (ev.get("battle_context") or {}).get("opponent_bench", ""),
                 ])
                 fainted_on_bench = set(re.findall(r'([^\s/]+)\(ひんし\)', bench_text))
                 repeat_names = fainted_on_bench & already_narrated_deaths
+                skip_event = False
                 if repeat_names:
                     if (ev["event_type"] == "faint"
                             and fainted_on_bench and repeat_names == fainted_on_bench):
@@ -4552,21 +4675,32 @@ class Pipeline:
                         # イベントは新情報ゼロ。生成自体をスキップして再蒸し返しを防ぐ。
                         log.info("[faint重複スキップ] t=%.1fs %s は全員報告済みのため実況生成をスキップ",
                                  ev["event_time"], repeat_names)
-                        continue
-                    hint = (
-                        "、".join(sorted(repeat_names))
-                        + "の気絶は、既に別のイベントで伝えている"
-                        "（HP観測や正式な気絶表示が先に伝わっているため）。今のイベントで"
-                        "画面上に表示が残っている・技ログに古い情報が残っているだけで、新情報ではない。"
-                        "「たった今起きた」「これは大きなアドバンテージ」のような驚き・速報"
-                        "口調で再度報告し直さないこと。触れる場合は一言の確認・整理に留めるか、"
-                        "この後の展開（残り数・次の一手の見通し等）に焦点を移すこと"
-                    )
-                    ev["game_state"] = dict(ev["game_state"])
-                    ev["game_state"]["faint_repeat_hint"] = hint
-                    if ev.get("render_context") is not None:
-                        ev["render_context"]["faint_repeat_hint"] = hint
-                    log.info("[faint重複ヒント] t=%.1fs %s (%s)", ev["event_time"], repeat_names, ev["event_type"])
+                        skip_event = True
+                    else:
+                        new_focus = fainted_on_bench - repeat_names
+                        hint = (
+                            "、".join(sorted(repeat_names))
+                            + "の気絶は、既に別のイベントで伝えている"
+                            "（HP観測や正式な気絶表示が先に伝わっているため）。今のイベントで"
+                            "画面上に表示が残っている・技ログに古い情報が残っているだけで、新情報ではない。"
+                            "「たった今起きた」「これは大きなアドバンテージ」のような驚き・速報"
+                            "口調で再度報告し直さないこと。触れる場合は一言の確認・整理に留めるか、"
+                            "この後の展開（残り数・次の一手の見通し等）に焦点を移すこと"
+                        )
+                        if new_focus:
+                            hint += (
+                                "。一方、" + "、".join(sorted(new_focus))
+                                + "の気絶はこのイベントで初めて伝える新情報なので、こちらを中心に実況すること"
+                            )
+                        ev["game_state"] = dict(ev["game_state"])
+                        ev["game_state"]["faint_repeat_hint"] = hint
+                        if ev.get("render_context") is not None:
+                            ev["render_context"]["faint_repeat_hint"] = hint
+                        log.info("[faint重複ヒント] t=%.1fs %s (%s)", ev["event_time"], repeat_names, ev["event_type"])
+                if ev["event_type"] == "faint" and fainted_on_bench:
+                    already_narrated_deaths |= fainted_on_bench
+                if skip_event:
+                    continue
             self._record_situation_snapshot(match_id, ev)
             bedrock_commentary, bedrock_analysis = _call_bedrock_text(
                 self._ec2_url, ev["game_state"], ev["event_type"], history,

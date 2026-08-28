@@ -205,6 +205,26 @@ class TestBuildVisionPrompt:
         assert "自分のブリジュラス" in prompt
         assert "新しいターンの攻防が始まる場面" in prompt  # event_hintはmove_usedのまま
 
+    def test_switch_focus_gets_dedicated_move_used_instruction(self):
+        """2026-08-27新設: move_usedはswitchと同様にswitch_focusを断定事実として
+        直接指示する専用event_hintを持つ（従来は状況セクションの一行に埋もれて
+        いた）。実機renders/2026-08-26_21-35-16の298.4s: switch_focusは
+        「自分のイダイトウ」なのに戦況テキストに残っていた古い相手情報から
+        「相手がスコヴィランへ交代してきました」と無関係な内容を実況していた。"""
+        prompt = _build_vision_prompt(
+            self._context("move_used", switch_focus="自分のイダイトウ"), [], self._battle_state())
+        assert "実際に場に出た（出る）ポケモンは「自分のイダイトウ」" in prompt
+        assert "であることが確定している" in prompt
+        assert "今回の交代として語らないこと" in prompt
+
+    def test_avoids_theatrical_return_phrasing(self):
+        """2026-08-27新設: ユーザーfb「イダイトウが舞台に戻るってなに？」
+        （renders/2026-08-26_21-35-16）を受け、「舞台に戻る」等の演劇的な比喩を
+        禁止する指示が入る。"""
+        prompt = _build_vision_prompt(self._context("move_used"), [], self._battle_state())
+        assert "舞台に戻る" in prompt
+        assert "自然な表現を使う" in prompt
+
     def test_move_used_hint_reframed_as_turn_transition(self):
         """2026-08-15: move_usedは発火時点でまだこのターンの技が出ていない
         （通信終了＝ターン冒頭）ため、「今ターンの技を実況」から戦況全体

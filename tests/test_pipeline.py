@@ -415,6 +415,51 @@ class TestMoveTargetHint:
         hint = pipe._compute_move_target_hint(120.0, 130.0, move_range="相手単体")
         assert "ライチュウ（相手側）は攻撃から身を守った" in hint
 
+    def test_move_range_single_target_dedup_prefers_larger_drop(self):
+        """単体対象技の複数体誤爆対策（2026-08-27新設）: 実機
+        renders/2026-08-26_21-35-16の466.1s——おはかまいり（相手単体）使用時、
+        ドドゲザン（実際の対象・100%→61%の大ダメージ）とガブリアス（やけどの
+        毎ターンダメージが偶然同じ観測窓に入っただけ・23%→16%の小ダメージ）の
+        両方がHP減少として観測され、「おはかまいりが両方に着弾！」と単体技なのに
+        範囲技的に誤実況されていた。単体対象と分かっている場合はHP減少量が
+        最大の1件だけを残し、無関係な小ダメージは除外する。"""
+        pipe = self._pipe()
+        pipe._panel_state_history = [
+            (120.0, self._state(player=[("ドドゲザン", 100.0, None), ("ガブリアス", 23.0, None)])),
+            (125.0, self._state(player=[("ドドゲザン", 61.0, None), ("ガブリアス", 16.0, None)])),
+        ]
+        hint = pipe._compute_move_target_hint(120.0, 130.0, move_range="相手単体")
+        assert "ドドゲザン（自分側）のHPが100%→61%に減少" in hint
+        assert "ガブリアス" not in hint
+
+    def test_move_range_single_target_dedup_prefers_protect_over_drop(self):
+        """単体対象技でまもる成立と無関係なHP減少（別ポケモンのノイズ）が同じ窓に
+        混在する場合、まもる成立（技の直接的な結果）を優先し、無関係な減少は
+        除外する（実機renders/2026-08-26_21-35-16の404.9s: おはかまいり使用時、
+        実際に技を防いだイダイトウと、やけどのダメージが乗っただけのガブリアスの
+        両方に言及していた）。"""
+        pipe = self._pipe()
+        pipe._protect_history = [(125.0, "自分側", "イダイトウ")]
+        pipe._panel_state_history = [
+            (120.0, self._state(player=[("ガブリアス", 29.0, None)])),
+            (125.0, self._state(player=[("ガブリアス", 23.0, None)])),
+        ]
+        hint = pipe._compute_move_target_hint(120.0, 130.0, move_range="相手単体")
+        assert "イダイトウ（自分側）は攻撃から身を守った＝この技は防がれた" in hint
+        assert "ガブリアス" not in hint
+
+    def test_move_range_multi_target_keeps_all_drops(self):
+        """回帰ガード: 範囲技（自分以外全員等）では単体化ロジックを適用せず、
+        従来通り複数体すべてのHP減少を列挙する（じしん等の全体攻撃技）。"""
+        pipe = self._pipe()
+        pipe._panel_state_history = [
+            (120.0, self._state(opponent=[("スコヴィラン", 100.0, None), ("オオニューラ", 88.0, None)])),
+            (125.0, self._state(opponent=[("スコヴィラン", 51.0, None), ("オオニューラ", 40.0, None)])),
+        ]
+        hint = pipe._compute_move_target_hint(120.0, 130.0, move_range="自分以外全員")
+        assert "スコヴィラン（相手側）のHPが100%→51%に減少" in hint
+        assert "オオニューラ（相手側）のHPが88%→40%に減少" in hint
+
     def test_protect_dedup_window_short_enough_for_second_attack(self):
         """同一ターン内で同じポケモンが2回別の攻撃をまもった場合、2回目の成功も
         （デデュープで消えず）別々に観測できる必要がある（実機2026-08-14_20-52-59
@@ -2964,6 +3009,66 @@ class TestFaintInferredDispatch:
         self.runner._dispatch_commentary.assert_called_once()
         sent_state = self.runner._dispatch_commentary.call_args.args[2]
         assert sent_state["faint_focus"] == "自分のペリッパーとブリジュラス"
+
+
+class TestFlushPendingFaint:
+    """_flush_pending_faint: 保留faintのフラッシュ時にトラッカー最新状態で
+    faint_focusを再計算する（2026-08-28新設）。
+
+    保留開始時点（_process_event内）では「たおれた」メッセージ由来の確定が
+    まだ届いていないことがあり、その場合faint_focusが空のまま保留される。
+    フラッシュはこの後（数秒〜数十秒後）に起きるため、その時点のトラッカー
+    最新状態で改めて確定した気絶をfaint_focusとして注入し直す必要がある
+    （実機2026-08-28_21-52-34で反証: フラッシュ時点の再計算が無く、
+    LLMが誤った種族名で実況した）。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._ec2_url = "http://fake-ec2:5000"
+        self.runner._battle_active = True
+        self.runner._announced_faints = set()
+        self.runner._dispatch_commentary = MagicMock()
+        self.runner._move_log_display = MagicMock(return_value=[])
+        self.runner._pending_faint_battle_context = {}
+        self.runner._pending_faint_frame = None
+        self.runner._pending_faint_time = 120.9
+
+    def test_injects_faint_focus_using_latest_tracker_state(self):
+        """保留開始時点ではfaint_focusが空だったが、フラッシュ時点では
+        トラッカーがリザードンの気絶を確定している（メッセージ由来の確定が
+        保留中に届いたケース）。"""
+        self.runner._pending_faint_state = {"event_type": "faint", "faint_focus": ""}
+        self.runner._battle_tracker = MagicMock()
+        self.runner._battle_tracker.fainted_names.return_value = ({"リザードン"}, set())
+
+        Pipeline._flush_pending_faint(self.runner)
+
+        self.runner._dispatch_commentary.assert_called_once()
+        args, kwargs = self.runner._dispatch_commentary.call_args
+        assert args[0] == "faint"
+        sent_state = args[2]
+        assert sent_state["faint_focus"] == "自分のリザードン"
+        assert kwargs["event_time"] == 120.9
+        assert self.runner._announced_faints == {"リザードン"}
+
+    def test_does_not_overwrite_already_announced(self):
+        """既に実況済みの名前しか無い場合はfaint_focusを上書きしない
+        （元のgame_state["faint_focus"]をそのまま維持する）。"""
+        self.runner._pending_faint_state = {
+            "event_type": "faint", "faint_focus": "自分のドドゲザン"}
+        self.runner._announced_faints = {"ドドゲザン"}
+        self.runner._battle_tracker = MagicMock()
+        self.runner._battle_tracker.fainted_names.return_value = ({"ドドゲザン"}, set())
+
+        Pipeline._flush_pending_faint(self.runner)
+
+        sent_state = self.runner._dispatch_commentary.call_args.args[2]
+        assert sent_state["faint_focus"] == "自分のドドゲザン"  # 元のまま
+
+    def test_no_pending_state_does_nothing(self):
+        self.runner._pending_faint_state = None
+        Pipeline._flush_pending_faint(self.runner)
+        self.runner._dispatch_commentary.assert_not_called()
 
 
 class TestResetBattleState:

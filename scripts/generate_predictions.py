@@ -99,11 +99,25 @@ def find_decisive_event(entries: list) -> dict | None:
 
     試合最後の faint イベント（event_time最大）を優先し、無ければ
     battle_end にフォールバックする（降参決着等でfaintが1件も無いケース）。
+
+    2026-08-29追記: 降参決着（context.battle_surrendered=true）の場合は
+    battle_end自体を優先する。降参は「最後のfaint」より前に起きることがあり
+    （試合を決めたのはKOではなく相手の意思決定）、その場合manifest.jsonl上の
+    最後のfaintエントリは決着とは無関係な内容になり得る（実機
+    2026-08-28_21-52-34で確認: 相手はムクホークを残したまま降参しており、
+    manifest.jsonl上「最後のfaint」に見えるエントリはメタグロスの登場を
+    伝える内容で、決着の42秒以上前・しかも決着とは無関係だった。加えて
+    2026-08-28に追加した重複faintのスキップ最適化により、真に最後の
+    faintイベント自体がmanifest.jsonlに記録されないケースもある）。
     """
+    ends = [e for e in entries if e.get("event_type") == "battle_end"]
+    surrendered_end = next(
+        (e for e in ends if (e.get("context") or {}).get("battle_surrendered")), None)
+    if surrendered_end is not None:
+        return surrendered_end
     faints = [e for e in entries if e.get("event_type") == "faint"]
     if faints:
         return max(faints, key=lambda e: e["event_time"])
-    ends = [e for e in entries if e.get("event_type") == "battle_end"]
     if ends:
         return max(ends, key=lambda e: e["event_time"])
     return None

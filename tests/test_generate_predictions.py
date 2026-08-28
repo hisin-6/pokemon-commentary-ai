@@ -118,6 +118,38 @@ class TestFindDecisiveEvent:
         entries = [_event(50.0, event_type="move_used")]
         assert gp.find_decisive_event(entries) is None
 
+    def test_surrendered_battle_end_preferred_over_earlier_faint(self):
+        """降参決着では、時系列的に後でもfaintではなくbattle_endを優先する
+        （2026-08-29新設の回帰ガード）。
+
+        降参は最後のfaintより前に起きることがあり（試合を決めたのはKOでは
+        なく相手の意思決定）、その場合manifest.jsonl上の「最後のfaint」は
+        決着とは無関係な内容になり得る（実機2026-08-28_21-52-34で確認:
+        相手はムクホークを残したまま降参しており、「最後のfaint」に見える
+        エントリはメタグロスの登場を伝える内容で決着の42秒以上前だった）。"""
+        entries = [
+            _event(100.0, event_type="faint", commentary="1匹目が倒れた"),
+            _event(200.0, event_type="faint", commentary="相手が入れ替わった"),
+            _event(370.0, event_type="battle_end", commentary="降参で勝利",
+                   battle_surrendered=True),
+        ]
+        decisive = gp.find_decisive_event(entries)
+        assert decisive["event_type"] == "battle_end"
+        assert decisive["event_time"] == 370.0
+
+    def test_non_surrendered_battle_end_does_not_override_last_faint(self):
+        """通常決着（KOで終了）では従来通り最後のfaintを優先する
+        （battle_surrendered=trueでない限り挙動を変えない回帰ガード）。"""
+        entries = [
+            _event(100.0, event_type="faint", commentary="1匹目が倒れた"),
+            _event(400.0, event_type="faint", commentary="最後の1匹が倒れた"),
+            _event(450.0, event_type="battle_end", commentary="試合終了",
+                   battle_surrendered=False),
+        ]
+        decisive = gp.find_decisive_event(entries)
+        assert decisive["event_type"] == "faint"
+        assert decisive["event_time"] == 400.0
+
 
 class TestDetermineBattleResult:
     def test_finds_result_from_last_event_carrying_it(self):

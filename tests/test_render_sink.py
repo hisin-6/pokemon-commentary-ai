@@ -574,8 +574,57 @@ class TestGeneratePosthocCommentary:
         p._generate_posthoc_commentary()
 
         faint_call = next(gs for et, gs in seen_game_states if et == "faint")
-        assert "オオニューラ" in faint_call.get("faint_repeat_hint", "")
-        assert "ルガルガン" not in faint_call.get("faint_repeat_hint", "")
+        hint = faint_call.get("faint_repeat_hint", "")
+        assert "オオニューラ" in hint
+        # 2026-08-28変更: 新規の気絶（ルガルガン）はヒントから省くのではなく、
+        # 「こちらが新情報」として明示的に呼びかけるようになった（実機
+        # 2026-08-28_21-52-34で、禁止対象を伝えるだけでは新情報が握りつぶされる
+        # 実例が確認されたため）。
+        assert "ルガルガン" in hint
+        assert "新情報" in hint
+
+    def test_faint_event_alone_registers_already_narrated_without_move_single(self, tmp_path, monkeypatch):
+        """move_singleのHP0%早期検出を経由しない、通常のfaintイベント自身が確定させた
+        気絶も、以降のイベントで「既報告」として扱われること（2026-08-28修正の回帰ガード）。
+
+        従来のalready_narrated_deathsはmove_singleのHP0%ヒットでしか埋まらず、実機
+        2026-08-28_21-52-34の3:29.2sで「相手のエルフーンとガブリアスが倒れました」と
+        通常のfaintイベントだけで確定・実況済みだったエルフーンが、後続イベントの
+        既報告判定に一切反映されていなかった（move_singleを経由しなかったため）。"""
+        p = self._make_pipeline(tmp_path)
+        p._panel_state_history = []
+        p._protect_history = []
+        p._miss_history = []
+        p._flinch_history = []
+        p._pending_render_events = [
+            {"event_time": 100.0, "event_type": "faint",
+             "game_state": {"ocr_text": ""},
+             # エルフーンのみが対象（move_singleのHP0%検出は一切経由していない）
+             "battle_context": {"player_bench": "なし", "opponent_bench": "エルフーン(ひんし)"},
+             "move_log": [], "render_context": None},
+            {"event_time": 200.0, "event_type": "faint",
+             "game_state": {"ocr_text": ""},
+             # エルフーンは既報告・ガブリアスが今回の新情報
+             "battle_context": {"player_bench": "なし",
+                                 "opponent_bench": "エルフーン(ひんし) / ガブリアス(ひんし)"},
+             "move_log": [], "render_context": None},
+        ]
+        seen_game_states = []
+
+        def fake_call(ec2_url, game_state, event_type, history, battle_context,
+                      classifier, move_log, **kwargs):
+            seen_game_states.append((event_type, dict(game_state)))
+            return (f"実況{len(seen_game_states)}", "a")
+
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", fake_call)
+
+        p._generate_posthoc_commentary()
+
+        assert len(seen_game_states) == 2
+        second_hint = seen_game_states[1][1].get("faint_repeat_hint", "")
+        assert "エルフーン" in second_hint
+        assert "ガブリアス" in second_hint
+        assert "新情報" in second_hint
 
     def test_faint_repeat_hint_also_applied_to_move_used(self, tmp_path, monkeypatch):
         """faint_repeat_hintはmove_usedイベントにも付与される（2026-08-27拡張）。
@@ -652,6 +701,67 @@ class TestGeneratePosthocCommentary:
 
         faint_call = next(gs for et, gs in seen_game_states if et == "faint")
         assert "faint_repeat_hint" not in faint_call
+
+    def test_move_effect_hint_voided_when_move_was_protected(self, tmp_path, monkeypatch):
+        """まもるで防がれた技の反動・追加効果誤実況対策（2026-08-27新設）:
+        move_effect_hintは技の一般的な効果説明（PokeAPI由来の静的テキスト）で、
+        実際にまもる等で技が不発だったかどうかを考慮していない。プロンプト側では
+        これを「信頼して事実として扱ってよい」と明言しているため、まもるで防がれた
+        場合でも反動・追加効果が発生したかのように誤実況される（実機
+        renders/2026-08-26_21-35-16の282.7s: オーバーヒートがドドゲザンにまもるで
+        防がれたのに「相手は特攻が低下してしまい」と反動が発生したかのように
+        実況していた）。技が防がれたことがtarget_hintで確定した場合、
+        move_effect_hintにその旨を追記する。"""
+        p = self._make_pipeline(tmp_path)
+        p._panel_state_history = []
+        p._protect_history = [(125.0, "自分側", "ドドゲザン")]
+        p._miss_history = []
+        p._flinch_history = []
+        p._pending_render_events = [
+            {"event_time": 120.0, "event_type": "move_single",
+             "game_state": {"ocr_text": ""},
+             "battle_context": {
+                 "move_range_hint": "相手単体",
+                 "move_effect_hint": ("オーバーヒート: フルパワーで相手を攻撃する。"
+                                       "使うと反動で自分の特攻ががくっとさがる。"),
+             },
+             "move_log": [], "render_context": {}},
+        ]
+
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", lambda *a, **k: ("実況", "a"))
+
+        p._generate_posthoc_commentary()
+
+        voided = p._pending_render_events[0]["battle_context"]["move_effect_hint"]
+        assert "反動で自分の特攻ががくっとさがる" in voided
+        assert "追加効果・反動" in voided and "発生していない" in voided
+        assert p._pending_render_events[0]["render_context"]["move_effect_hint"] == voided
+
+    def test_move_effect_hint_not_voided_when_move_connected(self, tmp_path, monkeypatch):
+        """回帰ガード: まもる等で防がれていない通常ヒット時はmove_effect_hintを
+        書き換えない。"""
+        p = self._make_pipeline(tmp_path)
+        p._panel_state_history = [
+            (118.0, {"player": [], "opponent": [{"name": "ドドゲザン", "hp_pct": 100.0, "status": None}]}),
+            (125.0, {"player": [], "opponent": [{"name": "ドドゲザン", "hp_pct": 60.0, "status": None}]}),
+        ]
+        p._protect_history = []
+        p._miss_history = []
+        p._flinch_history = []
+        original_hint = ("オーバーヒート: フルパワーで相手を攻撃する。"
+                          "使うと反動で自分の特攻ががくっとさがる。")
+        p._pending_render_events = [
+            {"event_time": 120.0, "event_type": "move_single",
+             "game_state": {"ocr_text": ""},
+             "battle_context": {"move_range_hint": "相手単体", "move_effect_hint": original_hint},
+             "move_log": [], "render_context": {}},
+        ]
+
+        monkeypatch.setattr(pipeline_module, "_call_bedrock_text", lambda *a, **k: ("実況", "a"))
+
+        p._generate_posthoc_commentary()
+
+        assert p._pending_render_events[0]["battle_context"]["move_effect_hint"] == original_hint
 
     def test_falls_back_to_phi3_on_bedrock_failure(self, tmp_path, monkeypatch):
         p = self._make_pipeline(tmp_path)
