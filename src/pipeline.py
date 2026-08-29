@@ -4226,6 +4226,24 @@ class Pipeline:
             self._announced_faints |= set(new_player) | set(new_opponent)
             log.info("[気絶確定ヒント][flush] %s", game_state["faint_focus"])
 
+        # 2026-08-29新設: battle_context（player_field/player_bench等の控え欄表記）も
+        # 保留開始時点の古いスナップショットのままだと、上記のfaint_focus同様に
+        # フラッシュまでの間に確定した気絶が反映されない。後段の後付け処理
+        # （既報告チェック・already_narrated_deaths、pending_render_events処理内）は
+        # 控え欄の「(ひんし)」表記を頼りに新規気絶を判定しているため、ここが古いままだと
+        # 新規気絶を見落として「全員報告済み」と誤判定し、faintイベント自体が丸ごと
+        # スキップされる（実機2026-08-28_21-52-34で実証: 保留開始時点ではまだ場に出た
+        # ままだったドドゲザンの気絶がbench欄に反映されないまま握りつぶされた）。
+        # _refresh_condition_hint と同じ要領で、フラッシュ時点の最新状態で該当
+        # フィールドだけ作り直す。
+        if battle_context is not None:
+            fresh_ctx = self._battle_tracker.to_context()
+            battle_context = dict(battle_context)
+            for key in ("player_field", "player_bench", "opponent_field", "opponent_bench",
+                        "player_pokemon", "opponent_pokemon"):
+                if key in fresh_ctx:
+                    battle_context[key] = fresh_ctx[key]
+
         # event_time は faint 検知時点の動画内時刻（保留中に動画が進んでいるため
         # 現在時刻ではなく保留開始時刻を使う）
         self._dispatch_commentary(

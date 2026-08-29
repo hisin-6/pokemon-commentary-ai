@@ -3040,6 +3040,7 @@ class TestFlushPendingFaint:
         self.runner._pending_faint_state = {"event_type": "faint", "faint_focus": ""}
         self.runner._battle_tracker = MagicMock()
         self.runner._battle_tracker.fainted_names.return_value = ({"リザードン"}, set())
+        self.runner._battle_tracker.to_context.return_value = {}
 
         Pipeline._flush_pending_faint(self.runner)
 
@@ -3059,6 +3060,7 @@ class TestFlushPendingFaint:
         self.runner._announced_faints = {"ドドゲザン"}
         self.runner._battle_tracker = MagicMock()
         self.runner._battle_tracker.fainted_names.return_value = ({"ドドゲザン"}, set())
+        self.runner._battle_tracker.to_context.return_value = {}
 
         Pipeline._flush_pending_faint(self.runner)
 
@@ -3069,6 +3071,43 @@ class TestFlushPendingFaint:
         self.runner._pending_faint_state = None
         Pipeline._flush_pending_faint(self.runner)
         self.runner._dispatch_commentary.assert_not_called()
+
+    def test_refreshes_bench_field_from_latest_tracker_state(self):
+        """battle_context（player_bench等の控え欄表記）もfaint_focusと同様に
+        フラッシュ時点の最新状態で作り直す（2026-08-29新設）。
+
+        保留開始時点ではドドゲザンはまだ場に出たまま気絶が未確定で、控え欄には
+        現れていなかった（player_field/player_benchのどちらにも載らず「宙に浮く」
+        状態）。フラッシュ時点ではメッセージ由来の確定が届き、control欄に
+        「ドドゲザン(ひんし)」が反映されているはずなので、古いスナップショットの
+        まま使い回すと、後段の既報告チェックがこの新規気絶を見落として
+        「全員報告済み」と誤判定しfaintイベントごと握りつぶしてしまう
+        （実機2026-08-28_21-52-34で実証）。
+        """
+        self.runner._pending_faint_battle_context = {
+            "player_field": "ガブリアス",
+            "player_bench": "なし",
+            "opponent_field": "メタグロス",
+            "opponent_bench": "エルフーン(ひんし)",
+            "weather": "はれ",  # bench/field系以外はそのまま維持されるべき
+        }
+        self.runner._pending_faint_state = {"event_type": "faint", "faint_focus": ""}
+        self.runner._battle_tracker = MagicMock()
+        self.runner._battle_tracker.fainted_names.return_value = (
+            {"ドドゲザン"}, {"エルフーン"})
+        self.runner._battle_tracker.to_context.return_value = {
+            "player_field": "ガブリアス",
+            "player_bench": "ドドゲザン(ひんし)",
+            "opponent_field": "メタグロス",
+            "opponent_bench": "エルフーン(ひんし)",
+            "weather": "あめ",
+        }
+
+        Pipeline._flush_pending_faint(self.runner)
+
+        sent_context = self.runner._dispatch_commentary.call_args.args[3]
+        assert sent_context["player_bench"] == "ドドゲザン(ひんし)"
+        assert sent_context["weather"] == "はれ"  # bench/field系以外は元のまま維持
 
 
 class TestResetBattleState:
