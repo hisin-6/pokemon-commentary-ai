@@ -180,6 +180,16 @@ class Phi3Client:
                 f"直近で実際に繰り出されたポケモン（画面の繰り出しメッセージから確定）: "
                 f"{game_state['switch_focus']}。交代・繰り出しに言及する場合は必ずこれに従うこと"
             )
+        # メガシンカの専用変身アニメーション（2026-08-29・server.py側と同じ趣旨）:
+        # 数秒間の専用演出中は他の技・戦況の動きが発生しないため、この1つの出来事
+        # だけに焦点を絞らせる
+        if game_state.get("event_type") == "mega_evolution" and game_state.get("mega_evolution_focus"):
+            lines.append(
+                f"「{game_state['mega_evolution_focus']}」がメガシンカする専用の変身"
+                "アニメーション中（数秒間、他の攻防は発生していない）。このメガシンカの"
+                "迫力や変身後への期待を盛り上げる短い実況にする"
+                "（他のポケモンの技やHP変化には触れないこと）"
+            )
         # move_used=新しいターンの攻防が始まる瞬間（2026-08-15・server.py側と同じ趣旨）:
         # 個別の技はmove_singleが都度実況するため、戦況全体に徹させる
         if game_state.get("event_type") == "move_used":

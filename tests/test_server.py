@@ -196,6 +196,20 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context("switch"), [], self._battle_state())
         assert "ポケモンの交代について実況する" in prompt
 
+    def test_mega_evolution_focus_overrides_event_hint(self):
+        """メガシンカの専用変身アニメーション（2026-08-29新設）: 数秒間の専用演出中は
+        他の技・戦況の動きが発生しないため、この出来事だけに焦点を絞らせる。"""
+        prompt = _build_vision_prompt(
+            self._context("mega_evolution", mega_evolution_focus="自分のリザードン"),
+            [], self._battle_state())
+        assert "「自分のリザードン」がメガシンカする" in prompt
+        assert "他の攻防は発生していない" in prompt
+        assert "他のポケモンの技やHP変化には触れないこと" in prompt
+
+    def test_mega_evolution_without_focus_falls_back_to_generic_hint(self):
+        prompt = _build_vision_prompt(self._context("mega_evolution"), [], self._battle_state())
+        assert "状況を実況する" in prompt
+
     def test_switch_focus_info_line_for_move_used(self):
         """move_usedはターン冒頭のコマンド交代と同時に発火するため、確定した
         繰り出しを状況セクションに注入する（event_hintは差し替えない）。"""
@@ -448,6 +462,17 @@ class TestBuildVisionPrompt:
         assert "くれぴ" not in prompt
         assert "花圓" not in prompt
 
+    def test_persona_neutral_instructs_mixing_casual_endings(self):
+        """2026-08-29: 「ですます調ばかりで喋り口調が足りない」というユーザーfbを受け、
+        丁寧語だけに偏らずタメ口寄りの言い切りも混ぜる指示が入ること。
+        名乗り・自称のキャラ付け禁止（neutral運用の方針）自体は引き続き維持する。"""
+        prompt = _build_vision_prompt(
+            self._context(persona="neutral"), [], self._battle_state())
+        assert "丁寧な言い切りだけに偏らず" in prompt
+        assert "毎回同じ文末パターンで終わらせないこと" in prompt
+        assert "決まってほしいね" in prompt  # 更新後のNEUTRAL_TONE_EXAMPLES
+        assert "自己紹介・名乗り・一人称のキャラ付けはしないこと" in prompt
+
     def test_persona_missing_defaults_to_kurepi(self):
         """contextにpersonaキーが無い旧クライアントとの後方互換確認。"""
         ctx = self._context()
@@ -601,6 +626,25 @@ class TestVisionEndpoint:
         resp = client.post("/api/vision", json=payload)
         assert resp.status_code == 400
         assert resp.get_json()["error"] == "invalid_event_type"
+
+    def test_mega_evolution_event_type_is_accepted(self, client):
+        """mega_evolution（2026-08-29新設）はVALID_EVENT_TYPESに含まれ400にならない。"""
+        payload = _valid_vision_payload(
+            context={"event_type": "mega_evolution", "ocr_text": "メガシンカした!",
+                      "mega_evolution_focus": "自分のリザードン"},
+            image_base64="",
+        )
+        mock_response_body = {
+            "content": [{"text": "【実況】テスト実況"}],
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+        }
+        mock_bedrock_response = {
+            "body": MagicMock(read=MagicMock(return_value=json.dumps(mock_response_body).encode())),
+        }
+        with patch.object(server_module.bedrock, "invoke_model",
+                           return_value=mock_bedrock_response):
+            resp = client.post("/api/vision", json=payload)
+        assert resp.status_code == 200
 
     def test_invalid_base64_returns_400(self, client):
         payload = _valid_vision_payload(image_base64="not-valid-base64!!!")

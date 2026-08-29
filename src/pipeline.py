@@ -90,7 +90,11 @@ log = logging.getLogger(__name__)
 log.info(f"ログファイル: {log_file_path}")
 
 # Bedrock を呼ぶイベント種別
-BEDROCK_EVENTS = {"battle_start", "move_used", "move_single", "switch", "faint", "battle_end"}
+# mega_evolution（2026-08-29新設）: メガシンカの専用変身アニメーション（数秒間）が
+# 従来無実況だったための対策。Zワザ/ダイマックス/テラスタルも将来的に同様の
+# 専用イベントとして追加予定（画面文言未確認のため今回は見送り）。
+BEDROCK_EVENTS = {"battle_start", "move_used", "move_single", "switch", "faint", "battle_end",
+                   "mega_evolution"}
 
 
 # ─── OCR 結果からゲーム状態を構築 ─────────────────────────────────────────────
@@ -2840,6 +2844,7 @@ def _build_bedrock_context(
         "battle_surrendered":       bool(game_state.get("battle_surrendered", False)),  # 降参による決着（battle_endのみ）
         "move_focus":               game_state.get("move_focus", ""),  # 実況対象の1技（move_singleのみ）
         "switch_focus":             game_state.get("switch_focus", ""),  # 実際に繰り出されたポケモン（switch/move_used・後付けのみ）
+        "mega_evolution_focus":     game_state.get("mega_evolution_focus", ""),  # メガシンカした対象（陣営＋ポケモン名・mega_evolutionのみ）
         "persona":                  persona,  # "kurepi"/"neutral"（2026-08-14・3Dモデル一時差し替え検証用）
     }
 
@@ -3441,7 +3446,7 @@ class Pipeline:
                         self._update_miss_history(ocr_results)
                         self._update_flinch_history(ocr_results)
                         self._update_battle_conditions(ocr_results)
-                        self._update_mega_evolution(ocr_results)
+                        self._update_mega_evolution(ocr_results, frame=frame)
                         self._update_switch_out(ocr_results)
                         # OCR bbox 位置から状態異常アイコンを検出してトラッカーに反映
                         fh, fw = frame.shape[:2]
@@ -3660,7 +3665,7 @@ class Pipeline:
                         self._update_miss_history(dense_results)
                         self._update_flinch_history(dense_results)
                         self._update_battle_conditions(dense_results)
-                        self._update_mega_evolution(dense_results)
+                        self._update_mega_evolution(dense_results, frame=frame)
 
                 self._prev_yolo = yolo_state
 
@@ -4856,20 +4861,31 @@ class Pipeline:
                 return override
         return classifier.get_pokemon_types(pokemon.name)
 
-    def _update_mega_evolution(self, ocr_results: list[dict]) -> None:
+    def _update_mega_evolution(self, ocr_results: list[dict],
+                                frame: "np.ndarray | None" = None) -> None:
         """OCR結果から「〜のメガシンカ」メッセージを検出し、該当ポケモンの
         `mega_evolved`フラグを立てる（改善ロードマップ「戦況推論強化」続き・2026-08-04）。
         フォーム名（X/Y等）まで正確にOCRから拾うのは信頼度が低いと想定されるため、
         「メガシンカした事実」の検出のみ行う。タイプ上書きは`mega_forms.py`に該当
         エントリがあれば適用され、無ければ通常タイプのまま（段階的な設計）。
+
+        2026-08-29拡張: メガシンカ専用の変身アニメーション（数秒間、他の攻防は
+        発生しない）が従来無実況だったユーザー指摘を受け、検出時に専用の実況
+        イベント（mega_evolution）を1回だけディスパッチする。`mega_evolved`が
+        既にTrueなら再ディスパッチしない（フラグ自体が複数フレーム検出への
+        自然なデバウンスを兼ねる）。Zワザ/ダイマックス/テラスタルも将来的に
+        同様の専用イベントとして追加予定（画面文言未確認のため今回は見送り）。
         """
         joined = "".join(r.get("text", "") for r in ocr_results)
         m = self._MEGA_EVOLUTION_RE.search(joined)
         if not m:
             return
         slot = self._battle_tracker._find_slot(m.group(1).strip())
-        if slot:
+        if slot and not slot.mega_evolved:
             slot.mega_evolved = True
+            side = "player" if slot in self._battle_tracker._player else "opponent"
+            log.info("[戦況] %s メガシンカ検出（%s）", slot.name, side)
+            self._dispatch_mega_evolution_commentary(slot.name, side, ocr_results, frame)
 
     def _latest_move_type_hint(self, classifier, on_field_p: list, on_field_o: list
                                 ) -> tuple[str | None, dict[str, str]]:
@@ -5802,6 +5818,57 @@ class Pipeline:
 
         self._dispatch_commentary(
             "move_single", frame, game_state, battle_context,
+            self._move_log_display(5), attempt_bedrock, event_time=self._now())
+
+    def _dispatch_mega_evolution_commentary(
+        self,
+        pokemon_name: str,
+        side: str,
+        ocr_results: list[dict],
+        frame: "np.ndarray | None",
+    ) -> None:
+        """メガシンカ検出時の専用実況（mega_evolution）をディスパッチする（2026-08-29新設）。
+
+        メガシンカは数秒間の専用変身アニメーションを挟み、その間は他の技・戦況の
+        動きが発生しないため、従来この区間が無実況になっていた（ユーザー指摘）。
+        `_dispatch_move_commentary`と同じ設計に倣い、`_update_mega_evolution`が
+        検出した瞬間に1件だけディスパッチする（重複防止は呼び出し元の
+        `mega_evolved`フラグが担う）。
+
+        テストが部分構築のPipeline（Pipeline.__new__）から呼ぶケースがあるため、
+        _ec2_url 等が未設定なら何もしない（早期return・_dispatch_move_commentaryと同様）。
+        """
+        if not hasattr(self, "_ec2_url"):
+            return
+        if not self._battle_active:
+            return
+        # 保留中のfaintがあれば先にフラッシュする（_dispatch_move_commentaryと同じ理由:
+        # このイベントも_process_eventを経由しない別経路のため、放置すると気絶より後の
+        # この実況が先に出てしまい時系列が乱れる）
+        if getattr(self, "_pending_faint_state", None) is not None:
+            log.info("[faintフラッシュ] mega_evolution検知 → 先に保留faintを送信（時系列維持）")
+            self._flush_pending_faint()
+        game_state = _build_game_state(
+            ocr_results, BattleState(), "mega_evolution", BattleState(),
+            self._classifier, ability_msg=getattr(self, "_last_ability_msg", {}))
+        side_prefix = "自分の" if side == "player" else "相手の"
+        game_state["mega_evolution_focus"] = f"{side_prefix}{pokemon_name}"
+        battle_context = self._battle_tracker.to_context()
+        if getattr(self, "_team_preview_hint", ""):
+            battle_context["team_preview_hint"] = self._team_preview_hint
+        condition_hint = self._compute_condition_hint(battle_context)
+        if condition_hint:
+            battle_context["condition_hint"] = condition_hint
+        attempt_bedrock = bool(
+            self._ec2_url and "mega_evolution" in BEDROCK_EVENTS and self._battle_active)
+
+        # move_singleと同じく_process_eventを経由しない別経路のため、保留中の
+        # battle_startがあればここでも確定させる
+        if getattr(self, "_pending_battle_start_time", None) is not None:
+            self._flush_pending_battle_start(battle_context)
+
+        self._dispatch_commentary(
+            "mega_evolution", frame, game_state, battle_context,
             self._move_log_display(5), attempt_bedrock, event_time=self._now())
 
     def _update_move_log(self, ocr_results: list[dict], is_main_ocr: bool = False,

@@ -82,6 +82,17 @@ class TestBuildPrompt:
         assert "自分のブリジュラス" in prompt
         assert "必ずこれに従うこと" in prompt
 
+    def test_mega_evolution_focus_instruction(self, client):
+        """メガシンカの専用変身アニメーション（2026-08-29新設・server.py側と同じ文言で配線）。"""
+        game_state = {"event_type": "mega_evolution", "mega_evolution_focus": "自分のリザードン"}
+        prompt = client._build_prompt(game_state, None, None)
+        assert "「自分のリザードン」がメガシンカする" in prompt
+        assert "他の攻防は発生していない" in prompt
+
+    def test_mega_evolution_without_focus_omits_instruction(self, client):
+        prompt = client._build_prompt({"event_type": "mega_evolution"}, None, None)
+        assert "メガシンカする専用の変身" not in prompt
+
     def test_move_used_turn_transition_framing(self, client):
         """2026-08-15: move_usedを戦況全体フレーミングに変更（server.py側と同じ趣旨）。"""
         prompt = client._build_prompt({"event_type": "move_used"}, None, None)
@@ -255,6 +266,15 @@ class TestPersonaSwitch:
         prompt = client._build_prompt({"event_type": "move_used", "status": "なし"}, None, None)
         assert "くれぴ" not in prompt
         assert "花圓" not in prompt
+
+    def test_neutral_persona_instructs_mixing_casual_endings(self):
+        """2026-08-29: 「ですます調ばかりで喋り口調が足りない」というユーザーfbを受け、
+        丁寧語だけに偏らずタメ口寄りの言い切りも混ぜる指示が入ること（server.py側と
+        同じ文言でNEUTRAL_CHARACTER_INTROに配線）。"""
+        client = Phi3Client(persona="neutral")
+        prompt = client._build_prompt({"event_type": "move_used", "status": "なし"}, None, None)
+        assert "丁寧な言い切りだけに偏らず" in prompt
+        assert "毎回同じ文末パターンで終わらせないこと" in prompt
 
     def test_neutral_persona_still_contains_output_rules(self):
         """SLANG_GLOSSARY_LINES/OUTPUT_RULES_LINESはキャラ非依存のため両ペルソナで

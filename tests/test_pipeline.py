@@ -13,7 +13,7 @@ pipeline.py の純粋ロジック単体テスト
 import sys
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -3602,6 +3602,84 @@ class TestUpdateMegaEvolution:
         self.runner._update_mega_evolution(
             self._ocr("謎のポケモンは", "メガ謎のポケモンに", "メガシンカした！"))
         assert self.runner._battle_tracker._player[0].mega_evolved is False
+
+    def test_dispatches_commentary_on_first_detection(self):
+        """初回検出時はメガシンカ専用の実況をディスパッチする（2026-08-29新設・
+        メガシンカの変身アニメーション区間が無実況だったユーザー指摘への対策）。"""
+        self.runner._ec2_url = "http://fake-ec2:5000"
+        self.runner._dispatch_mega_evolution_commentary = MagicMock()
+        ocr = self._ocr("リザードンは", "メガリザードンに", "メガシンカした！")
+        self.runner._update_mega_evolution(ocr)
+        self.runner._dispatch_mega_evolution_commentary.assert_called_once_with(
+            "リザードン", "player", ocr, None)
+
+    def test_opponent_side_dispatches_with_opponent_label(self):
+        self.runner._ec2_url = "http://fake-ec2:5000"
+        self.runner._dispatch_mega_evolution_commentary = MagicMock()
+        ocr = self._ocr("ミュウツーは", "メガミュウツーに", "メガシンカした！")
+        self.runner._update_mega_evolution(ocr)
+        self.runner._dispatch_mega_evolution_commentary.assert_called_once_with(
+            "ミュウツー", "opponent", ocr, None)
+
+    def test_does_not_redispatch_when_already_mega_evolved(self):
+        """既にmega_evolved=Trueなら再検出してもディスパッチしない（OCRの複数フレーム
+        検出に対する自然なデバウンス）。"""
+        self.runner._ec2_url = "http://fake-ec2:5000"
+        self.runner._battle_tracker._player[0].mega_evolved = True
+        self.runner._dispatch_mega_evolution_commentary = MagicMock()
+        self.runner._update_mega_evolution(
+            self._ocr("リザードンは", "メガリザードンに", "メガシンカした！"))
+        self.runner._dispatch_mega_evolution_commentary.assert_not_called()
+
+
+class TestDispatchMegaEvolutionCommentary:
+    """_dispatch_mega_evolution_commentary: メガシンカ専用実況のディスパッチ（2026-08-29新設）。"""
+
+    def setup_method(self):
+        self.runner = Pipeline.__new__(Pipeline)
+        self.runner._ec2_url = "http://fake-ec2:5000"
+        self.runner._battle_active = True
+        self.runner._battle_tracker = MagicMock()
+        self.runner._battle_tracker.to_context.return_value = {}
+        self.runner._classifier = None
+        self.runner._last_ability_msg = {}
+        self.runner._team_preview_hint = ""
+        self.runner._pending_faint_state = None
+        self.runner._pending_battle_start_time = None
+        self.runner._dispatch_commentary = MagicMock()
+        self.runner._move_log_display = MagicMock(return_value=[])
+        self.runner._compute_condition_hint = MagicMock(return_value=None)
+        self.runner._now = MagicMock(return_value=123.4)
+
+    def test_player_side_sets_mega_evolution_focus(self):
+        Pipeline._dispatch_mega_evolution_commentary(
+            self.runner, "リザードン", "player", [], None)
+        args, kwargs = self.runner._dispatch_commentary.call_args
+        assert args[0] == "mega_evolution"
+        sent_state = args[2]
+        assert sent_state["mega_evolution_focus"] == "自分のリザードン"
+        assert kwargs["event_time"] == 123.4
+
+    def test_opponent_side_sets_mega_evolution_focus(self):
+        Pipeline._dispatch_mega_evolution_commentary(
+            self.runner, "メタグロス", "opponent", [], None)
+        sent_state = self.runner._dispatch_commentary.call_args.args[2]
+        assert sent_state["mega_evolution_focus"] == "相手のメタグロス"
+
+    def test_flushes_pending_faint_before_dispatch(self):
+        """保留中のfaintがあれば時系列維持のため先にフラッシュする
+        （_dispatch_move_commentaryと同じ設計）。"""
+        self.runner._pending_faint_state = {"event_type": "faint"}
+        self.runner._flush_pending_faint = MagicMock()
+        Pipeline._dispatch_mega_evolution_commentary(
+            self.runner, "リザードン", "player", [], None)
+        self.runner._flush_pending_faint.assert_called_once()
+
+    def test_no_ec2_url_does_nothing(self):
+        runner = Pipeline.__new__(Pipeline)
+        Pipeline._dispatch_mega_evolution_commentary(runner, "リザードン", "player", [], None)
+        # _ec2_url属性が無いため早期returnし、例外を出さない（部分構築テストからの
+        # 呼び出しに耐える設計・_dispatch_move_commentaryと同様）
 
 
 class TestEffectivePokemonTypes:
