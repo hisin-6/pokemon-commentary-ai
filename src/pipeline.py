@@ -2844,6 +2844,7 @@ def _build_bedrock_context(
         "battle_surrendered":       bool(game_state.get("battle_surrendered", False)),  # 降参による決着（battle_endのみ）
         "move_focus":               game_state.get("move_focus", ""),  # 実況対象の1技（move_singleのみ）
         "switch_focus":             game_state.get("switch_focus", ""),  # 実際に繰り出されたポケモン（switch/move_used・後付けのみ）
+        "no_new_switch_hint":       game_state.get("no_new_switch_hint", ""),  # 交代の蒸し返し防止（switch_focusで触れられていない陣営向け・switch/move_used・後付けのみ）
         "mega_evolution_focus":     game_state.get("mega_evolution_focus", ""),  # メガシンカした対象（陣営＋ポケモン名・mega_evolutionのみ）
         "persona":                  persona,  # "kurepi"/"neutral"（2026-08-14・3Dモデル一時差し替え検証用）
     }
@@ -4508,6 +4509,38 @@ class Pipeline:
                     "いない（対象・効果を断定しないこと。「対象不明」等ぼかした表現に留める）")
         return " / ".join(hints)
 
+    @staticmethod
+    def _voided_move_effect_hint(move_effect_hint: str, target_hint: str) -> str:
+        """技が防がれた/外れたことがtarget_hintで確定した場合、move_effect_hint
+        （PokeAPI由来の一般的な技効果説明）に、追加効果・反動も発生していない旨を
+        注記する（2026-08-27新設）。
+
+        move_effect_hintは技が実際に発動したかどうかを考慮しない静的テキストで、
+        プロンプト側ではこれを「信頼して事実として扱ってよい」と明言しているため、
+        まもる等で技そのものが不発だった場合でも追加効果が起きたかのように誤実況
+        される（実機renders/2026-08-26_21-35-16の282.7s: オーバーヒートがドドゲザン
+        にまもるで防がれたのに「相手は特攻が低下してしまい」と反動が発生したかの
+        ように実況していた）。
+
+        2026-08-29修正: 注記の文言に技名「まもる」を直接書くと、今まさに使われた
+        技（move_focus）とは別の技名がヒント文中に混入することになり、LLMが
+        両者を混同して技名をすり替える事故があった（実機2026-08-28_22-11-26:
+        相手のキラフロルが使ったのは「だいちのちから」なのに、この注記中の
+        「まもる」に引きずられ「相手のキラフロルもまもるで守ってくる」と誤実況）。
+        技名を出さない一般的な表現に置き換えた。
+
+        該当しない場合は move_effect_hint をそのまま返す（空文字も含む）。
+        """
+        voided = ("は攻撃から身を守った＝この技は防がれた" in target_hint
+                  or "この技は外れた" in target_hint)
+        if not voided or not move_effect_hint:
+            return move_effect_hint
+        return (
+            move_effect_hint
+            + "（ただし今回は相手の防御成功や命中失敗によりこの技自体が"
+            "不発だったため、上記の追加効果・反動・能力変化は発生していない）"
+        )
+
     def _compute_switch_focus(self, start: float, end: float) -> str:
         """観測窓 (start, end] の繰り出しメッセージ履歴から「実際に誰が繰り出されたか」を
         組み立てる（後付け生成専用・2026-08-15）。
@@ -4527,6 +4560,32 @@ class Pipeline:
                 if entry not in parts:
                     parts.append(entry)
         return " / ".join(parts)
+
+    @staticmethod
+    def _compute_no_new_switch_hint(switch_focus: str) -> str:
+        """switch_focusで触れられていない陣営（自分側/相手側）について、蒸し返し
+        防止の否定ヒントを組み立てる（2026-08-29新設）。
+
+        switch_focusは観測できた陣営分の「自分の○○」「相手の○○」だけを含む
+        文字列のため、含まれない側について何も言わないだけだと、LLMが控え欄に
+        残る古い情報（前のターンで既に起きた交代）から「今起きた交代」を
+        勝手に作文してしまう事故があった（実機2026-08-28_22-11-26: 241.5sで
+        既に「相手のイダイトウ」登場を正しく報告済みなのに、287.0sの
+        switch_focus="自分のエルフーン"のみのイベントで「相手はキラフロルから
+        イダイトウに」と誤った起点付きで蒸し返された）。両陣営とも触れられて
+        いれば（またswitch_focusが空で両陣営とも触れられていなければ両方）
+        空文字/両陣営分のヒントを返す。
+        """
+        missing_sides = [label for label, prefix in
+                          (("自分側", "自分の"), ("相手側", "相手の"))
+                          if prefix not in switch_focus]
+        if not missing_sides:
+            return ""
+        return (
+            "、".join(missing_sides) + "について、このターンに新しい"
+            "交代（繰り出し）は確認されていない。前のターンで既に起きた"
+            "交代を、今回新たに起きたことのように語らないこと"
+        )
 
     def _generate_posthoc_commentary(self) -> None:
         """動画モードの後付け実況生成（ADR-009追記）。
@@ -4599,14 +4658,9 @@ class Pipeline:
                     # 反動が発生したかのように実況していた）。技が防がれた/外れたことが
                     # target_hintで確定した場合、move_effect_hintにその旨を追記して
                     # 追加効果・反動も発生していないことを明示する。
-                    voided = ("は攻撃から身を守った＝この技は防がれた" in target_hint
-                              or "この技は外れた" in target_hint)
-                    if voided and ev["battle_context"].get("move_effect_hint"):
-                        voided_hint = (
-                            ev["battle_context"]["move_effect_hint"]
-                            + "（ただし今回はまもる/命中失敗によりこの技自体が不発だったため、"
-                            "上記の追加効果・反動・能力変化は発生していない）"
-                        )
+                    voided_hint = self._voided_move_effect_hint(
+                        ev["battle_context"].get("move_effect_hint", ""), target_hint)
+                    if voided_hint != ev["battle_context"].get("move_effect_hint", ""):
                         ev["battle_context"]["move_effect_hint"] = voided_hint
                         if ev.get("render_context") is not None:
                             ev["render_context"]["move_effect_hint"] = voided_hint
@@ -4649,6 +4703,23 @@ class Pipeline:
                     if ev.get("render_context") is not None:
                         ev["render_context"]["switch_focus"] = switch_focus
                     log.info("[交代ヒント] t=%.1fs %s", ev["event_time"], switch_focus)
+                # 交代の蒸し返し対策（2026-08-29新設）: switch_focusに自分・相手
+                # どちらかの陣営情報しか含まれていない（または完全に空の）場合、
+                # 触れられていない側について何も言わないだけだと、LLMが控え欄に
+                # 残る古い情報（前のターンで既に起きた交代）から「今起きた交代」を
+                # 勝手に作文してしまう事故があった（実機2026-08-28_22-11-26:
+                # 241.5sで既に「相手のイダイトウ」登場を正しく報告済みなのに、
+                # 287.0sのswitch_focus="自分のエルフーン"のみのイベントで「相手は
+                # キラフロルからイダイトウに」と誤った起点付きで蒸し返された）。
+                # faint_repeat_hintと同じ発想で、触れられていない側に「新しい交代
+                # は無い」と明示する否定ヒントを注入する。
+                no_switch_hint = self._compute_no_new_switch_hint(switch_focus)
+                if no_switch_hint:
+                    ev["game_state"] = dict(ev["game_state"])
+                    ev["game_state"]["no_new_switch_hint"] = no_switch_hint
+                    if ev.get("render_context") is not None:
+                        ev["render_context"]["no_new_switch_hint"] = no_switch_hint
+                    log.info("[交代なしヒント] t=%.1fs %s", ev["event_time"], no_switch_hint)
             # faint二重報告ヒント（2026-08-24新設、2026-08-27拡張）: この気絶の対象が、既に
             # move_singleのHP観測で「落ちました」等を先に語っている名前と一致する
             # 場合、そのイベント側に「新情報ではない」ことを明示する。

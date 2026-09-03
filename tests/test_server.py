@@ -169,6 +169,13 @@ class TestBuildVisionPrompt:
         prompt = _build_vision_prompt(self._context(ocr_text="ピカチュウのかみなり"), [], self._battle_state())
         assert "ピカチュウのかみなり" in prompt
 
+    def test_prompt_forbids_fabricating_repeat_counts(self):
+        """2026-08-29新設: 技ログ1件しか無いのに「2ターン連続」等の回数を
+        LLMが勝手に創作した実機事故（renders/2026-08-28_22-11-26）への対策。"""
+        prompt = _build_vision_prompt(self._context("move_used"), [], self._battle_state())
+        assert "回数・連続性を表す数字" in prompt
+        assert "勝手に数を盛らないこと" in prompt
+
     def test_battle_result_rule_when_present(self):
         """battle_endで勝敗が確定していれば明言指示を出す（2026-07-30視聴fb#4）。"""
         prompt = _build_vision_prompt(
@@ -230,6 +237,23 @@ class TestBuildVisionPrompt:
         assert "実際に場に出た（出る）ポケモンは「自分のイダイトウ」" in prompt
         assert "であることが確定している" in prompt
         assert "今回の交代として語らないこと" in prompt
+
+    def test_no_new_switch_hint_appended_for_move_used(self):
+        """交代の蒸し返し対策（2026-08-29新設）: switch_focusで触れられていない
+        陣営について「新しい交代は無い」という否定ヒントをevent_hintに追記する
+        （実機2026-08-28_22-11-26で発覚した蒸し返し事故の対策）。"""
+        prompt = _build_vision_prompt(
+            self._context("move_used", switch_focus="自分のイダイトウ",
+                           no_new_switch_hint="相手側について、このターンに新しい"
+                           "交代（繰り出し）は確認されていない"),
+            [], self._battle_state())
+        assert "相手側について、このターンに新しい交代（繰り出し）は確認されていない" in prompt
+
+    def test_no_new_switch_hint_ignored_for_other_events(self):
+        prompt = _build_vision_prompt(
+            self._context("faint", no_new_switch_hint="相手側について、このターンに新しい交代は確認されていない"),
+            [], self._battle_state())
+        assert "確認されていない" not in prompt
 
     def test_avoids_theatrical_return_phrasing(self):
         """2026-08-27新設: ユーザーfb「イダイトウが舞台に戻るってなに？」
@@ -888,6 +912,20 @@ class TestBuildScriptPrompt:
         assert "ネタバレ禁止" in prompt
         assert "先取り" in prompt
 
+    def test_no_repeat_rule_strengthened_with_concrete_examples(self):
+        """2026-08-29新設: 「収録済み実況と重複しない」という抽象的な指示だけでは
+        LLMが破る実例があった（実機2026-08-28_22-11-26: 216.9sのイベント実況
+        「相手のエルフーン一撃で落とした！」を、13秒後のフィラーが「エルフーンが
+        落ちた！これはでかい」とほぼ同じ情報量で繰り返した）。具体例を挙げて
+        「新しい話題につなげること」を明示する形に強化した。"""
+        payload = _valid_script_payload()
+        prompt = _build_script_prompt(payload["gap"], payload["events"])
+        assert "収録済み実況と重複しない内容にすること" in prompt
+        assert "同じ情報量のまま言い直さないこと" in prompt
+        assert "新しい話題（そこからの展開・戦況の変化・考察等）につなげること" in prompt
+        # フィラー内容の選択肢側にも同様の制約が明示されている
+        assert "なぞるのではなく、そこからどう繋がるか" in prompt
+
     def test_target_and_defense_uncertainty_rules_present(self):
         """2026-08-14: 台本パス（フィラー生成）にも対象不明時の決め打ち禁止・
         防御結果不明時の命中断定禁止の安全策を追加（ビジョンパスと同種の対策）。"""
@@ -1147,11 +1185,33 @@ class TestBuildPayoffPrompt:
         assert "time は 123.4 にすること" in prompt
         assert "要素は1件だけ" in prompt
 
+    def test_instructs_not_repeating_outcome_summary(self):
+        """2026-08-29新設: outcome_summaryにはbattle_end等の実況文そのものが渡る
+        ことがあり、LLMがそれをそのまま言い直して既存実況と重複する事故があった
+        （実機2026-08-28_22-11-26: battle_endとprediction_payoffが「降参で勝利」を
+        ほぼ同じ内容で2回語った）。"""
+        prompt = _build_payoff_prompt(
+            "ここでおいかぜを活かして押し切るかもしれない", hit=True,
+            outcome_summary="ふいうち、相手に効いた！だけどインファイトの反撃で、"
+            "ドドゲザンが倒れちゃった——でも相手が降参を選んだ、こちらの勝利だ！",
+            payoff_time=370.6)
+        assert "既に別の実況で" in prompt
+        assert "そのまま言い直さないこと" in prompt
+
     def test_persona_neutral_excludes_kurepi(self):
         prompt = _build_payoff_prompt("予想", hit=True, outcome_summary="結果",
                                        payoff_time=123.4, persona="neutral")
         assert "くれぴ" not in prompt
         assert "花圓" not in prompt
+
+    def test_persona_neutral_instructs_mixing_casual_endings(self):
+        """2026-08-29: _build_vision_prompt側とは別にintro_linesがコピペで
+        ハードコードされており、先日の口調修正（ですます調偏重の解消）が
+        ここには反映されていなかった（実機2026-08-28_22-11-26で発見）。"""
+        prompt = _build_payoff_prompt("予想", hit=True, outcome_summary="結果",
+                                       payoff_time=123.4, persona="neutral")
+        assert "丁寧な言い切りだけに偏らず" in prompt
+        assert "毎回同じ文末パターンで終わらせないこと" in prompt
 
 
 class TestBuildSelectionPredictionPrompt:
@@ -1177,6 +1237,15 @@ class TestBuildSelectionPredictionPrompt:
             "相手の構築: リザードン", predict_time=1.5, persona="neutral")
         assert "くれぴ" not in prompt
         assert "花圓" not in prompt
+
+    def test_persona_neutral_instructs_mixing_casual_endings(self):
+        """2026-08-29: _build_vision_prompt側とは別にintro_linesがコピペで
+        ハードコードされており、先日の口調修正（ですます調偏重の解消）が
+        ここには反映されていなかった（実機2026-08-28_22-11-26で発見）。"""
+        prompt = _build_selection_prediction_prompt(
+            "相手の構築: リザードン", predict_time=1.5, persona="neutral")
+        assert "丁寧な言い切りだけに偏らず" in prompt
+        assert "毎回同じ文末パターンで終わらせないこと" in prompt
 
 
 class TestGapFillerCount:

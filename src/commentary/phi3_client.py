@@ -180,6 +180,11 @@ class Phi3Client:
                 f"直近で実際に繰り出されたポケモン（画面の繰り出しメッセージから確定）: "
                 f"{game_state['switch_focus']}。交代・繰り出しに言及する場合は必ずこれに従うこと"
             )
+        # 交代の蒸し返し対策（2026-08-29・server.py側と同じ趣旨）: switch_focusで
+        # 触れられていない陣営について、前のターンで既に起きた交代を「今起きた
+        # こと」として語らないよう明示する
+        if game_state.get("event_type") in ("switch", "move_used") and game_state.get("no_new_switch_hint"):
+            lines.append(game_state["no_new_switch_hint"])
         # メガシンカの専用変身アニメーション（2026-08-29・server.py側と同じ趣旨）:
         # 数秒間の専用演出中は他の技・戦況の動きが発生しないため、この1つの出来事
         # だけに焦点を絞らせる

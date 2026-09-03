@@ -482,6 +482,39 @@ class TestMoveTargetHint:
         assert Pipeline._move_target_window_end(events, 0) == expected
 
 
+class TestVoidedMoveEffectHint:
+    """_voided_move_effect_hint: 技が防がれた/外れたことが確定した場合、
+    move_effect_hintに追加効果・反動も発生していない旨を注記する（2026-08-27新設）。
+
+    2026-08-29修正確認: 注記の文言に技名「まもる」を直接書くとLLMが今まさに
+    使われた技（move_focus）と混同する事故があった（実機2026-08-28_22-11-26:
+    相手のキラフロルの「だいちのちから」が「まもる」にすり替わった）ため、
+    注記からは技名を排除している。"""
+
+    def test_appends_note_when_protected(self):
+        hint = Pipeline._voided_move_effect_hint(
+            "だいちのちから: 相手の足下へ大地の力を放出する。相手の特防をさげることがある。",
+            "ドドゲザン（自分側）は攻撃から身を守った＝この技は防がれた")
+        assert "不発だった" in hint
+        assert "まもる" not in hint  # 技名を混同させないため注記に技名を書かない
+
+    def test_appends_note_when_missed(self):
+        hint = Pipeline._voided_move_effect_hint(
+            "だいちのちから: 相手の足下へ大地の力を放出する。相手の特防をさげることがある。",
+            "この技は外れた（対象に命中していない＝ダメージ・効果なし）")
+        assert "不発だった" in hint
+
+    def test_unvoided_target_hint_leaves_hint_unchanged(self):
+        original = "だいちのちから: 相手の足下へ大地の力を放出する。相手の特防をさげることがある。"
+        hint = Pipeline._voided_move_effect_hint(
+            original, "エルフーン（相手側）のHPが78%→0%に減少")
+        assert hint == original
+
+    def test_empty_move_effect_hint_stays_empty(self):
+        assert Pipeline._voided_move_effect_hint(
+            "", "ドドゲザン（自分側）は攻撃から身を守った＝この技は防がれた") == ""
+
+
 class TestUpdateProtectHistory:
     """「Xは攻撃から身を守った」メッセージの捕捉（技の対象ヒント用）。"""
 
@@ -701,6 +734,32 @@ class TestComputeSwitchFocus:
         gs2 = dict(gs)
         del gs2["switch_focus"]
         assert _build_bedrock_context(gs2, "switch", None, None, [])["switch_focus"] == ""
+
+
+class TestComputeNoNewSwitchHint:
+    """交代の蒸し返し対策（2026-08-29新設）: switch_focusで触れられていない陣営に
+    ついて「新しい交代は無い」と明示する否定ヒント。
+
+    実機2026-08-28_22-11-26で発覚: switch_focus="自分のエルフーン"のみの
+    イベントで、既に別イベントで報告済みの相手側の交代（イダイトウ登場）を
+    「相手はキラフロルからイダイトウに」と誤った起点付きで蒸し返した。"""
+
+    def test_missing_opponent_side_only(self):
+        hint = Pipeline._compute_no_new_switch_hint("自分のエルフーン")
+        assert "相手側について" in hint
+        assert "自分側について" not in hint
+
+    def test_missing_player_side_only(self):
+        hint = Pipeline._compute_no_new_switch_hint("相手のムクホーク")
+        assert "自分側について" in hint
+        assert "相手側について" not in hint
+
+    def test_both_sides_present_returns_empty(self):
+        assert Pipeline._compute_no_new_switch_hint("自分のペリッパー / 相手のキュウコン") == ""
+
+    def test_empty_focus_flags_both_sides(self):
+        hint = Pipeline._compute_no_new_switch_hint("")
+        assert "自分側" in hint and "相手側" in hint
 
 
 class TestNoteSendoutHistory:

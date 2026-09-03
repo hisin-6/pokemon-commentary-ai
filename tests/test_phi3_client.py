@@ -41,6 +41,13 @@ class TestBuildPrompt:
         assert "花圓くれぴ" in prompt
         assert "了解しました" in prompt  # 指示エコー対策ルール
 
+    def test_contains_repeat_count_fabrication_rule(self, client):
+        """2026-08-29新設: 技ログ1件しか無いのに「2ターン連続」等の回数を
+        LLMが勝手に創作した実機事故（renders/2026-08-28_22-11-26）への対策。"""
+        prompt = client._build_prompt({"event_type": "move_used", "status": "なし"}, None, None)
+        assert "回数・連続性を表す数字" in prompt
+        assert "勝手に数を盛らないこと" in prompt
+
     def test_contains_target_defense_side_uncertainty_rules(self, client):
         """2026-08-14: kurepi_persona.OUTPUT_RULES_LINESに追加した対象/防御結果/陣営の
         断定回避ルールがPhi3Client側にもそのまま反映されること（単一ソース経由）。"""
@@ -81,6 +88,15 @@ class TestBuildPrompt:
         prompt = client._build_prompt(game_state, None, None)
         assert "自分のブリジュラス" in prompt
         assert "必ずこれに従うこと" in prompt
+
+    def test_no_new_switch_hint_appended_for_move_used(self, client):
+        """交代の蒸し返し対策（2026-08-29新設・server.py側と同じ趣旨）。"""
+        game_state = {
+            "event_type": "move_used", "switch_focus": "自分のイダイトウ",
+            "no_new_switch_hint": "相手側について、このターンに新しい交代（繰り出し）は確認されていない",
+        }
+        prompt = client._build_prompt(game_state, None, None)
+        assert "相手側について、このターンに新しい交代（繰り出し）は確認されていない" in prompt
 
     def test_mega_evolution_focus_instruction(self, client):
         """メガシンカの専用変身アニメーション（2026-08-29新設・server.py側と同じ文言で配線）。"""
