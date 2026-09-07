@@ -997,6 +997,25 @@ def _normalize_ocr_message(text: str) -> str:
     return text
 
 
+# 濁点・半濁点の除去（ひらがな/カタカナ両対応）。比較用の正規化にのみ使い、
+# 表示・登録される名前自体は書き換えない。
+# ポケモン名の同一性判定（BattleStateTracker._get_or_create の重複吸収）で、
+# OCRの濁点誤読による表記ゆれ（例:「きねんびをすごした」/「きねんびをすこした」）が
+# 中間の1文字違いのため既存の前方一致吸収では拾えず、同一個体が別スロットに
+# 二重登録される事例が実機2026-09-06_21-31-02で発覚（2026-09-07対策）。
+_DAKUTEN_NORM_MAP = str.maketrans(
+    "がぎぐげご" "ざじずぜぞ" "だぢづでど" "ばびぶべぼ" "ぱぴぷぺぽ"
+    "ガギグゲゴ" "ザジズゼゾ" "ダヂヅデド" "バビブベボ" "パピプペポ",
+    "かきくけこ" "さしすせそ" "たちつてと" "はひふへほ" "はひふへほ"
+    "カキクケコ" "サシスセソ" "タチツテト" "ハヒフヘホ" "ハヒフヘホ",
+)
+
+
+def _normalize_dakuten(text: str) -> str:
+    """濁点・半濁点を除去した比較用の正規形を返す（表示や登録には使わない）。"""
+    return text.translate(_DAKUTEN_NORM_MAP)
+
+
 class BattleMessageParser:
     """
     バトル中に左下のメッセージボックスに表示されるテキストを解析し、
@@ -1035,10 +1054,22 @@ class BattleMessageParser:
     )
     # 自分がポケモンを繰り出すメッセージのパターン:
     #   旧: 「〇〇、ゆけ！」（名前が前）
-    #   新: 「ゆけつ！ (げんきいっぱいの) 〇〇！」（名前が後ろ・SVの実際の表示形式）
+    #   新: 「ゆけつ！ (げんきいっぱいの/二つ名) 〇〇！」（名前が後ろ・SVの実際の表示形式）
+    # 2026-09-07修正: group2は従来「(?:\S+の\s+)?」で前置句が必ず「の」で終わる
+    # （「げんきいっぱいの」等の体力フレーバー文）前提だったが、ポケモンの「二つ名」
+    # （称号。付かないこともあり、付く場合「二つ名＋種族名」の形で自分・相手どちらの
+    # 個体にも付きうる）は「の」で終わるとは限らない（実機: 「きねんびをすごした」）。
+    # 「の」で終わらない二つ名が来ると前置句の省略可能グループが不成立になり、直後の
+    # 単一トークン捕捉が二つ名自体を種族名と誤認し、後続の本来の種族名まで一度も
+    # 到達しないまま切り捨てられていた（実機2026-09-06_21-31-02: states.jsonl/
+    # manifest.jsonlのnameが「きねんびをすごした」のまま一度もリザードンに解決されず、
+    # Biimパネル・音声にも生の二つ名が漏れた）。「ゆけ」〜文末記号までを丸ごと捕捉し、
+    # 呼び出し側でスペース区切りの最終トークン（＝二つ名の有無によらず必ず種族名）
+    # だけを採用する方式に変更（二つ名が無い場合も最終トークン＝唯一のトークンなので
+    # 従来と同じ結果になる）。
     _SWITCH_IN_RE  = re.compile(
         r'(.{2,12})、?\s*ゆけ'                      # 「〇〇、ゆけ！」（名前が前・旧パターン保持）
-        r'|ゆけ\S*\s+(?:\S+の\s+)?(\S{2,12})'      # 「ゆけつ！ (げんきいっぱいの) 〇〇！」
+        r'|ゆけ\S*\s+([^!！]{2,40})'                # 「ゆけつ！ (げんきいっぱいの/二つ名) 〇〇！」
         r'|(.{2,12})が\s*とびだした'                 # 「〇〇が とびだした」
     )
     # 相手がポケモンを繰り出すメッセージ: 「〇〇をくりだした！」
@@ -1154,7 +1185,16 @@ class BattleMessageParser:
 
             m = self._SWITCH_IN_RE.search(text)
             if m:
-                _emit("switch_in", (m.group(1) or m.group(2) or m.group(3) or ""))
+                switch_in_name = m.group(1) or m.group(2) or m.group(3) or ""
+                if m.group(2):
+                    # group2は「(二つ名) 種族名」の複数トークンをまとめて捕捉している
+                    # ことがある（2026-09-07修正）。スペース区切りの最終トークンだけを
+                    # 種族名として採用する（二つ名が無い場合は元々1トークンのみなので
+                    # 挙動は変わらない）
+                    tokens = switch_in_name.split()
+                    if tokens:
+                        switch_in_name = tokens[-1]
+                _emit("switch_in", switch_in_name)
 
             # 「AとBをくりだした」: 先にDual REで1匹目・2匹目の両方を emit
             m2 = self._DUAL_OPPONENT_SWITCH_IN_RE.search(text)
@@ -1343,6 +1383,10 @@ class BattleStateTracker:
           同一チームに揃う確率よりOCR末尾欠け誤読の頻度の方が圧倒的に高い。
         ②新規登録ヒステリシス（low_trust時のみ）: 新規名は複数サイクルの連続目撃で
           確定するまでスロットを作らない（1フレームのノイズ由来の幽霊登録防止）。
+        ①-2濁点ゆらぎ吸収（2026-09-07追加）: OCRの濁点誤読（例:「きねんびをすごした」/
+          「きねんびをすこした」）で中間の1文字だけ違う表記が同一個体として登録される。
+          前方一致（①）は先頭からの一致しか見ないため中間の1文字違いを拾えず、
+          実機2026-09-06_21-31-02で同一個体が別スロットに二重登録される事例が発覚した。
         ③満杯時eviction（高信頼経路のみ）: 満杯で新規登録できない場合、場におらず
           未気絶で目撃回数（confidence）最少のスロットを幽霊とみなして削除する。
           低信頼経路に許すと相手繰り出しメッセージの誤分類などで本物のスロットが
@@ -1361,6 +1405,15 @@ class BattleStateTracker:
             if name.startswith(s.name):
                 log.info(f"[戦況] ロスターの {s.name} を {name} に更新（前方一致吸収）")
                 s.name = name
+                return s
+        # ①-2 濁点ゆらぎ吸収: 前方一致では拾えない中間の1文字違い（清音/濁音・半濁音の
+        # OCR誤読）を正規化して比較する。どちらの表記を残すかは判断材料が無いため
+        # 既存スロットの表記をそのまま維持する（新規スロットは作らない）
+        for s in slots:
+            if min(len(s.name), len(name)) < self._ABSORB_MIN_LEN:
+                continue
+            if _normalize_dakuten(s.name) == _normalize_dakuten(name):
+                log.info(f"[戦況] {name} は既存 {s.name} と濁点ゆらぎのみの一致 → 同一個体として吸収")
                 return s
         # ②新規登録ヒステリシス（低信頼経路のみ）
         side = "自分側" if slots is self._player else "相手側"
@@ -3095,9 +3148,13 @@ class Pipeline:
         self._FAINT_PENDING_TIMEOUT: float = 75.0  # この秒数内にmove_usedが来なければ単独送信
         self._skip_next_turn_start: bool = False  # faint統合でgame_turnを繰り上げた後、直後のturn_startをスキップするフラグ
         # 気絶実況の重複防止: faintイベント（OCRの0%表示）または合成faint
-        # （ボール数減少推定）で既に実況済みのポケモン名。0%表示がサンプリング
-        # から漏れた気絶をボール数確定時に合成実況するとき、両経路の二重言及を防ぐ
-        self._announced_faints: set[str] = set()
+        # （ボール数減少推定）で既に実況済みの (陣営, ポケモン名)。0%表示がサンプリング
+        # から漏れた気絶をボール数確定時に合成実況するとき、両経路の二重言及を防ぐ。
+        # 2026-09-07修正: 従来は名前のみのset[str]だったため、同名ミラー戦（自分・相手
+        # 両陣営に同じ種族がいる）で片側の気絶実況が済むと、もう片側の気絶が実況済み
+        # 扱いになり握りつぶされていた（実機2026-09-06_21-31-02で実例確認）。
+        # (陣営, 名前) のタプルで管理して陣営を区別する
+        self._announced_faints: set[tuple[str, str]] = set()
         # 直近で通常のfaintイベント（OCRの0%/たおれたテキスト検知）を処理した
         # 動画内時刻（2026-08-16・気絶の二重実況対策）。合成キャッチアップ
         # （_dispatch_faint_inferred）がこの直後の場合は抑制する
@@ -3881,8 +3938,12 @@ class Pipeline:
             # のと同じ理由）。非faintイベントは従来の実績があるためprev_fainted方式のまま
             # 変更しない（挙動を不必要に変えるリスクを避ける）。
             if event_type == "faint":
-                new_player = sorted(curr_fainted[0] - pre_announced_faints)
-                new_opponent = sorted(curr_fainted[1] - pre_announced_faints)
+                # 2026-09-07修正: _announced_faintsが(陣営, 名前)タプル化されたため、
+                # 陣営ごとに名前だけ取り出してから差分を取る（同名ミラー対策）
+                pre_announced_player = {n for s, n in pre_announced_faints if s == "player"}
+                pre_announced_opponent = {n for s, n in pre_announced_faints if s == "opponent"}
+                new_player = sorted(curr_fainted[0] - pre_announced_player)
+                new_opponent = sorted(curr_fainted[1] - pre_announced_opponent)
             else:
                 new_player = sorted(curr_fainted[0] - prev_fainted[0])
                 new_opponent = sorted(curr_fainted[1] - prev_fainted[1])
@@ -3941,7 +4002,8 @@ class Pipeline:
         # ── 気絶実況の合成（ボール数推定で新規確定した相手の気絶）──────────────
         # 現行イベントの実況より先にディスパッチし、時系列順（気絶→現行イベント）を保つ
         if inferred_faints:
-            self._announced_faints.update(name for _side, name in inferred_faints)
+            # inferred_faintsは元々 (side, name) のタプルリストなのでそのまま登録できる
+            self._announced_faints.update(inferred_faints)
             self._dispatch_faint_inferred(inferred_faints, frame, game_state, battle_context,
                                            event_type)
 
@@ -4219,8 +4281,12 @@ class Pipeline:
         # 数十秒後）に起きるため、その時点のトラッカー最新状態で確定した気絶を
         # 改めてfaint_focusとして注入し直す（保留開始時点の計算より確定精度が高い）。
         curr_fainted = self._battle_tracker.fainted_names()
-        new_player = sorted(curr_fainted[0] - self._announced_faints)
-        new_opponent = sorted(curr_fainted[1] - self._announced_faints)
+        # (陣営, 名前) タプル化された_announced_faintsから陣営ごとの名前集合を取り出す
+        # （2026-09-07・同名ミラー戦対策）
+        announced_player = {n for s, n in self._announced_faints if s == "player"}
+        announced_opponent = {n for s, n in self._announced_faints if s == "opponent"}
+        new_player = sorted(curr_fainted[0] - announced_player)
+        new_opponent = sorted(curr_fainted[1] - announced_opponent)
         if new_player or new_opponent:
             parts = []
             if new_player:
@@ -4229,7 +4295,8 @@ class Pipeline:
                 parts.append("相手の" + "と".join(new_opponent))
             game_state = dict(game_state)
             game_state["faint_focus"] = "と".join(parts)
-            self._announced_faints |= set(new_player) | set(new_opponent)
+            self._announced_faints |= {("player", n) for n in new_player}
+            self._announced_faints |= {("opponent", n) for n in new_opponent}
             log.info("[気絶確定ヒント][flush] %s", game_state["faint_focus"])
 
         # 2026-08-29新設: battle_context（player_field/player_bench等の控え欄表記）も
@@ -4310,14 +4377,17 @@ class Pipeline:
     # （2026-08-27新設・_compute_move_target_hintの単体化ロジック参照）。
     _SINGLE_OPPONENT_TARGET_VALUES = {"相手単体", "相手のランダム1体"}
 
+    # 「現在HP/最大HP」形式のHP生テキスト判定用（_hp_drop_observationsの分母誤読対策で使用）
+    _HP_XY_RE = re.compile(r'^(\d+)/(\d+)$')
+
     @staticmethod
     def _snap_panel_state(state: dict) -> dict:
-        """パネル状態スナップショット1件を (陣営ラベル, 名前) -> (HP%, 状態異常) に
+        """パネル状態スナップショット1件を (陣営ラベル, 名前) -> (HP%, 状態異常, HP生テキスト) に
         変換する。`_hp_drop_observations`/`_status_change_observations`で共有。"""
         out = {}
         for side_key, label in (("player", "自分側"), ("opponent", "相手側")):
             for p in state.get(side_key, []):
-                out[(label, p.get("name"))] = (p.get("hp_pct"), p.get("status"))
+                out[(label, p.get("name"))] = (p.get("hp_pct"), p.get("status"), p.get("hp_text"))
         return out
 
     def _panel_state_window(self, start: float, end: float) -> tuple[dict | None, list[dict]]:
@@ -4368,11 +4438,24 @@ class Pipeline:
         drops: dict[tuple, tuple[float, float]] = {}
         seen_in_window: set = set()
         for state in window_states:
-            for key, (hp, _status) in self._snap_panel_state(state).items():
+            for key, (hp, _status, hp_text) in self._snap_panel_state(state).items():
                 seen_in_window.add(key)
-                base_hp, _base_status = base_map.get(key, (None, None))
-                if (hp is not None and base_hp is not None
-                        and base_hp - hp >= self._TARGET_HINT_MIN_HP_DROP):
+                base_hp, _base_status, base_hp_text = base_map.get(key, (None, None, None))
+                if hp is None or base_hp is None:
+                    continue
+                # 2026-09-07修正: 分母（最大HP）のOCR誤読で、現在HP自体は変化して
+                # いないのにHP%だけ見かけ上動くケースへの対策（実機
+                # 2026-09-06_21-31-02のエルフーンで発覚: 「137/137」が「137/157」に
+                # 誤読され100%→87%とHP%上は13pt下がったが、分子＝現在HPは137のまま
+                # 一度も変化していなかった。自分側は「現在HP/最大HP」の絶対値表示
+                # のため、分子は分母よりOCRが遥かに安定している＝実測でこの試合の
+                # 分子誤読は0件・分母誤読は15回中14回）。両方がX/Y形式で分子が
+                # 一致するなら、HP%の食い違いはOCR誤読とみなしHP減少ありとしない
+                base_m = self._HP_XY_RE.match(base_hp_text) if base_hp_text else None
+                curr_m = self._HP_XY_RE.match(hp_text) if hp_text else None
+                if base_m and curr_m and base_m.group(1) == curr_m.group(1):
+                    continue
+                if base_hp - hp >= self._TARGET_HINT_MIN_HP_DROP:
                     prev = drops.get(key)
                     if prev is None or hp < prev[1]:
                         drops[key] = (base_hp, hp)
@@ -4380,7 +4463,7 @@ class Pipeline:
         tracker = getattr(self, "_battle_tracker", None)
         fainted_p, fainted_o = tracker.fainted_names() if tracker is not None else (set(), set())
         fainted_by_label = {"自分側": fainted_p, "相手側": fainted_o}
-        for key, (base_hp, _base_status) in base_map.items():
+        for key, (base_hp, _base_status, _base_hp_text) in base_map.items():
             if key in drops or key in seen_in_window or base_hp is None:
                 continue
             label, name = key
@@ -4401,8 +4484,8 @@ class Pipeline:
         base_map = self._snap_panel_state(baseline)
         statuses: dict[tuple, str] = {}
         for state in window_states:
-            for key, (_hp, status) in self._snap_panel_state(state).items():
-                _base_hp, base_status = base_map.get(key, (None, None))
+            for key, (_hp, status, _hp_text) in self._snap_panel_state(state).items():
+                _base_hp, base_status, _base_hp_text = base_map.get(key, (None, None, None))
                 if status and status != base_status and key not in statuses:
                     statuses[key] = status
         return statuses
@@ -4561,6 +4644,15 @@ class Pipeline:
                     parts.append(entry)
         return " / ".join(parts)
 
+    def _latest_sendout_time(self, start: float, end: float) -> float | None:
+        """観測窓 (start, end] に含まれる繰り出しメッセージのうち最も遅い時刻を返す
+        （無ければNone）。_compute_switch_focusと同じ窓を使い、switch_focus注入時に
+        実況音声の再生タイミングを実際の登場時刻まで繰り下げるために使う
+        （2026-09-07新設・move_used早期発火対策）。"""
+        times = [t for t, _side, _name in getattr(self, "_sendout_history", [])
+                 if start < t <= end]
+        return max(times) if times else None
+
     @staticmethod
     def _compute_no_new_switch_hint(switch_focus: str) -> str:
         """switch_focusで触れられていない陣営（自分側/相手側）について、蒸し返し
@@ -4703,6 +4795,29 @@ class Pipeline:
                     if ev.get("render_context") is not None:
                         ev["render_context"]["switch_focus"] = switch_focus
                     log.info("[交代ヒント] t=%.1fs %s", ev["event_time"], switch_focus)
+                    # 2026-09-07新設: 音声の再生タイミング補正（move_used早期発火対策）。
+                    # switch_focusはプロンプト内容の訂正のみで、event_time（音声を
+                    # render_sinkへ配置する時刻）はBattlePhaseClassifierがフェーズ遷移を
+                    # 検知した瞬間（＝新規登場メッセージが画面に完全表示されるより数秒前）
+                    # に固定されたままだった。内容は正しいのに音声だけ先に再生される
+                    # ズレが実機2026-09-06_21-31-02の1:16/2:20/2:32で確認された。
+                    # switch_focusの根拠になった繰り出しメッセージの実時刻まで
+                    # event_timeを繰り下げる（window_end超過なし＝次イベントより
+                    # 後ろにはならない）。
+                    latest_sendout_t = self._latest_sendout_time(
+                        ev["event_time"] - lookback, window_end)
+                    # 次イベント（種別を問わず）の時刻は超えない安全弁。window_endは
+                    # move_single/move_used/switch/battle_end種別しか境界にしないため、
+                    # 間に別種別（status等）のイベントが挟まっていると時系列が逆転する
+                    # 恐れがある
+                    if i + 1 < len(self._pending_render_events):
+                        next_ev_time = self._pending_render_events[i + 1]["event_time"]
+                        if latest_sendout_t is not None:
+                            latest_sendout_t = min(latest_sendout_t, next_ev_time)
+                    if latest_sendout_t is not None and latest_sendout_t > ev["event_time"]:
+                        log.info("[交代ヒント] t=%.1fs → %.1fsへ音声タイミングを補正",
+                                 ev["event_time"], latest_sendout_t)
+                        ev["event_time"] = latest_sendout_t
                 # 交代の蒸し返し対策（2026-08-29新設）: switch_focusに自分・相手
                 # どちらかの陣営情報しか含まれていない（または完全に空の）場合、
                 # 触れられていない側について何も言わないだけだと、LLMが控え欄に
@@ -5374,7 +5489,10 @@ class Pipeline:
             canonical = pokemon
             if self._classifier:
                 result = self._classifier.classify(pokemon)
-                if result and result.canonical_ja:
+                # category未チェックで採用すると、二つ名のOCR揺れ等が偶然
+                # 技/特性/アイテム名に75点以上でマッチした場合に無関係な名前へ
+                # 化ける恐れがある（2026-09-07・opponent_faintと同じ安全策を追加）
+                if result and result.canonical_ja and result.category == CATEGORY_POKEMON:
                     canonical = result.canonical_ja
             self._battle_tracker.mark_on_field_by_name(canonical)
             self._note_sendout("player", canonical)
@@ -5383,7 +5501,7 @@ class Pipeline:
             canonical = pokemon
             if self._classifier:
                 result = self._classifier.classify(pokemon)
-                if result and result.canonical_ja:
+                if result and result.canonical_ja and result.category == CATEGORY_POKEMON:
                     canonical = result.canonical_ja
             self._battle_tracker.register_opponent_on_field(canonical)
             self._note_sendout("opponent", canonical)
@@ -5736,19 +5854,25 @@ class Pipeline:
         2. 自分側の気絶も合成対象に拡張した。従来は相手側のみ（ボール数減少推定の
            スコープ）だったが、メッセージ由来の気絶確定（「メタグロスはたおれた!」）は
            自分側でも起きており、faintイベントの取り漏らし時に保険が効かなかった。
-        ※既知の限界: _announced_faintsは名前のみの集合のため、同名ミラー戦では
-        片側の実況で両側が実況済み扱いになる（同名ミラーの根本解決はフェーズ2候補）。
+        2026-09-07修正: _announced_faintsを(陣営, 名前)タプルの集合に変更した。従来は
+        名前のみの集合だったため、同名ミラー戦（自分・相手両陣営に同じ種族がいる）で
+        片側の気絶を実況すると、もう片側の気絶が実況済み扱いになり握りつぶされていた
+        （実機2026-09-06_21-31-02で実例確認）。
         """
+        announced_player = {n for s, n in self._announced_faints if s == "player"}
+        announced_opponent = {n for s, n in self._announced_faints if s == "opponent"}
         if event_type == "faint":
-            new_names = ((curr_fainted[0] - prev_fainted[0])
-                         | (curr_fainted[1] - prev_fainted[1]))
-            if new_names:
-                self._announced_faints |= new_names
+            new_player = curr_fainted[0] - prev_fainted[0]
+            new_opponent = curr_fainted[1] - prev_fainted[1]
+            if new_player or new_opponent:
+                self._announced_faints |= {("player", n) for n in new_player}
+                self._announced_faints |= {("opponent", n) for n in new_opponent}
             else:
-                self._announced_faints |= curr_fainted[0] | curr_fainted[1]
+                self._announced_faints |= {("player", n) for n in curr_fainted[0]}
+                self._announced_faints |= {("opponent", n) for n in curr_fainted[1]}
             return []
-        return ([("player", n) for n in sorted(curr_fainted[0] - self._announced_faints)]
-                + [("opponent", n) for n in sorted(curr_fainted[1] - self._announced_faints)])
+        return ([("player", n) for n in sorted(curr_fainted[0] - announced_player)]
+                + [("opponent", n) for n in sorted(curr_fainted[1] - announced_opponent)])
 
     def _dispatch_faint_inferred(
         self,

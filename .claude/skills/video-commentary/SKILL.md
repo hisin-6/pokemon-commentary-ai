@@ -31,6 +31,12 @@
           相手のリード[先頭2匹]を試合開始直前に予想し、battle_startで回収）
         的中/外れの判定はどちらもPython側が機械的に確定・LLMには演技だけさせる
   ↓ predictions.jsonl ＋ wav/pNNNN_*.wav（対象なしなら空ファイル）
+パス1.7 [WSL+Windows]  実況内容の重複確認・改善（任意・2026-09-06新設）
+        manifest.jsonl／fillers.jsonl／predictions.jsonlを時刻順にマージして目視し、
+        フィラーが直前の本編実況を言い直していないか確認する。見つかったら
+        「まだ言ってない角度」に文言を書き換え、scripts/resynthesize_fillers.pyで
+        対応するWAVをVOICEVOXに再合成させる（Bedrock不要＝追加課金なし）
+  ↓ fillers.jsonl（該当行のcommentary/duration/wavだけ更新）
 パス2   [WSL]      scripts/render_commentary_video.py --layout biim
         枠・字幕・戦況パネル・音声を一発合成（課金なし・何度でもやり直し可）。
         fillers.jsonl/predictions.jsonlは両方とも「あれば自動マージ」方式
@@ -46,6 +52,10 @@
   パス1より必ず先に実行する必要がある**（`team_preview.json`はパス1起動直後の
   `Pipeline.__init__`で1回だけ読み込まれる。パス1実行後に置いても・パス1実行中に
   置いても反映されない）
+- パス1.7（重複確認）はパス1.6までの素材が出揃った後・ネタバレ検査より前に行うのが効率的
+  （文言を直したらそのままネタバレ検査に持ち込める。fillers.jsonlの`commentary`だけを
+  テキストエディタで直接書き換えないこと＝WAVとズレる。必ず`resynthesize_fillers.py`経由で
+  音声も同時に更新すること）
 
 ## 工程の分担（どこが機械的で、どこに判断が要るか）
 
@@ -54,7 +64,8 @@
 | ① | パス1（解析＋素材） | Windows（要VOICEVOX） | **機械的**（コマンド1つ） |
 | ② | パス1.5（フィラー生成） | Windows（要VOICEVOX・EC2） | **機械的**（コマンド1つ） |
 | ②.5 | パス1.6（予測→回収・任意） | Windows（要VOICEVOX・EC2） | **機械的**（コマンド1つ・材料が無ければ0件で正常終了） |
-| ③ | ネタバレ検査 | WSL | **半自動**: `check_spoilers.py`が技名先読みを自動検出（実測されたネタバレの全パターン）。＋タイムラインの目視で勝敗・気絶の先取りを確認。predictions.jsonlも②.5実行時は③の前に生成しておき、回収文が未来情報を含んでいないか目視確認に含めること（当落判定自体はPython側の確定事実だが、③のスクリプト対応状況は実装時に要確認） |
+| ②.7 | パス1.7（重複確認・改善・任意） | WSL（目視）＋Windows（音声再合成） | **半自動**: 3つのjsonlを時刻順にマージして目視、フィラーが直前の本編実況を言い直していないか確認。見つかったら文言を書き換えて`resynthesize_fillers.py`で音声を合わせる |
+| ③ | ネタバレ検査 | WSL | **半自動**: `check_spoilers.py`が技名先読みを自動検出（実測されたネタバレの全パターン）。＋タイムラインの目視で勝敗・気絶の先取りを確認。predictions.jsonlも②.5実行時は③の前に生成しておき、回収文が未来情報を含んでいないか目視確認に含めること（当落判定自体はPython側の確定事実だが、③のスクリプト対応状況は実装時に要確認）。**②.7で文言を直した場合は必ずこの③をやり直すこと**（文言が変わっているため） |
 | ④ | パス2（合成） | WSL | **機械的**（コマンド1つ） |
 | ⑤ | 仕上げ確認 | どちらでも | **目視**: フレーム抽出2〜3枚＋通し視聴 |
 
@@ -175,6 +186,62 @@ venv\Scripts\python.exe scripts\generate_predictions.py renders\<動画名> --ec
 - `--persona`はパス1・パス1.5と同じ値にすること
 - 未実行でも`predictions.jsonl`が存在しなければパス2は従来通り動く（省略可能な機能）
 
+### パス1.7（実況内容の重複確認・改善・任意・WSL+Windows・2026-09-06新設）
+
+専用の自動検出スクリプトは無い。manifest.jsonl／fillers.jsonl／predictions.jsonlを
+時刻順にマージして目視し、フィラーが直前の本編実況（数十秒以内）を同じ出来事の
+言い直しになっていないか確認するステップ。
+
+```bash
+# WSL: 3つのjsonlを時刻順にマージして表示
+python3 - <<'EOF'
+import json
+from pathlib import Path
+
+rd = Path("renders/<動画名>")
+
+def load(name, kind):
+    p = rd / name
+    rows = []
+    if not p.exists():
+        return rows
+    with p.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            t = d.get("event_time", d.get("time"))
+            text = d.get("commentary") or d.get("text") or ""
+            rows.append((t, kind, d.get("event_type", ""), text))
+    return rows
+
+all_rows = load("manifest.jsonl", "本編") + load("fillers.jsonl", "フィラー") + load("predictions.jsonl", "予測")
+all_rows = [r for r in all_rows if r[0] is not None]
+all_rows.sort(key=lambda r: r[0])
+
+for t, kind, etype, text in all_rows:
+    m, s = divmod(int(t), 60)
+    print(f"{m:02d}分{s:02d}秒 [{kind}/{etype}] {text}")
+EOF
+```
+
+- 目安: 30秒以内・同じ技名/状態への言及が本編とフィラーで重なっていないか目視
+- 見つかったら、フィラーの文言を「起きた出来事の再説明」から「そこまでの展開の解釈・
+  今後への期待・感情」に寄せて書き換える（断定禁止ルールは無変更）
+- 書き換えた文言は`scripts/resynthesize_fillers.py`（2026-09-06新設）でVOICEVOXに
+  再投入し、WAVも同時に更新する。Bedrockは呼ばないので追加課金なし:
+  ```powershell
+  # Windows PowerShell・VOICEVOX起動必須（1行で書くのが確実。複数行にする場合は
+  # 継続記号がバッククォート` （cmdの^ではない）で、行末に余計な空白を入れないこと）
+  venv\Scripts\python.exe scripts\resynthesize_fillers.py renders\<動画名> --edit "SEQ=新しい文言" --edit "SEQ=新しい文言"
+  ```
+- ⚠️ **fillers.jsonlの`commentary`だけをテキストエディタで直接書き換えないこと**。
+  字幕は`commentary`フィールドをそのまま使う（`render_commentary_video.py`のASS生成）
+  ため、対応するWAVの音声内容とズレる。必ず`resynthesize_fillers.py`で音声も同時に
+  更新すること
+- 文言を直したら**ネタバレ検査（次項）を必ずやり直す**こと
+
 ### ネタバレ検査（WSL・パス2の前に必ず実行）
 
 ```
@@ -274,9 +341,17 @@ python3 scripts/render_commentary_video.py renders/<動画名>              # �
 出力する。パス2とは独立（動画本体の合成をやり直さなくてもサムネイルだけ再生成できる）。
 
 **2026-08-15確定運用**: オプション無指定（`--avatar-video`だけ指定）で
-構築アイコン無し・固定タイトルロゴ「ポケモンダブルバトル／AI自動実況」・
-アバターは上半身まで大きく（scale 0.62）・persona=neutralがデフォルトになる
+固定タイトルロゴ「ポケモンダブルバトル／AI自動実況」・アバターは上半身まで大きく
+（scale 0.62）・persona=neutralがデフォルトになる
 （`main()`のargparse既定値として組み込み済み。ユーザー承認済みの標準仕様）。
+
+**⚠️2026-09-07訂正**: 上記に「構築アイコン無しがデフォルト」と書いていたが誤り。
+`--no-roster-icons`は`action="store_true"`（指定しない限りアイコン**あり**）が
+実装の既定値で、2026-08-26のteam_previewロスターアイコン機能追加時にこの本文の
+更新が漏れていたと判明。オプション無指定なら**構築アイコンは表示される**のが
+現在の実際の挙動（`renders/2026-09-06_21-31-02/thumbnail.png`で実機確認・
+ユーザーがこのアイコンあり仕様を再承認済み）。アイコン無しにしたい場合のみ
+`--no-roster-icons`を明示的に付けること。
 
 ```
 # 標準運用（2026-08-15〜）: --avatar-videoだけ指定すればOK

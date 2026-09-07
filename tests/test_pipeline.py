@@ -326,6 +326,45 @@ class TestMoveTargetHint:
     def test_no_data_returns_negative_hint(self):
         assert "観測されていない" in self._pipe()._compute_move_target_hint(10.0, 20.0)
 
+    def test_denominator_misread_not_treated_as_drop(self):
+        """自分側HPの分母（最大HP）のOCR誤読で見かけ上HP%が下がっても、分子（現在HP）
+        が一致していれば実際のダメージとして扱わない（実機2026-09-06_21-31-02のエルフーンで
+        発覚: 「137/137」が「137/157」に誤読され100%→87%に見えたが、分子＝現在HPは
+        137のまま一度も変化していなかった。分母のみのOCR誤読が技の対象誤認
+        （「エルフーンちょっと削られちゃったか」）を引き起こしていた。2026-09-07修正の
+        回帰ガード）。"""
+        pipe = self._pipe()
+        pipe._panel_state_history = [
+            (120.0, {"turn": 1, "opponent": [],
+                     "player": [{"name": "エルフーン", "hp_pct": 100.0,
+                                 "hp_text": "137/137", "status": None}],
+                     "alive_player": 0, "alive_opponent": 0}),
+            (130.0, {"turn": 1, "opponent": [],
+                     "player": [{"name": "エルフーン", "hp_pct": 87.0,
+                                 "hp_text": "137/157", "status": None}],
+                     "alive_player": 0, "alive_opponent": 0}),
+        ]
+        hint = pipe._compute_move_target_hint(123.3, 132.4)
+        assert "観測されていない" in hint
+        assert "エルフーン" not in hint
+
+    def test_real_drop_still_detected_when_both_xy_format(self):
+        """分子（現在HP）が実際に変化していれば、両方X/Y形式でも通常通り検出する
+        （上の分母誤読対策が実ダメージ検出を潰していないことの非回帰確認）。"""
+        pipe = self._pipe()
+        pipe._panel_state_history = [
+            (120.0, {"turn": 1, "opponent": [],
+                     "player": [{"name": "エルフーン", "hp_pct": 100.0,
+                                 "hp_text": "137/137", "status": None}],
+                     "alive_player": 0, "alive_opponent": 0}),
+            (130.0, {"turn": 1, "opponent": [],
+                     "player": [{"name": "エルフーン", "hp_pct": 73.0,
+                                 "hp_text": "100/137", "status": None}],
+                     "alive_player": 0, "alive_opponent": 0}),
+        ]
+        hint = pipe._compute_move_target_hint(123.3, 132.4)
+        assert "エルフーン（自分側）のHPが100%→73%に減少" in hint
+
     def test_fainted_pokemon_vanishing_from_panel_detected_as_drop(self):
         """2026-08-20バグ修正: 気絶したポケモンはHP0%表示ではなくパネルから
         エントリごと消えるため、従来のHP差分ループでは検出できず「観測されて
@@ -734,6 +773,42 @@ class TestComputeSwitchFocus:
         gs2 = dict(gs)
         del gs2["switch_focus"]
         assert _build_bedrock_context(gs2, "switch", None, None, [])["switch_focus"] == ""
+
+
+class TestLatestSendoutTime:
+    """_latest_sendout_time: switch_focus解決の根拠になった繰り出しメッセージの
+    実時刻を返す（2026-09-07新設・move_used早期発火の音声タイミング補正用）。
+
+    従来はswitch_focusの注入がプロンプト内容の訂正のみに留まり、event_time
+    （音声のrender_sink配置時刻）はBattlePhaseClassifierがフェーズ遷移を検知した
+    瞬間（＝新規登場メッセージが画面に完全表示されるより数秒前）に固定されたままで、
+    内容は正しいのに音声だけ早く再生されるズレがあった（実機2026-09-06_21-31-02の
+    1:16/2:20/2:32）。"""
+
+    def _pipe(self):
+        pipe = Pipeline.__new__(Pipeline)
+        pipe._sendout_history = []
+        return pipe
+
+    def test_returns_latest_time_in_window(self):
+        pipe = self._pipe()
+        pipe._sendout_history = [
+            (261.9, "player", "ブリジュラス"), (298.0, "player", "ペリッパー")]
+        assert pipe._latest_sendout_time(291.7 - 3.0, 306.4) == 298.0
+
+    def test_ignores_entries_outside_window(self):
+        pipe = self._pipe()
+        pipe._sendout_history = [(248.9, "player", "ペリッパー")]
+        assert pipe._latest_sendout_time(261.9 - 5.0, 265.0) is None
+
+    def test_no_history_returns_none(self):
+        assert self._pipe()._latest_sendout_time(10.0, 30.0) is None
+
+    def test_multiple_entries_returns_max(self):
+        pipe = self._pipe()
+        pipe._sendout_history = [
+            (291.0, "opponent", "キュウコン"), (295.0, "player", "ペリッパー")]
+        assert pipe._latest_sendout_time(288.0, 300.0) == 295.0
 
 
 class TestComputeNoNewSwitchHint:
@@ -2229,6 +2304,70 @@ class TestBattleMessageParser:
         ])
         assert ("opponent_switch_in", "ガブリアス") in self._types(events)
 
+    def test_switch_in_with_title_not_ending_in_no(self):
+        """二つ名（称号。付かないこともあり、付く場合「二つ名＋種族名」の形で自分・
+        相手どちらの個体にも付きうる）が「の」で終わらない場合でも種族名まで
+        正しく捕捉する（実機2026-09-06_21-31-02: 二つ名「きねんびをすごした」が
+        「の」で終わらないため旧実装は種族名リザードンに一度も到達できなかった。
+        2026-09-07修正の回帰ガード）。"""
+        events = self.parser.parse(_msg_ocr("ゆけっ!", "きねんびをすごした", "リザードン!"))
+        assert ("switch_in", "リザードン") in self._types(events)
+        assert all(name != "きねんびをすごした" for _t, name in self._types(events))
+
+    def test_switch_in_with_flavor_text_ending_in_no_still_works(self):
+        """従来通りの「(体力フレーバー文)の (種族名)」形式（「の」終わり）も
+        引き続き種族名だけを正しく捕捉する（2026-09-07修正の非回帰確認）。"""
+        events = self.parser.parse(_msg_ocr("ゆけっ!", "げんきいっぱいの", "ガブリアス!"))
+        assert ("switch_in", "ガブリアス") in self._types(events)
+
+    def test_switch_in_without_title_still_works(self):
+        """二つ名が無い単純な「ゆけっ! 〇〇!」形式も引き続き正しく捕捉する
+        （2026-09-07修正の非回帰確認）。"""
+        events = self.parser.parse(_msg_ocr("ゆけっ!", "ガブリアス!"))
+        assert ("switch_in", "ガブリアス") in self._types(events)
+
+
+class TestGetOrCreateDakutenAbsorption:
+    """_get_or_create: 濁点ゆらぎ吸収（2026-09-07新設）。
+
+    OCRの濁点誤読（例:「きねんびをすごした」/「きねんびをすこした」）による
+    中間の1文字違いは前方一致では拾えず、同一個体が別スロットに二重登録される
+    事例が実機2026-09-06_21-31-02で発覚した。"""
+
+    def setup_method(self):
+        self.tracker = BattleStateTracker()
+
+    def test_dakuten_variant_absorbed_into_existing_slot(self):
+        existing = FieldPokemon(name="きねんびをすごした")
+        slots = [existing]
+        result = self.tracker._get_or_create(slots, "きねんびをすこした")
+        assert result is existing
+        assert len(slots) == 1
+        assert existing.name == "きねんびをすごした"  # 既存表記は書き換えない
+
+    def test_katakana_dakuten_variant_also_absorbed(self):
+        existing = FieldPokemon(name="バドレックス")
+        slots = [existing]
+        result = self.tracker._get_or_create(slots, "パトレックス")
+        assert result is existing
+        assert len(slots) == 1
+
+    def test_unrelated_names_not_absorbed(self):
+        existing = FieldPokemon(name="ガブリアス")
+        slots = [existing]
+        result = self.tracker._get_or_create(slots, "リザードン")
+        assert result is not existing
+        assert len(slots) == 2
+
+    def test_short_names_below_absorb_min_len_not_absorbed(self):
+        """3文字未満の短い名前は偶発一致回避のため濁点吸収の対象外
+        （前方一致吸収と同じ_ABSORB_MIN_LENガードを流用）。"""
+        existing = FieldPokemon(name="ピィ")
+        slots = [existing]
+        result = self.tracker._get_or_create(slots, "ビィ")
+        assert result is not existing
+        assert len(slots) == 2
+
 
 class TestMarkBenchBySide:
     """mark_bench_by_name の side 限定（同名ミラー戦の誤ベンチ化防止）"""
@@ -2871,7 +3010,7 @@ class TestTrackNewFaints:
         curr = ({"メタグロス"}, {"ライチュウ"})  # 今回のfaintイベントの対象はメタグロス
         result = Pipeline._track_new_faints(self.runner, prev, curr, "faint")
         assert result == []
-        assert self.runner._announced_faints == {"メタグロス"}
+        assert self.runner._announced_faints == {("player", "メタグロス")}
         # → 次の通常イベントでライチュウが合成対象として拾われる
         result = Pipeline._track_new_faints(self.runner, curr, curr, "move_used")
         assert result == [("opponent", "ライチュウ")]
@@ -2882,7 +3021,7 @@ class TestTrackNewFaints:
         curr = ({"ガブリアス"}, {"リキキリン"})
         result = Pipeline._track_new_faints(self.runner, curr, curr, "faint")
         assert result == []
-        assert self.runner._announced_faints == {"ガブリアス", "リキキリン"}
+        assert self.runner._announced_faints == {("player", "ガブリアス"), ("opponent", "リキキリン")}
 
     def test_non_faint_event_returns_unannounced_opponent_faints(self):
         """ボール数減少推定（update()内）で確定した相手の気絶を合成対象として返す。"""
@@ -2902,13 +3041,13 @@ class TestTrackNewFaints:
         result = Pipeline._track_new_faints(self.runner, curr, curr, "move_used")
         assert result == [("opponent", "リキキリン")]
         # 実況合成後（呼び出し側で登録）は二度と返さない
-        self.runner._announced_faints.add("リキキリン")
+        self.runner._announced_faints.add(("opponent", "リキキリン"))
         result = Pipeline._track_new_faints(self.runner, curr, curr, "battle_end")
         assert result == []
 
     def test_already_announced_not_returned(self):
         """faintイベントで実況済みのポケモンは合成対象にしない（二重言及防止）。"""
-        self.runner._announced_faints = {"リキキリン"}
+        self.runner._announced_faints = {("opponent", "リキキリン")}
         curr = (set(), {"リキキリン"})
         result = Pipeline._track_new_faints(self.runner, curr, curr, "move_used")
         assert result == []
@@ -2932,6 +3071,24 @@ class TestTrackNewFaints:
         result = Pipeline._track_new_faints(
             self.runner, (set(), set()), (set(), set()), "move_used")
         assert result == []
+
+    def test_mirror_match_same_species_both_sides_not_cross_suppressed(self):
+        """同名ミラー戦（自分・相手両陣営に同じ種族がいる）対策（2026-09-07）。
+
+        従来は_announced_faintsが名前のみの集合だったため、片側のリザードンの
+        気絶を実況すると、もう片側の同名リザードンが後で倒れても「実況済み」
+        扱いになり握りつぶされていた（実機2026-09-06_21-31-02で実例確認）。
+        (陣営, 名前) タプル化により、陣営が違えば独立して実況対象になる。"""
+        # 先に相手側のリザードンが気絶・実況合成済み
+        result1 = Pipeline._track_new_faints(
+            self.runner, (set(), set()), (set(), {"リザードン"}), "turn_start")
+        assert result1 == [("opponent", "リザードン")]
+        self.runner._announced_faints.update(result1)
+
+        # 後で自分側のリザードンも気絶（同名ミラー）。相手側は既に実況済みのまま変わらず。
+        curr2 = ({"リザードン"}, {"リザードン"})
+        result2 = Pipeline._track_new_faints(self.runner, curr2, curr2, "turn_start")
+        assert result2 == [("player", "リザードン")]
 
 
 class TestFaintInferredDispatch:
@@ -3109,14 +3266,14 @@ class TestFlushPendingFaint:
         sent_state = args[2]
         assert sent_state["faint_focus"] == "自分のリザードン"
         assert kwargs["event_time"] == 120.9
-        assert self.runner._announced_faints == {"リザードン"}
+        assert self.runner._announced_faints == {("player", "リザードン")}
 
     def test_does_not_overwrite_already_announced(self):
         """既に実況済みの名前しか無い場合はfaint_focusを上書きしない
         （元のgame_state["faint_focus"]をそのまま維持する）。"""
         self.runner._pending_faint_state = {
             "event_type": "faint", "faint_focus": "自分のドドゲザン"}
-        self.runner._announced_faints = {"ドドゲザン"}
+        self.runner._announced_faints = {("player", "ドドゲザン")}
         self.runner._battle_tracker = MagicMock()
         self.runner._battle_tracker.fainted_names.return_value = ({"ドドゲザン"}, set())
         self.runner._battle_tracker.to_context.return_value = {}
