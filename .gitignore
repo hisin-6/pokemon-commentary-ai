@@ -130,3 +130,6 @@ data/battle_situations.sqlite.bak_20260809
 test_voice_metan.wav
 docs/portfolio.md
 docs/diagrams/system-architecture.svg
+
+# キャラクターデザイン資料（三面図PSD/PNG・外注納品物のためGit管理しない）
+docs/charactordesign/
