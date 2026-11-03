@@ -15,8 +15,9 @@
       納品モデルで `Joy`/`Sorrow`/`Fun`/`A`〜`O` が揃っているかを一発チェックできるように
       → 2026-10-29 `scripts/check_vrm_model.py` 作成（表情・回すボーン・メタ情報・VRM 1.0対応、テスト13件）。
       納品されたら `python scripts/check_vrm_model.py <model>.vrm` を流すだけ
-- [ ] 外注モデル差し替えチェックリスト `docs/manual/` に作成（クロップ再計測・idle pose角度再検証・
+- [x] 外注モデル差し替えチェックリスト `docs/manual/` に作成（クロップ再計測・idle pose角度再検証・
       表情名・クロマキー色・`--avatar-crop` 等。SKILL.md の地雷リストから拾う）
+      → 2026-11-03 `docs/manual/vrm-model-swap-checklist.md` 作成（現行値の控え表＋Ⅰ納品物確認〜Ⅵ値反映・persona切り戻しまで6段階）
 - [ ] `play_and_animate_avatar.py` の表情名・ボーン角度をモデルごとに切り替えられるよう設定ファイル化する案を提案メモに
 
 ## RVC（声質変更）の下ごしらえ
