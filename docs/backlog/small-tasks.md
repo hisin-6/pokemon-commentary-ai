@@ -18,7 +18,9 @@
 - [x] 外注モデル差し替えチェックリスト `docs/manual/` に作成（クロップ再計測・idle pose角度再検証・
       表情名・クロマキー色・`--avatar-crop` 等。SKILL.md の地雷リストから拾う）
       → 2026-11-03 `docs/manual/vrm-model-swap-checklist.md` 作成（現行値の控え表＋Ⅰ納品物確認〜Ⅵ値反映・persona切り戻しまで6段階）
-- [ ] `play_and_animate_avatar.py` の表情名・ボーン角度をモデルごとに切り替えられるよう設定ファイル化する案を提案メモに
+- [x] `play_and_animate_avatar.py` の表情名・ボーン角度をモデルごとに切り替えられるよう設定ファイル化する案を提案メモに
+      → 2026-11-06 `docs/design/avatar-model-profile-proposal.md` 作成（推奨=案A モデルプロファイルJSON＋`--avatar-profile`）。
+      腕下げ角度80°が `_IDLE_POSE_DEG` と `explore_avatar_poses._IDLE_ARM_DEG` に重複していると判明
 
 ## RVC（声質変更）の下ごしらえ
 - [ ] VOICEVOX出力→RVC変換を差し込む位置の調査メモ（`voicevox_client.py`・`generate_gap_commentary.py`・
@@ -37,3 +39,4 @@
 ## 提案メモ（挙動変更が必要なもの・実装はユーザー判断）
 - server.py のプロンプトキャッシュ（cache_control）導入: 2026-08-10 にユーザー判断で保留中
 - 残り体数を気絶数の積み上げから推定して実況に活かす案（2026-07-30メモ）
+- アバターのモデル依存値をプロファイルJSON化（2026-11-06・`docs/design/avatar-model-profile-proposal.md`・案A/B/C選択待ち）
