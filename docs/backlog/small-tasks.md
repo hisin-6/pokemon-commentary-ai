@@ -28,7 +28,11 @@
       → 2026-11-09 `docs/design/rvc-integration-proposal.md` 作成（推奨=案A 一括変換「パス1.8」新設）。
       WAVは全経路`VoicevoxClient.generate_wav()`経由・`build_commentary_track()`がフォーマット混在で落ちるため
       RVC出力は`--resample_sr 24000`でそろえる必要ありと判明
-- [ ] VRAM予算表にRVC推論ぶんを入れた試算（ADRとの整合も確認）
+- [x] VRAM予算表にRVC推論ぶんを入れた試算（ADRとの整合も確認）
+      → 2026-11-10 `docs/design/rvc-vram-budget.md` 作成。RVC推論は机上見積もり約1〜2GB（上限2.5GB・fp16・faiss indexはCPU）。
+      案A（パス1.8）ならどのフェーズでも7GB以上余る。案Bはgemma2:9bフォールバックと重なると9.4GBでOOM圏内。
+      ADR違反は無し・実装前にADR-004追記だけ必要。実測手順は同メモ5章（要実機確認）。
+      ついでに `ollama-setup.md`・`system-architecture.md` 3章のフォールバックLLM行が Phi-3 のままと判明（未修正）
 
 ## テスト・品質
 - [ ] テストが薄いスクリプトを洗い出して一覧化（`scripts/` で tests に対応が無いもの）

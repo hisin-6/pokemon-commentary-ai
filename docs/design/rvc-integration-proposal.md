@@ -120,7 +120,8 @@ RVC側（`C:\Users\rotat\Retrieval-based-Voice-Conversion-WebUI-main\...`・別�
 - [ ] `render_commentary_video.py` の変換漏れガード
 - [ ] SKILL.md（video-commentary）の手順にパス1.8、地雷リストに「resynthesize後の1.8忘れ」を追記
 - [ ] ADR-004に「VOICEVOX後段でRVC声質変換（パス1.8）」を追記（ADRに反する設計変更はADR先行のルール）
-- [ ] VRAM試算（別タスク）の結果を確認
+- [x] VRAM試算（別タスク）の結果を確認 → 2026-11-10 `docs/design/rvc-vram-budget.md`
+      （案Aなら最大2.5GBで問題なし・案Bはフォールバック発火時9.4GBで危険。実測は要実機確認）
 - [ ] **要確認（権利表記）**: RVCで声色を変えても元はVOICEVOX四国めたんの合成音声。
       VOICEVOX/四国めたんの利用規約上のクレジット表記（現在 `generate_thumbnail.py` の
       `_CHARACTER_NAME_NEUTRAL = "VOICEVOX：四国めたん"`・概要欄）をくれぴ名義に切り替えた後も
