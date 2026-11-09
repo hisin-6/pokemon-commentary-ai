@@ -23,8 +23,11 @@
       腕下げ角度80°が `_IDLE_POSE_DEG` と `explore_avatar_poses._IDLE_ARM_DEG` に重複していると判明
 
 ## RVC（声質変更）の下ごしらえ
-- [ ] VOICEVOX出力→RVC変換を差し込む位置の調査メモ（`voicevox_client.py`・`generate_gap_commentary.py`・
+- [x] VOICEVOX出力→RVC変換を差し込む位置の調査メモ（`voicevox_client.py`・`generate_gap_commentary.py`・
       `resynthesize_fillers.py`）。設計案のみ、実装はユーザー復帰後
+      → 2026-11-09 `docs/design/rvc-integration-proposal.md` 作成（推奨=案A 一括変換「パス1.8」新設）。
+      WAVは全経路`VoicevoxClient.generate_wav()`経由・`build_commentary_track()`がフォーマット混在で落ちるため
+      RVC出力は`--resample_sr 24000`でそろえる必要ありと判明
 - [ ] VRAM予算表にRVC推論ぶんを入れた試算（ADRとの整合も確認）
 
 ## テスト・品質
@@ -40,3 +43,4 @@
 - server.py のプロンプトキャッシュ（cache_control）導入: 2026-08-10 にユーザー判断で保留中
 - 残り体数を気絶数の積み上げから推定して実況に活かす案（2026-07-30メモ）
 - アバターのモデル依存値をプロファイルJSON化（2026-11-06・`docs/design/avatar-model-profile-proposal.md`・案A/B/C選択待ち）
+- RVC声質変換の差し込み位置（2026-11-09・`docs/design/rvc-integration-proposal.md`・案A/B/C選択待ち）
