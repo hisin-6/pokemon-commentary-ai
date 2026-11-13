@@ -40,7 +40,7 @@
 | vrm_bone_reader | 100 | 外注VRM納品時の check_vrm_model の土台 | `_read_glb_json`（最小GLBをバイト列で組める）、`node_world_position`（親子ノードの平行移動の合成） |
 | pose_tuner_gui | 478 | アバターのポーズ調整（SKILL.md・VRM差し替えチェックリスト記載） | `look_rotation_quat`、`orbit_to_camera`、`pose_to_axis_values`⇄`axis_values_to_steps`、`format_pose_dict` ※`import tkinter` がトップレベル（46行目）なので、テスト時はtkinter無し環境でのimport可否に注意 |
 
-→ **おすすめ順: ① generate_review_checklist ② resynthesize_fillers ③ vrm_bone_reader ④ pose_tuner_gui**
+→ **おすすめ順: ① ~~generate_review_checklist~~（2026-11-13 テスト追加済み） ② resynthesize_fillers ③ vrm_bone_reader ④ pose_tuner_gui**
 （①は関数がほぼ全部純粋で1回で収まりやすい。③④は2月のVRM納品直前に効く）
 
 ### B: 純粋関数はあるが、現役度が低い／保留中機能

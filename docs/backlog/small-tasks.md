@@ -39,6 +39,7 @@
       → 2026-11-11 `docs/backlog/scripts-test-coverage.md` 作成。60本中テストあり15本＋間接1本。
       次の候補（優先A）= generate_review_checklist → resynthesize_fillers → vrm_bone_reader → pose_tuner_gui
 - [ ] 上の一覧から純粋関数だけのものにテスト追加（1回1スクリプト）
+      - [x] 2026-11-13 `generate_review_checklist` → `tests/test_generate_review_checklist.py`（19件・main含む）。次=resynthesize_fillers
 - [ ] `scripts/test_*.py`（実機検証用の使い捨て）の整理案（残す/消すの提案だけ）
 
 ## ドキュメント
