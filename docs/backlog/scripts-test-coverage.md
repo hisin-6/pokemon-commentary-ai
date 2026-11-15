@@ -35,12 +35,12 @@
 
 | スクリプト | 行数 | 使われ方 | テストしやすい関数 |
 |---|---|---|---|
-| resynthesize_fillers | 105 | 実況動画パス1.7（SKILL.md記載） | `parse_edit`（`"<idx>:<text>"`パース）、`load_jsonl`/`write_jsonl` 往復 ※VOICEVOX呼び出し部はモック必須 |
+| resynthesize_fillers | 105 | 実況動画パス1.7（SKILL.md記載） | `parse_edit`（`"SEQ=新文言"`パース）、`load_jsonl`/`write_jsonl` 往復 ※VOICEVOX呼び出し部はモック必須 |
 | generate_review_checklist | 239 | パス1検証（pass1-verification-checklist.md） | `_judgement`、`_build_segments`、`_find_segment`、`_turn_state_summary`、`build_markdown`（tmp_pathにJSONLを置けば完結） |
 | vrm_bone_reader | 100 | 外注VRM納品時の check_vrm_model の土台 | `_read_glb_json`（最小GLBをバイト列で組める）、`node_world_position`（親子ノードの平行移動の合成） |
 | pose_tuner_gui | 478 | アバターのポーズ調整（SKILL.md・VRM差し替えチェックリスト記載） | `look_rotation_quat`、`orbit_to_camera`、`pose_to_axis_values`⇄`axis_values_to_steps`、`format_pose_dict` ※`import tkinter` がトップレベル（46行目）なので、テスト時はtkinter無し環境でのimport可否に注意 |
 
-→ **おすすめ順: ① ~~generate_review_checklist~~（2026-11-13 テスト追加済み） ② resynthesize_fillers ③ vrm_bone_reader ④ pose_tuner_gui**
+→ **おすすめ順: ① ~~generate_review_checklist~~（2026-11-13 テスト追加済み） ② ~~resynthesize_fillers~~（2026-11-16 テスト追加済み） ③ vrm_bone_reader ④ pose_tuner_gui**
 （①は関数がほぼ全部純粋で1回で収まりやすい。③④は2月のVRM納品直前に効く）
 
 ### B: 純粋関数はあるが、現役度が低い／保留中機能
