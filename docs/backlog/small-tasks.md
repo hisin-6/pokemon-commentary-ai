@@ -42,6 +42,8 @@
       - [x] 2026-11-13 `generate_review_checklist` → `tests/test_generate_review_checklist.py`（19件・main含む）。次=resynthesize_fillers
       - [x] 2026-11-16 `resynthesize_fillers` → `tests/test_resynthesize_fillers.py`（17件・VoicevoxClientはフェイク差し替え）。
             存在しないseqが混ざると1件も書き換えずに止まる（中途半端な更新にならない）ことも確認。次=vrm_bone_reader
+      - [x] 2026-11-18 `vrm_bone_reader` → `tests/test_vrm_bone_reader.py`（14件・最小GLBをバイト列で組み立て）。
+            VRM 0.x/1.0両方のhumanBones・パディング/BINチャンク付きGLB・親子の座標積算を確認。次=pose_tuner_gui
 - [ ] `scripts/test_*.py`（実機検証用の使い捨て）の整理案（残す/消すの提案だけ）
 
 ## ドキュメント
