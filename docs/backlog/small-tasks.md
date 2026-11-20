@@ -38,12 +38,15 @@
 - [x] テストが薄いスクリプトを洗い出して一覧化（`scripts/` で tests に対応が無いもの）
       → 2026-11-11 `docs/backlog/scripts-test-coverage.md` 作成。60本中テストあり15本＋間接1本。
       次の候補（優先A）= generate_review_checklist → resynthesize_fillers → vrm_bone_reader → pose_tuner_gui
-- [ ] 上の一覧から純粋関数だけのものにテスト追加（1回1スクリプト）
+- [x] 上の一覧から純粋関数だけのものにテスト追加（1回1スクリプト・優先A 4本完了）
       - [x] 2026-11-13 `generate_review_checklist` → `tests/test_generate_review_checklist.py`（19件・main含む）。次=resynthesize_fillers
       - [x] 2026-11-16 `resynthesize_fillers` → `tests/test_resynthesize_fillers.py`（17件・VoicevoxClientはフェイク差し替え）。
             存在しないseqが混ざると1件も書き換えずに止まる（中途半端な更新にならない）ことも確認。次=vrm_bone_reader
       - [x] 2026-11-18 `vrm_bone_reader` → `tests/test_vrm_bone_reader.py`（14件・最小GLBをバイト列で組み立て）。
             VRM 0.x/1.0両方のhumanBones・パディング/BINチャンク付きGLB・親子の座標積算を確認。次=pose_tuner_gui
+      - [x] 2026-11-20 `pose_tuner_gui` → `tests/test_pose_tuner_gui.py`（37件・GUI本体は対象外）。
+            tkinter/python-oscが無い環境だけMagicMockで差し替え。カメラが常に注視点を向くこと・
+            「Pythonコードを出力」の結果がそのままPOSESとして読み戻せることを確認。優先Aはこれで完了
 - [ ] `scripts/test_*.py`（実機検証用の使い捨て）の整理案（残す/消すの提案だけ）
 
 ## ドキュメント
