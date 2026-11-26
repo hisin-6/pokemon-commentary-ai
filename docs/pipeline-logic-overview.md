@@ -578,7 +578,7 @@ Bedrock への payload は `context`（`_build_bedrock_context` が作る）・`
 
 最後に勝敗が分かっていれば戦況ウェアハウスに書き戻す。
 
-**既知の不具合（コード読解ベース・実機未確認）**: `faint_repeat_hint` は `game_state` に入るが、`_build_bedrock_context` の出力キーに含まれていない。そのため Bedrock 側の `server.py` が `context.get("faint_repeat_hint")` で読もうとしても常に空になり、プロンプトに届かない。Phi-3 側も読んでいない。マニフェスト（`render_context`）には記録されるので、ログ上はヒントが付いているように見える。テスト（`tests/test_render_sink.py`）は `_call_bedrock_text` に渡す `game_state` までしか見ていないので検出できていない。全員既報告のときに生成を飛ばす処理は pipeline 側で完結しているので、こちらは効いている。
+**修正済み（2026-11-26）**: `faint_repeat_hint` は以前 `_build_bedrock_context` の出力キーに無く、`server.py` の `context.get("faint_repeat_hint")` が常に空だった（マニフェストには記録されるので効いているように見えていた）。2026-11-26 に context へ追加し、Phi-3 側の `_build_prompt` でも読むようにした。回帰テストは `tests/test_pipeline.py` の `test_faint_repeat_hint_context_passthrough` と `tests/test_phi3_client.py` の `test_faint_repeat_hint_*`。全員既報告のときに生成を飛ばす処理は以前から pipeline 側で効いている。
 
 ### 6.7 Bedrock 呼び出しと後処理
 
@@ -664,7 +664,7 @@ Bedrock への payload は `context`（`_build_bedrock_context` が作る）・`
 ## 10. 既知の制約・未確認事項
 
 - ボール数・YOLO 状態異常のロジックは既定構成で動いていない（4.10節・コード読解ベース）
-- `faint_repeat_hint` が Bedrock のプロンプトに届いていない疑い（6.6節・コード読解ベース）
+- ~~`faint_repeat_hint` が Bedrock のプロンプトに届いていない~~ → 2026-11-26 修正済み（6.6節）
 - バトル開始前の「ゆけっ」事前キャッシュ（`run()` 内の `_YUKE_RE`）は旧パターン `(?:\S+の\s+)?(\S{2,12})` のまま。2026-09-07 の二つ名対応は試合中の `BattleMessageParser._SWITCH_IN_RE` にしか入っていないので、「の」で終わらない二つ名が付いた自分の先発は、開始前キャッシュでは二つ名側を拾う可能性がある。PokeClassifier のスコア80以上という条件で大半は弾かれるはず（コード読解ベース・実機未確認）
 - 動画末尾で合成する battle_end は `frame=None` で `_process_event` を呼ぶ。最後の `cv2.imwrite(debug/pipeline_turn_*.png, frame)` は None を渡すと例外になるはずで、そうなると後付け生成は `finally` で走るものの、終了時にトレースバックが出る可能性がある（コード読解ベース・実機未確認）
 - 名前ベースの陣営判定（`_find_slot` 等）は同名ミラー戦で取り違えうる。根本対応はフェーズ2候補として見送り中

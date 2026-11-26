@@ -2892,6 +2892,7 @@ def _build_bedrock_context(
         "rag_pokemon_info":         rag_info,
         "detected_moves":           " / ".join(move_log) if move_log else "なし",
         "faint_context":            game_state.get("faint_context", ""),  # 直前のfaint情報（統合時のみ）
+        "faint_repeat_hint":        game_state.get("faint_repeat_hint", ""),  # 報告済み気絶の蒸し返し防止（後付けのみ・2026-11-26までcontextに入っておらずserver.pyに届いていなかった）
         "faint_focus":              game_state.get("faint_focus", ""),  # 気絶の対象（ボール数推定確定＝合成faint／2026-08-28〜fainted_names()のdiff確定＝通常faintの両方で使う）
         "battle_result":            game_state.get("battle_result", ""),  # 勝敗（battle_endのみ・"勝ち"/"負け"）
         "battle_surrendered":       bool(game_state.get("battle_surrendered", False)),  # 降参による決着（battle_endのみ）

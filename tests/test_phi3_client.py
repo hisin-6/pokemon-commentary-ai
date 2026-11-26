@@ -98,6 +98,17 @@ class TestBuildPrompt:
         prompt = client._build_prompt(game_state, None, None)
         assert "相手側について、このターンに新しい交代（繰り出し）は確認されていない" in prompt
 
+    def test_faint_repeat_hint_appended(self, client):
+        """報告済み気絶の蒸し返し対策（2026-11-26・server.py側と同じ形式で配線）。"""
+        game_state = {"event_type": "faint",
+                      "faint_repeat_hint": "ガブリアスの気絶は、既に別のイベントで伝えている"}
+        prompt = client._build_prompt(game_state, None, None)
+        assert "※ ガブリアスの気絶は、既に別のイベントで伝えている" in prompt
+
+    def test_faint_repeat_hint_absent_by_default(self, client):
+        prompt = client._build_prompt({"event_type": "faint"}, None, None)
+        assert "既に別のイベントで伝えている" not in prompt
+
     def test_mega_evolution_focus_instruction(self, client):
         """メガシンカの専用変身アニメーション（2026-08-29新設・server.py側と同じ文言で配線）。"""
         game_state = {"event_type": "mega_evolution", "mega_evolution_focus": "自分のリザードン"}

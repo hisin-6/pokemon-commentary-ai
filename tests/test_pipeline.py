@@ -221,6 +221,19 @@ class TestDetectBattleResult:
         del gs2["battle_surrendered"]
         assert _build_bedrock_context(gs2, "move_used", None, None, [])["battle_surrendered"] is False
 
+    def test_faint_repeat_hint_context_passthrough(self):
+        """game_stateのfaint_repeat_hintが_build_bedrock_contextに乗る。
+        2026-11-26まで出力キーに無く、server.pyのcontext.get("faint_repeat_hint")が
+        常に空だった（manifestには記録されるので効いているように見えていた）回帰防止。"""
+        gs = {"ocr_text": "", "hp_values": [], "balls_remaining": [],
+              "name_candidates_player": [], "name_candidates_opponent": [],
+              "status": "なし", "faint_repeat_hint": "ガブリアスの気絶は、既に別のイベントで伝えている"}
+        ctx = _build_bedrock_context(gs, "move_used", None, None, [])
+        assert ctx["faint_repeat_hint"] == "ガブリアスの気絶は、既に別のイベントで伝えている"
+        gs2 = dict(gs)
+        del gs2["faint_repeat_hint"]
+        assert _build_bedrock_context(gs2, "faint", None, None, [])["faint_repeat_hint"] == ""
+
 
 class TestIsSurrenderText:
     """降参テキスト判定（2026-08-15・フェーズ遷移経路の降参保留用）。"""

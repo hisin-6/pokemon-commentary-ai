@@ -185,6 +185,10 @@ class Phi3Client:
         # こと」として語らないよう明示する
         if game_state.get("event_type") in ("switch", "move_used") and game_state.get("no_new_switch_hint"):
             lines.append(game_state["no_new_switch_hint"])
+        # 報告済み気絶の蒸し返し対策（2026-11-26・server.py側と同じ趣旨）: 既に伝えた
+        # 気絶を「たった今起きた」ように再報告しない（faint/move_used・後付けのみ）
+        if game_state.get("faint_repeat_hint"):
+            lines.append(f"※ {game_state['faint_repeat_hint']}")
         # メガシンカの専用変身アニメーション（2026-08-29・server.py側と同じ趣旨）:
         # 数秒間の専用演出中は他の技・戦況の動きが発生しないため、この1つの出来事
         # だけに焦点を絞らせる
