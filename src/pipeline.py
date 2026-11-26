@@ -2827,6 +2827,47 @@ def _replace_glitch_commentary(text: str, persona: str = "kurepi") -> str:
     return replaced
 
 
+# ─── バトル開始前の「ゆけっ！」キャッシュ用 ──────────────────────────────────
+
+# 「ゆけっ！」の後ろを最大何トークン見るか（二つ名は1〜2トークン＋種族名1トークン）
+_YUKE_LOOKAHEAD_TOKENS = 3
+_SENTENCE_END_CHARS = "！!」"
+
+
+def _extract_yuke_candidates(texts: list[str]) -> list[list[str]]:
+    """バトル開始前のOCRトークン列から「ゆけっ！ (二つ名/フレーバー) 種族名！」を探し、
+    「ゆけ」1回ごとに、後ろに続く名前候補トークンのリストを返す（並びは画面の順）。
+
+    呼び出し側は各リストを前から分類し、最初にポケモンと判定できたものを採用する
+    （二つ名やフレーバー句はポケモン名として分類されないので読み飛ばされる）。
+    後ろから見ないのは、OCRが種族名の「！」を読み落としたときに、続く別メッセージの
+    単語（例:「ガブリアスの」）を拾わないようにするため。
+    旧実装（2026-11-26まで）は「(\\S+の\\s+)?」で「の」終わりのフレーバー句しか読み飛ばせず、
+    「の」で終わらない二つ名（例:「きねんびをすごした」）だと二つ名自体を候補にして
+    分類に失敗し、自分の先発ポケモンを事前キャッシュできていなかった。
+
+    文末記号（！ ! 」）で終わるトークンまでで打ち切るので、同じフレームの別メッセージの
+    単語は拾わない。
+    """
+    words = " ".join(texts).split()
+    groups: list[list[str]] = []
+    for i, w in enumerate(words):
+        if "ゆけ" not in w:
+            continue
+        cands: list[str] = []
+        for nxt in words[i + 1:i + 1 + _YUKE_LOOKAHEAD_TOKENS]:
+            if "ゆけ" in nxt:
+                break
+            clean = nxt.rstrip(_SENTENCE_END_CHARS + "、")
+            if len(clean) >= 2:
+                cands.append(clean)
+            if nxt[-1] in _SENTENCE_END_CHARS:
+                break
+        if cands:
+            groups.append(cands)
+    return groups
+
+
 # ─── Bedrock Vision 呼び出し（EC2 API 経由・オプション） ─────────────────────
 
 def _build_bedrock_context(
@@ -3561,17 +3602,16 @@ class Pipeline:
                         # バトル開始前: 自分ポケモンの「ゆけっ！ 〇〇！」パターンを検出してキャッシュ
                         # （battle_start OCR では技選択画面のため自分ポケモン名が映らないケースに対応）
                         if self._classifier:
-                            _YUKE_RE = re.compile(r'ゆけ\S*\s+(?:\S+の\s+)?(\S{2,12})')
-                            _yuke_full = " ".join(pre_ocr_texts)
-                            for m in _YUKE_RE.finditer(_yuke_full):
-                                cand = m.group(1).rstrip('！!」、')
-                                if len(cand) < 2:
-                                    continue
-                                r3 = self._classifier.classify(cand)
-                                if r3 and r3.category == CATEGORY_POKEMON and r3.score >= 80:
-                                    if r3.canonical_ja not in self._pre_battle_player:
-                                        self._pre_battle_player.append(r3.canonical_ja)
-                                        log.info("[事前検出] 自分 %s（ゆけっ！検出）", r3.canonical_ja)
+                            # 二つ名対応（2026-11-26）: 「ゆけ」の後ろの候補を前から分類し、
+                            # 最初にポケモンと判定できたもの（＝種族名）だけを採用する
+                            for cands in _extract_yuke_candidates(pre_ocr_texts):
+                                for cand in cands:
+                                    r3 = self._classifier.classify(cand)
+                                    if r3 and r3.category == CATEGORY_POKEMON and r3.score >= 80:
+                                        if r3.canonical_ja not in self._pre_battle_player:
+                                            self._pre_battle_player.append(r3.canonical_ja)
+                                            log.info("[事前検出] 自分 %s（ゆけっ！検出）", r3.canonical_ja)
+                                        break
 
                     # ── フェーズ分類 + イベント検知 ─────────────────────────
                     event_type = self._phase_classifier.detect(ocr_results)
@@ -4143,10 +4183,13 @@ class Pipeline:
             self._recent_sendouts.clear()  # 前試合の繰り出しを次試合に引き継がない
             log.info("[戦況] バトル終了 → トラッカー非アクティブ化")
 
-        # デバッグ用スクリーンショット保存
-        debug_dir = Path("debug")
-        debug_dir.mkdir(exist_ok=True)
-        cv2.imwrite(str(debug_dir / f"pipeline_turn_{turn:03d}.png"), frame)
+        # デバッグ用スクリーンショット保存。動画末尾で合成するbattle_endはframe=Noneで
+        # 呼ばれるので保存しない（cv2.imwriteは空画像で例外を投げる。2026-11-26までは
+        # run()のfinally（後付け生成・レンダサマリー）は走ったあと、最後に例外で異常終了していた）
+        if frame is not None:
+            debug_dir = Path("debug")
+            debug_dir.mkdir(exist_ok=True)
+            cv2.imwrite(str(debug_dir / f"pipeline_turn_{turn:03d}.png"), frame)
 
     def _dispatch_commentary(
         self,

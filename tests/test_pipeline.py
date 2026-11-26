@@ -32,6 +32,7 @@ from src.pipeline import (
     _detect_result_from_win_lose_ocr,
     _extract_opponent_trainer_name,
     _extract_structured_info,
+    _extract_yuke_candidates,
     _is_battle_screen,
     _is_surrender_text,
     _ocr_results_to_text,
@@ -4429,3 +4430,49 @@ class TestToPanelState:
                                             slot_index=0, status="ねむり"))
         state = tracker.to_panel_state()
         assert state["player"][0]["status"] == "ねむり"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# バトル開始前の「ゆけっ！」キャッシュ（2026-11-26・二つ名対応）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestExtractYukeCandidates:
+    """run() のバトル開始前キャッシュが使う候補抽出。呼び出し側は各グループを前から
+    分類し、最初にポケモンと判定できたものを採用する。"""
+
+    def test_plain(self):
+        assert _extract_yuke_candidates(["ゆけっ！", "リザードン！"]) == [["リザードン"]]
+
+    def test_flavor_ending_with_no(self):
+        assert _extract_yuke_candidates(["ゆけっ！ げんきいっぱいの リザードン！"]) == \
+            [["げんきいっぱいの", "リザードン"]]
+
+    def test_title_not_ending_with_no(self):
+        """実機2026-09-06_21-31-02の二つ名「きねんびをすごした」。旧正規表現は
+        二つ名だけを候補にしてしまい、種族名まで届かなかった。"""
+        groups = _extract_yuke_candidates(["ゆけっ！", "きねんびをすごした", "リザードン！"])
+        assert groups == [["きねんびをすごした", "リザードン"]]
+
+    def test_stops_at_sentence_end(self):
+        """種族名の「！」で打ち切り、同じフレームの別メッセージの単語は拾わない。"""
+        groups = _extract_yuke_candidates(["ゆけっ！ リザードン！", "ガブリアスの", "ドラゴンクロー！"])
+        assert groups == [["リザードン"]]
+
+    def test_lookahead_is_limited(self):
+        groups = _extract_yuke_candidates(["ゆけっ", "あ1", "い2", "う3", "え4"])
+        assert groups == [["あ1", "い2", "う3"]]
+
+    def test_two_yuke_in_one_frame(self):
+        groups = _extract_yuke_candidates(["ゆけっ！ リザードン！ ゆけっ！ エルフーン！"])
+        assert groups == [["リザードン"], ["エルフーン"]]
+
+    def test_next_yuke_cuts_window(self):
+        """「！」を読み落としても、次の「ゆけ」より先は前のグループに入れない。"""
+        groups = _extract_yuke_candidates(["ゆけっ リザードン ゆけっ エルフーン"])
+        assert groups == [["リザードン"], ["エルフーン"]]
+
+    def test_no_yuke(self):
+        assert _extract_yuke_candidates(["たたかう", "ポケモン"]) == []
+
+    def test_one_char_tokens_skipped(self):
+        assert _extract_yuke_candidates(["ゆけっ！", "・", "リザードン！"]) == [["リザードン"]]

@@ -74,6 +74,6 @@
 - RVC声質変換の差し込み位置（2026-11-09・`docs/design/rvc-integration-proposal.md`・案A/B/C選択待ち）
 - 【2026-11-26 pipeline-logic-overview全面改訂で発見・コード読解ベース】
   - `faint_repeat_hint` がBedrockに届いていない: `_generate_posthoc_commentary` が `game_state` に入れるが、`_build_bedrock_context` の出力に無いので `server.py` 側は常に空（manifestには記録されるので効いているように見える）。→ ✅2026-11-26 修正（context に追加・Phi-3 側も配線・回帰テスト3件）
-  - バトル開始前の「ゆけっ」キャッシュ（`run()` 内の `_YUKE_RE`）が旧パターンのまま＝2026-09-07の二つ名修正が入っていない
-  - 動画末尾の battle_end が `frame=None` で `_process_event` に入り、`cv2.imwrite(debug/pipeline_turn_*.png, None)` で例外になる可能性（後付け生成は finally で走る）
+  - バトル開始前の「ゆけっ」キャッシュ（`run()` 内の `_YUKE_RE`）が旧パターンのまま＝2026-09-07の二つ名修正が入っていない → ✅2026-11-26 修正（`_extract_yuke_candidates` 新設・テスト9件）
+  - 動画末尾の battle_end が `frame=None` で `_process_event` に入り、`cv2.imwrite(debug/pipeline_turn_*.png, None)` で例外になる可能性（後付け生成は finally で走る） → ✅2026-11-26 修正（例外になることを確認のうえ `frame is None` ガード）
   - `pipeline.py` の古いコメント11件・`hpbar_analyzer.py`/`screen_capture.py` のdocstring 2件（一覧は `docs/pipeline-logic-overview.md` 10章）。コメントのみなので挙動は変わらない
