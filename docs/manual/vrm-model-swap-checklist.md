@@ -60,6 +60,10 @@
   - [ ] 指の曲がりが不自然でない（手の大きさが違うと特に崩れやすい）
   - 崩れたポーズは `scripts\pose_tuner_gui.py --port 39540` で読み込み→調整→「Pythonコードを出力」→`explore_avatar_poses.py` の `POSES` に貼り替える
 - [ ] **待機モーション**: `play_and_animate_avatar.py` で数十秒流し、Spine/Chestの揺れ（`_IDLE_BONES`）と首かしげ等の仕草が大きすぎ/小さすぎないか
+- [ ] **本番コードでのポーズ遷移**: `venv\Scripts\python.exe scripts\test_vmc_pose_reaction.py --port 39540` をEnterで1段階ずつ進める（`play_and_animate_avatar.py` の `send_reaction`/`play_pose_reaction`/`run_idle_sway`/`run_idle_gestures` をそのまま呼ぶ）
+  - [ ] Joy/Sorrow/Fun/Angry の各ポーズへの遷移が滑らか（急に飛ばない）
+  - [ ] ポーズ後に腕・首・上体がTポーズではなく腕下げ姿勢に戻る
+  - [ ] ポーズ中〜直後に待機スウェイ・仕草とぶつかってガクつかない
 - [ ] `fist_pump_right` への遷移が不自然な件（見送り中の既知課題）が新モデルでも出るか、ついでに見ておく
 
 ## Ⅳ. 収録→クロップ再計測（Windows録画＋WSL計測）

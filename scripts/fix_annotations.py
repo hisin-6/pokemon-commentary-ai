@@ -250,16 +250,6 @@ def extract_correct_texts(filepath):
     return texts
 
 
-all_correct = set()
-for fp in TRANSCRIPT_FILES:
-    all_correct |= extract_correct_texts(fp)
-
-print(f"[Step 1] 正解テキスト数: {len(all_correct)}")
-
-# 正規化キー -> 正規化後テキスト（= 書き起こしの正解）
-correct_norm_map = {t: t for t in all_correct}  # すでに正規化済み
-
-
 # ---------------------------------------------------------------------------
 # Step 2: ノイズ判定
 # ---------------------------------------------------------------------------
@@ -291,98 +281,112 @@ def is_noise(text, conf):
 # Step 3: メイン処理
 # ---------------------------------------------------------------------------
 
-with open(INPUT_PATH, encoding='utf-8') as f:
-    data = json.load(f)
+def main():
+    all_correct = set()
+    for fp in TRANSCRIPT_FILES:
+        all_correct |= extract_correct_texts(fp)
 
-print(f"[Step 2] 元データ件数: {len(data)}")
+    print(f"[Step 1] 正解テキスト数: {len(all_correct)}")
 
-fixed = []
-deleted_entries = []  # (file, text, conf, reason)
-modified_entries = []  # (file, before, after, method)
+    # 正規化キー -> 正規化後テキスト（= 書き起こしの正解）
+    correct_norm_map = {t: t for t in all_correct}  # すでに正規化済み
 
-for entry in data:
-    text = entry['ocr_text']
-    conf = entry['conf']
-    fname = entry['file']
+    with open(INPUT_PATH, encoding='utf-8') as f:
+        data = json.load(f)
 
-    # ノイズ判定
-    noise, reason = is_noise(text, conf)
-    if noise:
-        deleted_entries.append((fname, text, conf, reason))
-        continue
+    print(f"[Step 2] 元データ件数: {len(data)}")
 
-    # 書き起こしと照合して修正
-    correction, method = find_correction(text, correct_norm_map)
-    if correction is not None and correction != text:
-        modified_entries.append((fname, text, correction, method))
-        entry = dict(entry)
-        entry['ocr_text'] = correction
-        entry['corrected'] = True
+    fixed = []
+    deleted_entries = []  # (file, text, conf, reason)
+    modified_entries = []  # (file, before, after, method)
 
-    # 」→！ の汎用変換（書き起こし照合に関係なく適用）
-    if '」' in entry['ocr_text']:
-        entry = dict(entry)
-        entry['ocr_text'] = entry['ocr_text'].replace('」', '！')
-        entry['corrected'] = True
+    for entry in data:
+        text = entry['ocr_text']
+        conf = entry['conf']
+        fname = entry['file']
 
-    fixed.append(entry)
-
-# 既存の annotations_fixed.json から reviewed/deleted/ocr_text を引き継ぐ
-if _os.path.exists(OUTPUT_PATH):
-    with open(OUTPUT_PATH, encoding='utf-8') as f:
-        prev = json.load(f)
-    prev_map = {d['file']: d for d in prev}
-    carried = 0
-    for entry in fixed:
-        prev_entry = prev_map.get(entry['file'])
-        if prev_entry is None:
+        # ノイズ判定
+        noise, reason = is_noise(text, conf)
+        if noise:
+            deleted_entries.append((fname, text, conf, reason))
             continue
-        # reviewed=True のエントリはユーザーが確認・修正済み → ocr_text も引き継ぐ
-        if prev_entry.get('reviewed'):
-            entry['ocr_text'] = prev_entry['ocr_text']
-            entry['reviewed'] = True
-            if prev_entry.get('deleted'):
+
+        # 書き起こしと照合して修正
+        correction, method = find_correction(text, correct_norm_map)
+        if correction is not None and correction != text:
+            modified_entries.append((fname, text, correction, method))
+            entry = dict(entry)
+            entry['ocr_text'] = correction
+            entry['corrected'] = True
+
+        # 」→！ の汎用変換（書き起こし照合に関係なく適用）
+        if '」' in entry['ocr_text']:
+            entry = dict(entry)
+            entry['ocr_text'] = entry['ocr_text'].replace('」', '！')
+            entry['corrected'] = True
+
+        fixed.append(entry)
+
+    # 既存の annotations_fixed.json から reviewed/deleted/ocr_text を引き継ぐ
+    if _os.path.exists(OUTPUT_PATH):
+        with open(OUTPUT_PATH, encoding='utf-8') as f:
+            prev = json.load(f)
+        prev_map = {d['file']: d for d in prev}
+        carried = 0
+        for entry in fixed:
+            prev_entry = prev_map.get(entry['file'])
+            if prev_entry is None:
+                continue
+            # reviewed=True のエントリはユーザーが確認・修正済み → ocr_text も引き継ぐ
+            if prev_entry.get('reviewed'):
+                entry['ocr_text'] = prev_entry['ocr_text']
+                entry['reviewed'] = True
+                if prev_entry.get('deleted'):
+                    entry['deleted'] = True
+            elif prev_entry.get('deleted'):
                 entry['deleted'] = True
-        elif prev_entry.get('deleted'):
-            entry['deleted'] = True
-            entry['reviewed'] = True
-        carried += 1
-    print(f"  フラグ引き継ぎ: {carried} 件")
+                entry['reviewed'] = True
+            carried += 1
+        print(f"  フラグ引き継ぎ: {carried} 件")
 
-# 結果保存
-with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
-    json.dump(fixed, f, ensure_ascii=False, indent=2)
+    # 結果保存
+    with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
+        json.dump(fixed, f, ensure_ascii=False, indent=2)
 
 
-# ---------------------------------------------------------------------------
-# 完了報告
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # 完了報告
+    # ---------------------------------------------------------------------------
 
-print(f"\n{'='*60}")
-print(f"完了報告")
-print(f"{'='*60}")
-print(f"元件数:       {len(data)}")
-print(f"最終件数:     {len(fixed)}")
-print(f"削除件数:     {len(deleted_entries)}")
-print(f"修正件数:     {len(modified_entries)}")
-print(f"変更なし:     {len(data) - len(deleted_entries) - len(modified_entries)}")
+    print(f"\n{'='*60}")
+    print(f"完了報告")
+    print(f"{'='*60}")
+    print(f"元件数:       {len(data)}")
+    print(f"最終件数:     {len(fixed)}")
+    print(f"削除件数:     {len(deleted_entries)}")
+    print(f"修正件数:     {len(modified_entries)}")
+    print(f"変更なし:     {len(data) - len(deleted_entries) - len(modified_entries)}")
 
-reasons = Counter(r for _, _, _, r in deleted_entries)
-print(f"\n--- 削除理由内訳 ---")
-for reason, count in reasons.most_common():
-    print(f"  {reason}: {count}件")
+    reasons = Counter(r for _, _, _, r in deleted_entries)
+    print(f"\n--- 削除理由内訳 ---")
+    for reason, count in reasons.most_common():
+        print(f"  {reason}: {count}件")
 
-methods = Counter(m for _, _, _, m in modified_entries)
-print(f"\n--- 修正方法内訳 ---")
-for method, count in methods.most_common():
-    print(f"  {method}: {count}件")
+    methods = Counter(m for _, _, _, m in modified_entries)
+    print(f"\n--- 修正方法内訳 ---")
+    for method, count in methods.most_common():
+        print(f"  {method}: {count}件")
 
-print(f"\n--- 代表的な修正例 (最大20件) ---")
-for fname, before, after, method in modified_entries[:20]:
-    print(f"  [{method:18s}] {repr(before):35s} -> {repr(after)}")
+    print(f"\n--- 代表的な修正例 (最大20件) ---")
+    for fname, before, after, method in modified_entries[:20]:
+        print(f"  [{method:18s}] {repr(before):35s} -> {repr(after)}")
 
-print(f"\n--- 削除サンプル (最大15件) ---")
-for fname, text, conf, reason in deleted_entries[:15]:
-    print(f"  conf={conf:.3f} [{reason}] {repr(text)}")
+    print(f"\n--- 削除サンプル (最大15件) ---")
+    for fname, text, conf, reason in deleted_entries[:15]:
+        print(f"  conf={conf:.3f} [{reason}] {repr(text)}")
 
-print(f"\n出力ファイル: {OUTPUT_PATH}")
+    print(f"\n出力ファイル: {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()

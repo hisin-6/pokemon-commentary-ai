@@ -52,6 +52,8 @@
       `test_ocr_fix*.py` は `fix_annotations.py` の古いコピー（末尾助詞に「と」が無い）でassertも無いので、
       ケースを `tests/test_fix_annotations.py` に移してから削除。`test_manga_ocr.py` は2026-04-19に見送り済み。
       `test_vmc_pose_reaction.py` は差し替えチェックリストへの追記を提案。削除・追記はユーザーOK待ち
+      → 2026-11-26 実施: `tests/test_fix_annotations.py`（39件）新設・`fix_annotations.py` の本体処理を `main()` 化（importで
+        `annotations_fixed.json` を書き出さないように）・3本削除・`vrm-model-swap-checklist.md` Ⅲ節に `test_vmc_pose_reaction.py` を追記
 
 ## ドキュメント
 - [x] `docs/pipeline-logic-overview.md` を現行コードと突き合わせて古い記述を洗い出す
@@ -63,9 +65,15 @@
       10-29以降は本ファイルとコミットに日付つきで残っているので補完不要。
       09-12・09-14・10-02 の3日はリポジトリ内に記録が無い（MEMORYのみ）ので、短い日報を補う価値あり（ユーザー判断待ち）。
       ついでに 09-03 の日報は一度も作られていない（09-01・09-02のみ）と判明
+      → 2026-11-26 実施: `docs/daily/2026-09-12.md`・`2026-09-14.md`・`2026-10-02.md` をメモリとコミットから補完（冒頭に「後日補完」と明記）。09-03 は記録の材料が無いので作らない
 
 ## 提案メモ（挙動変更が必要なもの・実装はユーザー判断）
 - server.py のプロンプトキャッシュ（cache_control）導入: 2026-08-10 にユーザー判断で保留中
 - 残り体数を気絶数の積み上げから推定して実況に活かす案（2026-07-30メモ）
 - アバターのモデル依存値をプロファイルJSON化（2026-11-06・`docs/design/avatar-model-profile-proposal.md`・案A/B/C選択待ち）
 - RVC声質変換の差し込み位置（2026-11-09・`docs/design/rvc-integration-proposal.md`・案A/B/C選択待ち）
+- 【2026-11-26 pipeline-logic-overview全面改訂で発見・コード読解ベース】
+  - `faint_repeat_hint` がBedrockに届いていない: `_generate_posthoc_commentary` が `game_state` に入れるが、`_build_bedrock_context` の出力に無いので `server.py` 側は常に空（manifestには記録されるので効いているように見える）。修正は context に1行足すだけだが実況内容が変わるので要判断
+  - バトル開始前の「ゆけっ」キャッシュ（`run()` 内の `_YUKE_RE`）が旧パターンのまま＝2026-09-07の二つ名修正が入っていない
+  - 動画末尾の battle_end が `frame=None` で `_process_event` に入り、`cv2.imwrite(debug/pipeline_turn_*.png, None)` で例外になる可能性（後付け生成は finally で走る）
+  - `pipeline.py` の古いコメント11件・`hpbar_analyzer.py`/`screen_capture.py` のdocstring 2件（一覧は `docs/pipeline-logic-overview.md` 10章）。コメントのみなので挙動は変わらない

@@ -47,7 +47,7 @@
 
 | スクリプト | 行数 | 状況 | 純粋関数 |
 |---|---|---|---|
-| fix_annotations | 388 | OCRファインチューニング（保留中） | `normalize`、`chars_differ_only_by_ocr_error`、`find_correction`、`is_noise` |
+| fix_annotations | 392 | OCRファインチューニング（保留中）。✅2026-11-26 `tests/test_fix_annotations.py`（39件）追加・本体処理を `main()` 化 | `normalize`、`chars_differ_only_by_ocr_error`、`find_correction`、`is_noise` |
 | generate_battle_template | 410 | ログ→テンプレ変換。参照ドキュメントなし | `_is_ability_noise`、`_clean_*`、`format_template` |
 | extract_ocr_changes | 158 | OCRログ差分抽出。参照ドキュメントなし | `fields_changed`、`format_entry` |
 | replay_phase_events | 172 | 診断JSONLのリプレイ検証 | `_frame_time` |
@@ -69,7 +69,7 @@
 | capture_end_screen / collect_ocr_crops / crop_ball_rois | 動画・OCR・ファイル操作が主体 |
 | balance_background / create_lmdb / prepare_lmdb_data / setup_finetune_model / finetune_ocr | 学習データ準備の薄いラッパー |
 | pmx_bone_reader | 調査用ダンプ（関数1つ） |
-| test_manga_ocr / test_ocr_areas / test_ocr_fix / test_ocr_fix2 / test_vmc_expression / test_vmc_pose / test_vmc_pose_reaction | 実機検証用の使い捨て。整理案は small-tasks.md の別項目で扱う |
+| test_ocr_areas / test_vmc_expression / test_vmc_pose / test_vmc_pose_reaction | 実機検証用（残す）。test_ocr_fix / test_ocr_fix2 / test_manga_ocr は2026-11-26に削除（ケースは `tests/test_fix_annotations.py` へ移植） |
 
 ## 気づいたこと（未対応）
 - `scripts/test_*.py` という名前は pytest の収集パターン（`test_*.py`）に一致する。`pytest.ini` が `testpaths = tests`
