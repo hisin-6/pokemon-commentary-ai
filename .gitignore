@@ -133,3 +133,6 @@ docs/diagrams/system-architecture.svg
 
 # キャラクターデザイン資料（三面図PSD/PNG・外注納品物のためGit管理しない）
 docs/charactordesign/
+
+# AWS/EC2セキュリティ点検手順（自宅IP・環境の内部構成を含むため非公開・2026-11-24）
+docs/manual/aws-security-maintenance-2026-11.md

@@ -154,7 +154,7 @@ PokemonSlot（dataclass）
 
 - `selection_screen` フェーズ中の OCR 結果を利用した事前パーティ情報収集
 - 状態異常 YOLO 検出結果を BattleStateTracker に統合（現在は game_state 経由でのみ利用）
-- S3 への実況ログ保存（`/api/log` エンドポイント）のパイプライン組み込み
+- ~~S3 への実況ログ保存（`/api/log` エンドポイント）のパイプライン組み込み~~ → 2026-11-26に`/api/log`ごと廃止（ADR-005参照）
 
 ## 結果
 

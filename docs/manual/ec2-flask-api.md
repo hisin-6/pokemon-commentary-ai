@@ -115,13 +115,14 @@ sudo nginx -t
 
 ---
 
-## 環境変数の変更（S3バケット名など）
+## 環境変数の変更（DEBUG_PROMPTS など）
 
 `/etc/systemd/system/pokemon-api.service` を編集して再起動する。
 
 ```bash
 sudo vi /etc/systemd/system/pokemon-api.service
-# Environment="S3_BUCKET=新しいバケット名" を編集
+# Environment="DEBUG_PROMPTS=1" などを追加・編集
+# （S3_BUCKET は2026-11-26に /api/log ごと廃止。残っていたら行ごと削除してOK）
 
 sudo systemctl daemon-reload
 sudo systemctl restart pokemon-api

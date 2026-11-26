@@ -1,0 +1,19 @@
+# EC2 venv312（Python 3.12.16）の pip freeze 結果（2026-11-26 移行時）
+# 直接依存の指定は requirements.txt を参照。完全に同じ環境を再現したいときは
+#   venv312/bin/pip install -r requirements.lock.txt
+blinker==1.9.0
+boto3==1.44.12
+botocore==1.44.12
+click==8.5.1
+Flask==3.1.3
+gunicorn==23.0.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+jmespath==1.1.0
+MarkupSafe==3.0.4
+packaging==26.4
+python-dateutil==2.9.0.post0
+s3transfer==0.19.3
+six==1.17.0
+urllib3==2.8.0
+Werkzeug==3.1.9

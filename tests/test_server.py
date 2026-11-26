@@ -6,7 +6,6 @@ src/api/server.py の単体テスト
   - _build_vision_prompt()   Bedrock プロンプト構築
   - GET  /health             死活確認エンドポイント
   - POST /api/vision         バリデーション（Bedrock 呼び出しはモック）
-  - POST /api/log            バリデーション（S3 呼び出しはモック）
 """
 
 import base64
@@ -727,101 +726,6 @@ class TestVisionEndpoint:
                 )
                 resp = client.post("/api/vision", json=payload)
                 assert resp.status_code != 400, f"event_type={event} が 400 になった"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# POST /api/log
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _valid_log_payload(**overrides):
-    base = {
-        "session_id": "test-session-123",
-        "turn": 1,
-        "commentary": "ピカチュウが技を使った！",
-        "event_type": "move_used",
-        "context": {},
-    }
-    base.update(overrides)
-    return base
-
-
-class TestLogEndpoint:
-
-    def test_missing_json_returns_400(self, client):
-        resp = client.post("/api/log", data="not json", content_type="text/plain")
-        assert resp.status_code == 400
-
-    def test_missing_session_id_returns_400(self, client):
-        payload = _valid_log_payload(session_id="")
-        resp = client.post("/api/log", json=payload)
-        assert resp.status_code == 400
-        assert resp.get_json()["error"] == "missing_session_id"
-
-    def test_missing_commentary_returns_400(self, client):
-        payload = _valid_log_payload(commentary="")
-        resp = client.post("/api/log", json=payload)
-        assert resp.status_code == 400
-        assert resp.get_json()["error"] == "missing_commentary"
-
-    def test_s3_not_configured_returns_500(self, client):
-        """S3_BUCKET が未設定の場合は 500 を返す。"""
-        import src.api.server as sv
-        original = sv.S3_BUCKET
-        sv.S3_BUCKET = ""
-        try:
-            resp = client.post("/api/log", json=_valid_log_payload())
-            assert resp.status_code == 500
-            assert resp.get_json()["error"] == "s3_not_configured"
-        finally:
-            sv.S3_BUCKET = original
-
-    def test_successful_log_save(self, client):
-        """S3 をモックして正常保存を確認。"""
-        import src.api.server as sv
-        sv.S3_BUCKET = "test-bucket"
-        try:
-            with patch.object(sv.s3, "put_object", return_value={}):
-                resp = client.post("/api/log", json=_valid_log_payload())
-            assert resp.status_code == 200
-            data = resp.get_json()
-            assert data["success"] is True
-            assert "s3_log_path" in data
-        finally:
-            sv.S3_BUCKET = ""
-
-    def test_log_path_contains_session_id_and_turn(self, client):
-        """S3 パスに session_id とターン番号が含まれる。"""
-        import src.api.server as sv
-        sv.S3_BUCKET = "test-bucket"
-        try:
-            with patch.object(sv.s3, "put_object", return_value={}):
-                resp = client.post("/api/log", json=_valid_log_payload(turn=7))
-            data = resp.get_json()
-            assert "test-session-123" in data["s3_log_path"]
-            assert "007" in data["s3_log_path"]
-        finally:
-            sv.S3_BUCKET = ""
-
-    def test_image_saved_when_provided(self, client):
-        """image_base64 が渡された場合、スクリーンショットも保存される。"""
-        import src.api.server as sv
-        sv.S3_BUCKET = "test-bucket"
-        try:
-            call_count = {"n": 0}
-
-            def mock_put_object(**kwargs):
-                call_count["n"] += 1
-                return {}
-
-            with patch.object(sv.s3, "put_object", side_effect=mock_put_object):
-                payload = _valid_log_payload(image_base64=_TINY_PNG_B64)
-                resp = client.post("/api/log", json=payload)
-            assert resp.status_code == 200
-            assert call_count["n"] == 2  # JSON + 画像の 2 回
-            data = resp.get_json()
-            assert data["s3_image_path"] is not None
-        finally:
-            sv.S3_BUCKET = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

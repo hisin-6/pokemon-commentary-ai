@@ -5,9 +5,9 @@ EC2 Flask API サーバー
 エンドポイント:
   GET  /health      — 死活確認
   POST /api/vision  — Bedrock Claude Haiku で画面Vision分析
-  POST /api/log     — S3 に実況ログ・スクリーンショットを保存
+  （POST /api/log は呼び出し元が無いため2026-11-26に廃止・ADR-005参照）
 
-実行環境: EC2 (IAMロール経由でBedrock・S3にアクセス)
+実行環境: EC2 (IAMロール経由でBedrockにアクセス)
 ポート: 5000
 """
 
@@ -39,9 +39,6 @@ BEDROCK_TIMEOUT_SEC = 5
 # ⚠️ gunicornのworker timeout（既定30秒）も超える場合はsystemdユニット側の調整が必要
 BEDROCK_SCRIPT_TIMEOUT_SEC = 60
 IMAGE_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-
-S3_BUCKET = os.environ.get("S3_BUCKET", "")
-S3_REGION = os.environ.get("S3_REGION", "ap-southeast-2")
 
 VALID_EVENT_TYPES = {"battle_start", "move_used", "move_single", "switch", "faint", "battle_end",
                       "mega_evolution"}
@@ -81,7 +78,6 @@ bedrock_script = boto3.client(
         retries={"max_attempts": 0},
     ),
 )
-s3 = boto3.client("s3", region_name=S3_REGION)
 
 # ─── ヘルパー ────────────────────────────────────────────────────────────────
 
@@ -1228,77 +1224,6 @@ def script():
         },
         "latency_ms": latency_ms,
     })
-
-
-@app.route("/api/log", methods=["POST"])
-def log_save():
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"success": False, "error": "invalid_json", "message": "リクエストボディがJSONではありません"}), 400
-
-    session_id: str = data.get("session_id", "")
-    turn = data.get("turn", 0)
-    commentary: str = data.get("commentary", "")
-
-    if not session_id:
-        return jsonify({"success": False, "error": "missing_session_id", "message": "session_id が必要です"}), 400
-    if not commentary:
-        return jsonify({"success": False, "error": "missing_commentary", "message": "commentary が必要です"}), 400
-    if not isinstance(turn, int) or isinstance(turn, bool):
-        return jsonify({"success": False, "error": "invalid_turn", "message": "turn は整数である必要があります"}), 400
-    if not S3_BUCKET:
-        return jsonify({"success": False, "error": "s3_not_configured", "message": "S3_BUCKET 環境変数が未設定です"}), 500
-
-    # S3 保存パス
-    log_key = f"logs/{session_id}/turn_{turn:03d}.json"
-    image_key = f"screenshots/{session_id}/turn_{turn:03d}.png"
-
-    # ログ JSON 保存
-    log_payload = {
-        "session_id": session_id,
-        "turn": turn,
-        "timestamp": data.get("timestamp", _now_iso()),
-        "event_type": data.get("event_type", ""),
-        "context": data.get("context", {}),
-        "analysis": data.get("analysis", ""),
-        "commentary": commentary,
-    }
-
-    try:
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=log_key,
-            Body=json.dumps(log_payload, ensure_ascii=False),
-            ContentType="application/json",
-        )
-    except ClientError as e:
-        logger.error("S3 ログ保存失敗: %s", e)
-        return jsonify({"success": False, "error": "s3_error", "message": "S3への保存でエラーが発生しました"}), 502
-
-    response_body: dict = {
-        "success": True,
-        "s3_log_path": f"s3://{S3_BUCKET}/{log_key}",
-        "s3_image_path": None,
-    }
-
-    # スクリーンショット保存（任意）
-    image_b64: str = data.get("image_base64", "")
-    if image_b64:
-        try:
-            image_bytes = base64.b64decode(image_b64)
-            s3.put_object(
-                Bucket=S3_BUCKET,
-                Key=image_key,
-                Body=image_bytes,
-                ContentType="image/png",
-            )
-            response_body["s3_image_path"] = f"s3://{S3_BUCKET}/{image_key}"
-        except Exception as e:
-            # 画像保存失敗はログ保存成功後でも警告のみ
-            logger.warning("S3 画像保存失敗（ログは保存済み）: %s", e)
-
-    logger.info("ログ保存完了 session=%s turn=%03d", session_id, turn)
-    return jsonify(response_body)
 
 
 # ─── 起動 ────────────────────────────────────────────────────────────────────
